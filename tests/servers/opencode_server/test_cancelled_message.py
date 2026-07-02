@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 
-import anyio
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -26,18 +25,14 @@ import pytest
 
 from agentpool_server.opencode_server.models import (
     AssistantMessage,
-    MessagePath,
     MessageRequest,
-    MessageTime,
     MessageUpdatedEvent,
-    SessionStatus,
     TextPartInput,
     TimeCreated,
     UserMessage,
 )
 from agentpool_server.opencode_server.models.message import (
     MessageAbortedError,
-    MessageAbortedErrorData,
     MessageWithParts,
 )
 from agentpool_server.opencode_server.routes.message_routes import _process_message_locked
@@ -138,8 +133,8 @@ def cancellable_mock_agent():
     # Create a RunHandle that raises CancelledError when waiting
     run_handle = Mock()
     run_handle.status = RunStatus.running
-    run_handle.complete_event = Mock()
-    run_handle.complete_event.wait = AsyncMock(side_effect=asyncio.CancelledError)
+    run_handle._turn_complete_event = Mock()
+    run_handle._turn_complete_event.wait = AsyncMock(side_effect=asyncio.CancelledError)
     session_pool.receive_request = AsyncMock(return_value=run_handle)
     # Ensure get_messages returns [] so get_messages_for_session falls back to state.messages
     session_pool.get_messages = AsyncMock(return_value=[])

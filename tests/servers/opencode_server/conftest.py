@@ -40,6 +40,7 @@ from agentpool_server.opencode_server.state import ServerState
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
+    from agentpool.sessions.models import SessionData
 
 
 def _make_functional_event_bus() -> Mock:
@@ -259,8 +260,8 @@ def mock_pool(
         return_value=(Mock(), True)
     )
     _run_handle = Mock()
-    _run_handle.complete_event = Mock()
-    _run_handle.complete_event.wait = AsyncMock()
+    _run_handle._turn_complete_event = Mock()
+    _run_handle._turn_complete_event.wait = AsyncMock()
     pool.session_pool.receive_request = AsyncMock(return_value=_run_handle)
     pool.session_pool.event_bus = _make_functional_event_bus()
     pool.session_pool.sessions.store = Mock()
@@ -329,8 +330,6 @@ def mock_agent(mock_env: Mock, mock_pool: Mock, storage_manager: StorageManager)
     # list_sessions delegates to storage_manager so that sessions created via
     # pool.sessions.store.save() are visible in GET /session.
     async def _list_sessions(**kwargs: object) -> list[SessionData]:
-        from agentpool.sessions.models import SessionData
-
         ids = await storage_manager.list_session_ids()
         results: list[SessionData] = []
         for sid in ids:

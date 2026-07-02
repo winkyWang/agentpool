@@ -8,14 +8,11 @@ reasoning/text events reach the frontend.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from typing import Any
 
 import pytest
-from pydantic_ai.models.test import TestModel
 
 from agentpool import AgentPool, AgentsManifest, NativeAgentConfig
-from agentpool.orchestrator.core import SessionPool
 from agentpool_server.opencode_server.session_pool_integration import (
     OpenCodeSessionPoolIntegration,
 )
@@ -73,8 +70,9 @@ async def test_e2e_reasoning_events_through_sessionpool() -> None:
         )
 
         if run_handle is not None:
-            # Wait for run to complete
-            await run_handle.complete_event.wait()
+            # Wait for the routed turn to complete; the run remains alive
+            # for future follow-up turns until the session is closed.
+            await run_handle._turn_complete_event.wait()
 
             # Give consumer time to process events
             await asyncio.sleep(0.2)
@@ -138,7 +136,7 @@ async def test_e2e_pre_existing_session_consumer_started() -> None:
         )
 
         if run_handle is not None:
-            await run_handle.complete_event.wait()
+            await run_handle._turn_complete_event.wait()
             await asyncio.sleep(0.2)
 
         await integration._stop_event_consumer(session_id)

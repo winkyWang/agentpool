@@ -6,9 +6,7 @@ in OpenCode TUI are not reflected in agentpool runtime.
 
 from __future__ import annotations
 
-import asyncio
 
-import anyio
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
@@ -326,8 +324,6 @@ agents:
     async with AgentPool(manifest) as pool:
         agent = pool.manifest.agents["assistant"].get_agent(pool=pool)
         async with agent:
-            initial_model = agent.model_name
-
             # Simulate OpenCode TUI getting available providers
             # In config_routes.py:_build_providers_from_variants(),
             # model_variants are exposed as a synthetic "agent" provider
@@ -462,7 +458,6 @@ def _make_mock_state_with_session_agent(
     from unittest.mock import AsyncMock, Mock
 
     from agentpool.orchestrator.run import RunStatus
-    from agentpool_server.opencode_server.models import SessionStatus
     from agentpool_server.opencode_server.state import ServerState
     from agentpool.utils.time_utils import now_ms
 
@@ -508,8 +503,8 @@ def _make_mock_state_with_session_agent(
     # RunHandle that completes immediately
     run_handle = Mock()
     run_handle.status = RunStatus.completed
-    run_handle.complete_event = Mock()
-    run_handle.complete_event.wait = AsyncMock(return_value=None)
+    run_handle._turn_complete_event = Mock()
+    run_handle._turn_complete_event.wait = AsyncMock(return_value=None)
     session_pool.receive_request = AsyncMock(return_value=run_handle)
 
     # EventBus mock

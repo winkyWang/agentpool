@@ -17,18 +17,15 @@ from __future__ import annotations
 
 import asyncio
 
-import anyio
 import os
 import time
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
-import pytest
 
 from agentpool_server.opencode_server.models import (
     MessageWithParts,
     Session,
-    SessionStatus,
     TextPartInput,
     TimeCreatedUpdated,
     UserMessage,
@@ -84,8 +81,8 @@ def _make_state(tmp_path: Any) -> ServerState:
         return_value=Mock()
     )
     _run_handle = Mock()
-    _run_handle.complete_event = Mock()
-    _run_handle.complete_event.wait = AsyncMock()
+    _run_handle._turn_complete_event = Mock()
+    _run_handle._turn_complete_event.wait = AsyncMock()
     pool.session_pool.receive_request = AsyncMock(return_value=_run_handle)
     pool.session_pool.event_bus = Mock()
     from tests._helpers.mock_stream import EmptyReceiveStream

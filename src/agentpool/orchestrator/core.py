@@ -1451,13 +1451,13 @@ class SessionController:
         ]
 
     async def _consume_run(self, run_handle: RunHandle, initial_prompt: str) -> None:
-        """Drive a RunHandle.start() async generator to completion.
+        """Drive a RunHandle.start() async generator for the session lifetime.
 
         Events are published to the EventBus inside ``start()``, so this
-        coroutine only needs to keep the generator alive until the first
-        turn completes (StreamCompleteEvent or RunErrorEvent). After that,
-        the generator is closed so that ``start()`` exits its idle/wake
-        loop and ``complete_event`` is set.
+        coroutine keeps the generator alive across turns. Request/response
+        frontends should wait on ``RunHandle._turn_complete_event`` when
+        they need one turn to finish; ``complete_event`` is reserved for the
+        run itself closing.
 
         If ``start()`` raises an exception before yielding a terminal
         event, a ``RunErrorEvent`` and ``RunFailedEvent`` are published to
@@ -1468,13 +1468,9 @@ class SessionController:
             run_handle: The run handle whose ``start()`` to consume.
             initial_prompt: The first user prompt.
         """
-        from agentpool.agents.events import RunErrorEvent, StreamCompleteEvent
-
-        gen = run_handle.start(initial_prompt)
         try:
-            async for event in gen:
-                if isinstance(event, StreamCompleteEvent | RunErrorEvent):
-                    break
+            async for _event in run_handle.start(initial_prompt):
+                pass
         except Exception as exc:
             logger.exception(
                 "RunHandle.start() raised for run_id=%s session_id=%s",
@@ -1496,8 +1492,6 @@ class SessionController:
                         exception=exc,
                     ),
                 )
-        finally:
-            await gen.aclose()
 
     def _start_run_handle(
         self,
@@ -1634,7 +1628,10 @@ class SessionController:
             run = self._runs.get(session.current_run_id) if session.current_run_id else None
             if run is not None:
                 if resolved == "asap":
-                    run.steer(content_str)
+                    if run.steer(content_str):
+                        return run
+                elif run._status == RunStatus.idle and run.followup(content_str):
+                    return run
                 else:
                     run.followup(content_str)
         return None

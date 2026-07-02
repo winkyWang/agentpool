@@ -9,14 +9,12 @@ This test reproduces the user-reported bug:
 from __future__ import annotations
 
 import asyncio
-from typing import Any
 from unittest.mock import patch
 
 import pytest
 
 from agentpool import AgentPool, AgentsManifest, NativeAgentConfig
 from agentpool.agents.native_agent.turn import NativeTurn
-from agentpool.messaging import ChatMessage
 
 
 pytestmark = pytest.mark.integration
@@ -60,7 +58,7 @@ async def test_conversation_preserved_after_run_failure(
             priority="when_idle",
         )
         assert run_handle is not None, "First prompt should start a run"
-        await run_handle.complete_event.wait()
+        await run_handle._turn_complete_event.wait()
 
         # Get the per-session agent and check conversation
         agent1 = await session_pool.sessions.get_or_create_session_agent(session_id)
@@ -118,7 +116,7 @@ async def test_conversation_preserved_after_run_failure(
             priority="when_idle",
         )
         assert run_handle3 is not None, "Third prompt should start a run"
-        await run_handle3.complete_event.wait()
+        await run_handle3._turn_complete_event.wait()
 
         # Check conversation after third run
         agent3 = await session_pool.sessions.get_or_create_session_agent(session_id)
@@ -162,7 +160,7 @@ async def test_agent_identity_preserved_after_failure(
         # First successful run
         run_handle = await session_pool.receive_request(session_id, "Hello")
         assert run_handle is not None
-        await run_handle.complete_event.wait()
+        await run_handle._turn_complete_event.wait()
 
         agent_before = await session_pool.sessions.get_or_create_session_agent(session_id)
         agent_id_before = id(agent_before)

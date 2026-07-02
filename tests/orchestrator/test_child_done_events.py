@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -28,7 +29,7 @@ from agentpool import Agent
 from agentpool.agents.context import AgentRunContext
 from agentpool.agents.events import StreamCompleteEvent
 from agentpool.messaging import ChatMessage
-from agentpool.orchestrator.core import EventBus, SessionState
+from agentpool.orchestrator.core import EventBus, SessionController, SessionState
 from agentpool.orchestrator.run import RunHandle, RunStatus
 from agentpool.orchestrator.turn import Turn
 
@@ -258,6 +259,56 @@ async def test_queued_steer_messages_become_next_turn_prompts() -> None:
     # Second turn's prompts include the steer message.
     second_call = agent.create_turn.call_args_list[1]
     assert "process this" in second_call.kwargs["prompts"]
+
+
+@pytest.mark.unit
+async def test_session_controller_consumer_preserves_run_between_turns() -> None:
+    """SessionController must not close RunHandle before child results are processed.
+
+    ``RunHandle.start()`` owns the run-level idle loop. The session consumer's
+    job is to keep that generator alive so child-session completion can enqueue
+    steer messages and trigger a follow-up turn.
+    """
+    agent = _make_agent()
+    run_ctx = AgentRunContext()
+    event = anyio.Event()
+    event.set()
+    run_ctx.child_done_events["child-1"] = event
+    run_ctx.queued_steer_messages.append("reviewer result from child")
+    handle = _make_handle(agent=agent, run_ctx=run_ctx)
+    controller = SimpleNamespace(_event_bus=None)
+
+    consumer_task = asyncio.create_task(
+        SessionController._consume_run(  # type: ignore[arg-type]
+            controller,
+            handle,
+            "initial prompt",
+        )
+    )
+
+    try:
+        await asyncio.wait_for(handle._turn_complete_event.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+
+        assert agent.create_turn.call_count == 2
+        assert run_ctx.child_done_events == {}
+        assert run_ctx.queued_steer_messages == []
+        assert not handle.complete_event.is_set()
+    finally:
+        handle.close()
+        await asyncio.wait_for(consumer_task, timeout=1.0)
+
+
+@pytest.mark.unit
+async def test_idle_followup_resets_turn_completion_for_next_waiter() -> None:
+    """A follow-up on an idle run must represent a new pending turn."""
+    handle = _make_handle()
+    handle._status = RunStatus.idle
+    handle._turn_complete_event.set()
+
+    assert handle.followup("next prompt")
+
+    assert not handle._turn_complete_event.is_set()
 
 
 # ---------------------------------------------------------------------------

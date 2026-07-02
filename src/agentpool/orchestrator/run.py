@@ -300,9 +300,8 @@ class RunHandle:
                         async for event in turn.execute():
                             await event_bus.publish(self.session_id, event)
                             # Save assistant final message to conversation BEFORE
-                            # yielding. The _consume_run caller closes the generator
-                            # immediately after receiving StreamCompleteEvent, which
-                            # prevents any code after `yield event` from executing.
+                            # yielding so consumers observe a durable assistant
+                            # message even if the run is cancelled while streaming.
                             if isinstance(event, StreamCompleteEvent) and event.message is not None:
                                 agent.conversation.add_chat_messages(
                                     [event.message],
@@ -458,6 +457,7 @@ class RunHandle:
             return False
         self._message_queue.append(message)
         if self._status == RunStatus.idle:
+            self._turn_complete_event.clear()
             self._idle_event.set()
         return True
 

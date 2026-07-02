@@ -1952,9 +1952,12 @@ async def execute_command(  # noqa: PLR0915
                         run_handles = getattr(state, "_run_handles", {})
                         run_handles[session_id] = run_handle
                         state._run_handles = run_handles
-                        # Wait for the background run to complete before finalizing
+                        # Wait for the current turn to complete before finalizing.
+                        # The run may remain alive for later follow-up turns.
                         try:
-                            await asyncio.wait_for(run_handle.complete_event.wait(), timeout=30.0)
+                            await asyncio.wait_for(
+                                run_handle._turn_complete_event.wait(), timeout=30.0
+                            )
                         except TimeoutError:
                             run_handle.cancel()
                             output_text = "Error: command execution timed out"
