@@ -9,6 +9,7 @@ from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.toolsets import FunctionToolset
 import pytest
 
+from agentpool.agents.context import AgentContext as NativeAgentContext
 from agentpool.capabilities.agent_context import AgentContext
 from agentpool.capabilities.delegation import AgentNotFoundError, DelegationService
 from agentpool.capabilities.subagent_capability import SubagentCapability
@@ -150,6 +151,26 @@ async def test_get_available_agents_returns_empty_list() -> None:
     result = await SubagentCapability.get_available_agents(ctx)
 
     assert result == []
+
+
+async def test_runtime_native_context_resolves_injected_capability_context() -> None:
+    """Native tool context exposes the per-turn capability context through data."""
+    delegation = FakeDelegationService(agents=["analyzer"])
+    capability_ctx = _make_ctx(delegation).deps
+    runtime_ctx = MagicMock()
+    runtime_ctx.deps = NativeAgentContext(
+        node=MagicMock(),
+        pool=MagicMock(),
+        input_provider=MagicMock(),
+        data=capability_ctx,
+    )
+
+    agents = await SubagentCapability.get_available_agents(runtime_ctx)
+    result = await SubagentCapability.spawn_subagent(runtime_ctx, "analyzer", "inspect")
+
+    assert agents == ["analyzer"]
+    assert result == "chunk_1\nchunk_2"
+    assert delegation.spawn_calls == [("analyzer", "inspect")]
 
 
 def test_get_instructions_returns_description() -> None:
