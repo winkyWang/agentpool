@@ -1094,4 +1094,23 @@ class TestIntegrationLifecycle:
 
         status = await integration.get_session_status("test-session-020")
         assert status is not None
-        assert status.type in ("idle", "busy")
+        assert status.type == "idle"
+
+        session = session_pool.sessions.get_session("test-session-020")
+        assert session is not None
+        run_handle = Mock()
+        run_handle.is_running = True
+        session.set_current_run_id("run-session-status")
+        session_pool.sessions._runs["run-session-status"] = run_handle
+
+        status = await integration.get_session_status("test-session-020")
+        assert status is not None
+        assert status.type == "busy"
+
+        run_handle.is_running = False
+        status = await integration.get_session_status("test-session-020")
+        assert status is not None
+        assert status.type == "idle"
+
+        session.set_current_run_id(None)
+        session_pool.sessions._runs.pop("run-session-status")
