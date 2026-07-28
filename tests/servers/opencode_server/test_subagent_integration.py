@@ -259,12 +259,10 @@ async def test_task_tool_async_mode_return_format():
     ctx.pool.manifest.agents = {"child_agent": mock_agent}
     ctx.pool.manifest.teams = {}
 
-    # Mock internal_fs
-    ctx.internal_fs.mkdirs = MagicMock()
-
     # Mock events.emit_event (needed for SpawnSessionStart emission)
     ctx.events.emit_event = AsyncMock()
     ctx.create_child_session = AsyncMock(return_value="child_session_123")
+    ctx.complete_background_task = AsyncMock()
 
     # Execute task in async mode
     result = await tools.task(
@@ -278,7 +276,10 @@ async def test_task_tool_async_mode_return_format():
     assert "metadata" in result
     assert "taskId" in result["metadata"]
     assert "sessionId" in result["metadata"]
-    assert "outputFile" in result["metadata"]
+    assert result["metadata"]["delivery"] == "wait_for_task"
+    assert "outputFile" not in result["metadata"]
+    assert "Do not poll" in result["output"]
+    assert "wait_for_task" in result["output"]
 
 
 # =============================================================================

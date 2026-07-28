@@ -13,6 +13,7 @@ import asyncio
 import datetime
 import re
 from typing import Any, Literal
+import uuid
 
 import logfire
 from pydantic_ai import ModelRetry
@@ -26,9 +27,6 @@ from agentpool.tools.exceptions import ToolError
 
 
 logger = get_logger(__name__)
-
-# Set to hold references to background tasks, preventing GC while running
-_background_tasks: set[asyncio.Task[Any]] = set()
 
 
 def _serialize_content(content: Any) -> str:
@@ -52,12 +50,13 @@ def _generate_task_id(description: str) -> str:
         description: Short task description to include in the ID
 
     Returns:
-        Task ID in format: YYYYMMDD-HHMMSS-description
+        Task ID in format: YYYYMMDD-HHMMSS-description-unique_suffix
     """
     timestamp = datetime.datetime.now(tz=datetime.UTC).strftime("%Y%m%d-%H%M%S")
     # Sanitize description: lowercase, replace spaces/special chars with dashes
     slug = re.sub(r"[^a-z0-9]+", "-", description.lower()).strip("-")[:30]
-    return f"{timestamp}-{slug}"
+    suffix = uuid.uuid4().hex[:8]
+    return f"{timestamp}-{slug or 'task'}-{suffix}"
 
 
 class SubagentTools(FunctionToolsetCapability):
@@ -68,11 +67,13 @@ class SubagentTools(FunctionToolsetCapability):
         name: str = "subagent_tools",
     ) -> None:
         super().__init__(name=name)
+        self._async_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
         # create_tool already adds to _tools, no need to call add_tool
         self.create_tool(
             self.list_available_nodes, category="search", read_only=True, idempotent=True
         )
         self.create_tool(self.task, category="other")
+        self.create_tool(self.wait_for_task, category="other")
 
     async def list_available_nodes(  # noqa: D417
         self,
@@ -129,8 +130,9 @@ class SubagentTools(FunctionToolsetCapability):
         and returns the result when complete.
 
         In async mode, the task starts in the background and returns immediately
-        with a task ID. The output is written to /tasks/{task_id}/output.md in
-        the internal filesystem after the run completes.
+        with a task ID. After launching all independent tasks, call
+        ``wait_for_task`` once for each task ID to collect the results. Do not
+        poll or read a task output file.
 
         Args:
             agent_or_team: The agent or team to execute the task
@@ -230,6 +232,34 @@ class SubagentTools(FunctionToolsetCapability):
             "metadata": {"sessionId": child_session_id},
         }
 
+    async def wait_for_task(self, ctx: AgentContext, task_id: str) -> dict[str, Any]:
+        """Wait for one asynchronous subagent task and return its final result.
+
+        Call this once for each task ID returned by ``task(async_mode=True)``.
+        The call blocks efficiently until that task completes; do not poll files
+        or repeatedly call this tool while the task is running.
+
+        Args:
+            ctx: Current agent execution context
+            task_id: Task identifier returned by an asynchronous ``task`` call
+
+        Returns:
+            Structured task result with child session metadata
+        """
+        _ = ctx
+        task = self._async_tasks.get(task_id)
+        if task is None:
+            available = ", ".join(sorted(self._async_tasks)) or "none"
+            raise ModelRetry(
+                f"Unknown or already collected async task ID: {task_id}. "
+                f"Available task IDs: {available}"
+            )
+        try:
+            return await task
+        finally:
+            if task.done():
+                self._async_tasks.pop(task_id, None)
+
     @staticmethod
     def _require_session_pool(ctx: AgentContext) -> Any:
         """Validate pool and session_pool are available, return session_pool."""
@@ -324,8 +354,8 @@ class SubagentTools(FunctionToolsetCapability):
                 final_content = _serialize_content(content)
         return final_content
 
-    @staticmethod
     async def _start_async_task(
+        self,
         ctx: AgentContext,
         session_pool: Any,
         node: Any,
@@ -338,54 +368,82 @@ class SubagentTools(FunctionToolsetCapability):
     ) -> dict[str, Any]:
         """Start a background async task and return task metadata."""
         task_id = _generate_task_id(description)
-        output_path = f"/tasks/{task_id}/output.md"
-        fs = ctx.internal_fs
-        fs.mkdirs(f"/tasks/{task_id}", exist_ok=True)
 
-        async def _background_run() -> None:
-            """Run task through SessionPool and write final result to filesystem."""
-            final_content = await SubagentTools._run_sync(
-                session_pool,
-                node,
-                child_session_id,
-                prompt,
-                input_provider,
-                is_team_node,
-            )
-            fs.pipe(output_path, final_content.encode("utf-8"))
-            logger.info(
-                "Async task completed",
-                task_id=task_id,
-                agent=agent_or_team,
-                output_path=output_path,
-            )
-
-        # Wrap with error handling
-        async def _safe_background_run() -> None:
+        async def _safe_background_run() -> dict[str, Any]:
+            """Run the task and retain exactly one collectable result."""
             try:
                 with logfire.span("subagent.background_task", task_id=task_id):
-                    await _background_run()
-            except Exception:
-                logger.exception("Async task failed", task_id=task_id, agent=agent_or_team)
-                error_content = (
-                    f"# Task Failed\n\nTask {task_id} ({agent_or_team}) failed with an error."
+                    final_content = await SubagentTools._run_sync(
+                        session_pool,
+                        node,
+                        child_session_id,
+                        prompt,
+                        input_provider,
+                        is_team_node,
+                    )
+                result = {
+                    "output": final_content,
+                    "metadata": {
+                        "taskId": task_id,
+                        "sessionId": child_session_id,
+                        "agentOrTeam": agent_or_team,
+                    },
+                }
+                logger.info(
+                    "Async task completed",
+                    task_id=task_id,
+                    agent=agent_or_team,
                 )
-                fs.pipe(output_path, error_content.encode("utf-8"))
+            except Exception as exc:
+                logger.exception("Async task failed", task_id=task_id, agent=agent_or_team)
+                result = {
+                    "output": (
+                        f"Async task {task_id} ({agent_or_team}) failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    "metadata": {
+                        "taskId": task_id,
+                        "sessionId": child_session_id,
+                        "agentOrTeam": agent_or_team,
+                        "failed": True,
+                    },
+                }
+            finally:
+                completion_summary = f"Async task {task_id} completed"
+                try:
+                    await ctx.complete_background_task(child_session_id, completion_summary)
+                except Exception:
+                    logger.exception(
+                        "Failed to mark async child task complete",
+                        task_id=task_id,
+                        child_session_id=child_session_id,
+                    )
+            return result
 
         task = asyncio.create_task(_safe_background_run(), name=f"async_task_{task_id}")
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+        self._async_tasks[task_id] = task
+
+        def _log_uncollected_failure(completed_task: asyncio.Task[dict[str, Any]]) -> None:
+            try:
+                completed_task.result()
+            except (asyncio.CancelledError, Exception):
+                logger.exception(
+                    "Unexpected failure outside async task result contract",
+                    task_id=task_id,
+                )
+
+        task.add_done_callback(_log_uncollected_failure)
 
         return {
             "output": (
                 f"Task started in background.\n"
                 f"Task ID: {task_id}\n"
-                f"Output will be written to: {output_path}\n"
-                f"Use the read tool to check the output file for results."
+                f"After launching independent tasks, call wait_for_task with task_id={task_id!r} "
+                "once to collect this result. Do not poll or read a task output file."
             ),
             "metadata": {
                 "taskId": task_id,
                 "sessionId": child_session_id,
-                "outputFile": output_path,
+                "delivery": "wait_for_task",
             },
         }
