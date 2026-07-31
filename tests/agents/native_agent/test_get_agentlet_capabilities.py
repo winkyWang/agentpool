@@ -628,7 +628,7 @@ async def test_capability_config_build_called(mock_agent: Agent[Any]) -> None:
 
 
 @pytest.mark.anyio
-async def test_from_config_capabilities_not_duplicated() -> None:
+async def test_from_config_capabilities_not_duplicated(monkeypatch: pytest.MonkeyPatch) -> None:
     """Capabilities built in from_config() must not be re-built in get_agentlet().
 
     from_config() pre-builds capabilities from config.capabilities and stores
@@ -640,6 +640,7 @@ async def test_from_config_capabilities_not_duplicated() -> None:
     This test calls from_config() with a config containing a capability, then
     calls get_agentlet() and verifies the capability appears exactly once.
     """
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-for-ci")
     from pydantic_ai.capabilities import Instrumentation
 
     from agentpool.models.agents import NativeAgentConfig
