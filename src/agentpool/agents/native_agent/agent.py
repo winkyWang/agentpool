@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 import inspect
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Self, TypedDict, TypeVar, overload
@@ -15,6 +15,7 @@ import logfire
 from pydantic_ai import (
     Agent as PydanticAgent,
     AgentRetries,
+    UsageLimits,
 )
 from pydantic_ai.capabilities import NativeTool, ProcessHistory
 from pydantic_ai.models import Model
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from exxec import ExecutionEnvironment
-    from pydantic_ai import AgentNativeTool as AgentBuiltinTool, UsageLimits, UserContent
+    from pydantic_ai import AgentNativeTool as AgentBuiltinTool, UserContent
     from pydantic_ai.capabilities import AbstractCapability
     from pydantic_ai.messages import ModelMessage
     from pydantic_ai.models import Model
@@ -69,6 +70,7 @@ if TYPE_CHECKING:
     from agentpool.mcp_server.config_snapshot import McpConfigEntry
     from agentpool.messaging import MessageNode
     from agentpool.models.agents import NativeAgentConfig, ToolMode
+    from agentpool.models.model_configs import BaseModelConfig
     from agentpool.orchestrator.turn import Turn
     from agentpool.prompts.prompts import PromptType
     from agentpool.sessions import SessionData
@@ -76,6 +78,7 @@ if TYPE_CHECKING:
     from agentpool.ui.base import InputProvider
     from agentpool_config.knowledge import Knowledge
     from agentpool_config.mcp_server import MCPServerConfig
+    from agentpool_config.model_capabilities import ModelCapabilities
     from agentpool_config.nodes import ToolConfirmationMode
     from agentpool_config.session import MemoryConfig, SessionQuery
 
@@ -93,6 +96,80 @@ def _build_capability_from_config(config: Any) -> Any:
     from agentpool_config.capabilities import build_capability
 
     return build_capability(config)
+
+
+def _model_config_names(config: Any) -> list[str]:
+    """Extract model name string(s) from a BaseModelConfig.
+
+    For ``FallbackModelConfig``, returns all sub-model names.
+    For configs with an ``identifier`` field, returns ``[identifier]``.
+    For ``TestModelConfig``, returns ``[]`` (no tokonomics lookup).
+    """
+    from agentpool.models.model_configs import (
+        AnthropicModelConfig,
+        FallbackModelConfig,
+        GeminiModelConfig,
+        OpenAIModelConfig,
+        StringModelConfig,
+    )
+
+    if isinstance(config, FallbackModelConfig):
+        names: list[str] = []
+        for sub in config.models:
+            match sub:
+                case _ if isinstance(sub, FallbackModelConfig):
+                    names.extend(_model_config_names(sub))
+                case str():
+                    names.append(sub)
+                case StringModelConfig():
+                    names.append(str(sub.identifier))
+                case OpenAIModelConfig():
+                    names.append(str(sub.identifier))
+                case AnthropicModelConfig():
+                    names.append(str(sub.identifier))
+                case GeminiModelConfig():
+                    names.append(str(sub.identifier))
+                case _:
+                    pass
+        return names
+    if isinstance(config, StringModelConfig):
+        return [str(config.identifier)]
+    if isinstance(config, OpenAIModelConfig):
+        return [str(config.identifier)]
+    if isinstance(config, AnthropicModelConfig):
+        return [str(config.identifier)]
+    if isinstance(config, GeminiModelConfig):
+        return [str(config.identifier)]
+    # TestModelConfig, ImportModelConfig, etc. — no tokonomics lookup.
+    return []
+
+
+def _intersect_capabilities(
+    caps_list: list[ModelCapabilities],
+) -> ModelCapabilities:
+    """Compute pessimistic intersection of resolved capabilities.
+
+    For each field, ``False`` wins over ``True`` — if any model says
+    ``False``, the result is ``False``.
+    """
+    from agentpool_config.model_capabilities import ModelCapabilities
+
+    fields = (
+        "image_input",
+        "audio_input",
+        "video_input",
+        "document_input",
+        "image_output",
+    )
+    result: dict[str, bool] = {}
+    for field in fields:
+        values = [getattr(c, field) for c in caps_list]
+        # If any model says False, result is False (pessimistic).
+        if any(v is False for v in values):
+            result[field] = False
+        else:
+            result[field] = True
+    return ModelCapabilities(**result)
 
 
 TResult = TypeVar("TResult")
@@ -171,6 +248,7 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
         metadata: dict[str, Any] | None = None,
         history_processors: Sequence[Callable[..., Any]] | None = None,
         capabilities: list[Any] | None = None,
+        resolved_model_config: BaseModelConfig | None = None,
     ) -> None:
         """Initialize agent.
 
@@ -221,6 +299,9 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
             metadata: Arbitrary metadata for the agent (e.g., feature flags)
             history_processors: Callable history processors for message processing
             capabilities: Extra capability instances or configs to attach
+            resolved_model_config: Resolved model config (after variant lookup).
+                Used for capability resolution when the agent references a
+                model variant by name.
         """
         from agentpool.agents.interactions import Interactions
         from agentpool.agents.native_agent.hook_manager import NativeAgentHookManager
@@ -232,6 +313,7 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
 
         self.model_settings = model_settings
         self.config = agent_config
+        self._resolved_model_config = resolved_model_config
         self._direct_history_processors = None
         memory_cfg = (
             session if isinstance(session, MemoryConfig) else MemoryConfig.from_value(session)
@@ -317,11 +399,29 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
             has_hooks=hooks is not None,
             hooks_repr=repr(hooks) if hooks else "None",
         )
-        self._default_usage_limits = usage_limits
+        self._default_usage_limits = usage_limits or UsageLimits(request_limit=None)
         self._providers = list(providers) if providers else None  # model discovery
         self._direct_history_processors = list(history_processors) if history_processors else None
         self._resolved_history_processors: list[Callable[..., Any]] | None = None
         self._extra_capabilities: list[Any] = capabilities or []
+
+        # Track session IDs for which we've registered SESSION-scope capabilities
+        # in the ExtensionRegistry. Prevents duplicate registration on repeated
+        # get_agentlet() calls within the same session.
+        self._registered_session_ids: set[str] = set()
+
+        # Eagerly build config-defined capabilities and add to _external_capabilities
+        # so they're visible to _all_capabilities (used by _get_all_tools() for
+        # tool listing endpoints) before get_agentlet() is called.
+        # Built instances are stored in _config_capabilities_built so get_agentlet()
+        # can reuse them instead of rebuilding (preventing double-append bug).
+        self._config_capabilities_built: list[Any] = []
+        if self.config and self.config.capabilities:
+            from agentpool_config.capabilities import build_config_capabilities
+
+            built_caps = build_config_capabilities(self.config.capabilities)
+            self._external_capabilities.extend(built_caps)
+            self._config_capabilities_built.extend(built_caps)
 
     def _build_pool_configs(self) -> tuple[McpConfigEntry, ...]:
         """Build MCP config entries from pool-level servers.
@@ -552,7 +652,7 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
         merged_handlers: list[AnyEventHandlerType] = [*config_handlers, *(event_handlers or [])]
 
         # Handle model configuration - resolve model_variants reference if needed
-        from agentpool.models.model_configs import StringModelConfig
+        from agentpool.models.model_configs import BaseModelConfig, StringModelConfig
 
         model_config = config.model
         if (
@@ -591,6 +691,9 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
             providers=config.model_providers,
             metadata=getattr(config, "metadata", None),
             capabilities=None,  # Built lazily in get_agentlet() from self.config.capabilities
+            resolved_model_config=model_config
+            if isinstance(model_config, BaseModelConfig)
+            else None,
         )
 
     async def __aenter__(self) -> Self:
@@ -772,6 +875,133 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
         wrapped_tool.__name__ = tool_name
         return Tool.from_callable(wrapped_tool, source="agent")
 
+    # ------------------------------------------------------------------
+    # Multimodal capability resolution & ModalityFilter injection
+    # ------------------------------------------------------------------
+
+    def _get_model_names_for_capability_resolution(self) -> list[str]:
+        """Return model name(s) for tokonomics capability lookup.
+
+        For fallback models, returns all sub-model names so the caller
+        can compute the intersection (pessimistic) of capabilities.
+        """
+        from agentpool.models.model_configs import (
+            BaseModelConfig,
+            FallbackModelConfig,
+        )
+
+        if self.config is None and self._resolved_model_config is None:
+            return []
+        model_cfg: BaseModelConfig | str | None = self._resolved_model_config
+        if model_cfg is None and self.config is not None:
+            model_cfg = self.config.model
+        if not isinstance(model_cfg, BaseModelConfig):
+            # model is a plain string (ModelId | str)
+            return [str(model_cfg)]
+        if isinstance(model_cfg, FallbackModelConfig):
+            names: list[str] = []
+            for sub in model_cfg.models:
+                match sub:
+                    case BaseModelConfig():
+                        names.extend(_model_config_names(sub))
+                    case str():
+                        names.append(sub)
+                    case _:
+                        pass
+            return names
+        return _model_config_names(model_cfg)
+
+    def _get_declared_capabilities(self) -> ModelCapabilities | None:
+        """Extract declared ModelCapabilities from the agent's model config.
+
+        Reads from ``self._resolved_model_config`` (which has model variant
+        references resolved) first; falls back to ``self.config.model`` if
+        ``_resolved_model_config`` is ``None`` (e.g. programmatic agents).
+
+        Returns ``None`` when no model config or no capabilities field is
+        present.
+        """
+        from agentpool.models.model_configs import BaseModelConfig
+
+        model_cfg: BaseModelConfig | str | None = self._resolved_model_config
+        if model_cfg is None and self.config is not None:
+            model_cfg = self.config.model
+        if not isinstance(model_cfg, BaseModelConfig):
+            return None
+        return model_cfg.capabilities
+
+    async def _resolve_model_capabilities(
+        self,
+        model_: Model,
+    ) -> ModelCapabilities | None:
+        """Resolve full ModelCapabilities (all fields bool) for the agent.
+
+        Uses ``resolve_capabilities(cache_only=True)`` to read from the
+        in-memory cache without initiating tokonomics network queries.
+        Cache misses default to ``False`` (text-only modality).
+
+        Returns ``ModelCapabilities()`` (all ``None``) when no model name
+        is available — this ensures ``ModalityFilterCapability`` is still
+        populated (passes the ``is not None`` guard) and text-only
+        filtering is applied via the ``is True`` check in
+        ``_is_modality_supported()``.
+
+        For ``FallbackModelConfig``, returns declared capabilities
+        directly without per-model cache lookups or intersection.
+        """
+        from agentpool_config.model_capabilities import ModelCapabilities
+
+        declared = self._get_declared_capabilities()
+        model_names = self._get_model_names_for_capability_resolution()
+
+        if not model_names:
+            # No model name for cache lookup — return ModelCapabilities()
+            # (all None) instead of None so ModalityFilterCapability is
+            # still populated.  _is_modality_supported() treats None as
+            # unsupported via ``is True`` check (text-only behavior).
+            return declared if declared is not None else ModelCapabilities()
+
+        if declared is None:
+            declared = ModelCapabilities()
+
+        if len(model_names) == 1:
+            from agentpool.host.stubs import resolve_capabilities
+
+            return await resolve_capabilities(
+                model_names[0],
+                declared,
+                cache_only=True,
+            )
+
+        # Intentional simplification: fallback models use declared/text-only
+        # defaults.  Per-model cache lookup + intersection is not performed.
+        # ``_intersect_capabilities()`` is preserved for future use.
+        return declared
+
+    def _apply_image_output_profile(
+        self,
+        model_: Model,
+        caps: ModelCapabilities,
+    ) -> Model:
+        """Apply image_output capability to the pydantic-ai Model profile.
+
+        When ``image_output`` is explicitly set (not None), merges the
+        override into the model's existing profile.  Returns the same
+        model instance with ``_profile`` updated.
+        """
+        if caps.image_output is None:
+            return model_
+
+        existing = model_._profile
+        match existing:
+            case None:
+                model_._profile = {"supports_image_output": caps.image_output}
+            case dict():
+                model_._profile = {**existing, "supports_image_output": caps.image_output}
+            case _:  # callable form
+                model_._profile = {"supports_image_output": caps.image_output}
+        return model_
+
     async def get_agentlet[AgentOutputType](  # noqa: PLR0915
         self,
         model: ModelType | None,
@@ -904,6 +1134,44 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
                 tool_capabilities.extend(
                     cap for cap in pool_capabilities if isinstance(cap, SkillManagerCap)
                 )
+            # 6. ResourceCapability — unified resource access tools.
+            #    Per-agent opt-out via ``resources.enabled: false`` in YAML.
+            if self.config is not None and self.config.resources.enabled:
+                resource_cap = pool.resource_capability
+                if resource_cap is not None:
+                    tool_capabilities.append(resource_cap)
+
+        # Register per-session capabilities (MCP, SkillManagerCap)
+        # at SESSION scope in the ExtensionRegistry.
+        # This is done once per session — subsequent get_agentlet() calls
+        # within the same session skip registration.
+        #
+        # Note: ResourceCapability is NOT registered here. It is a tool
+        # wrapper, not a ResourceAccess provider. See pool._setup_resource_capability().
+        if self.host_context is not None and run_ctx is not None:
+            registry = self.host_context.extension_registry
+            if registry is not None:
+                session_id = run_ctx.session_id
+                if session_id not in self._registered_session_ids:
+                    from agentpool.capabilities.extension_registry import (
+                        Scope,
+                        ScopeLevel,
+                    )
+
+                    session_scope = Scope(level=ScopeLevel.SESSION, session_id=session_id)
+                    for cap in mcp_capabilities:
+                        registry.register(cap, session_scope)
+                    if pool is not None:
+                        pool_caps = pool.skill_capabilities
+                        if pool_caps:
+                            from agentpool.capabilities.skill_manager_cap import (
+                                SkillManagerCap,
+                            )
+
+                            for cap in pool_caps:
+                                if isinstance(cap, SkillManagerCap):
+                                    registry.register(cap, session_scope)
+                    self._registered_session_ids.add(session_id)
 
         # Collect pydantic-ai compatible instructions from SystemPrompts and providers
         all_instructions: list[Any] = []
@@ -944,11 +1212,17 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
         if self._extra_capabilities:
             tool_capabilities.extend(self._extra_capabilities)
 
-        # Merge user-provided capabilities from config
-        if self.config and self.config.capabilities:
+        # Config-defined capabilities are already in _external_capabilities
+        # (built eagerly in __init__) and are picked up by the _all_capabilities
+        # loop above. No need to re-add them here (issue #306).
+        # However, if config was set after __init__ (e.g. tests mutating
+        # agent.config), _config_capabilities_built will be empty — build
+        # lazily in that case.
+        if self.config and self.config.capabilities and not self._config_capabilities_built:
             from pydantic import BaseModel as _BaseModel
 
             from agentpool_config.capabilities import (
+                EntryPointCapabilityConfig,
                 GenericCapabilityConfig,
                 build_capability,
             )
@@ -956,16 +1230,72 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
             for cap in self.config.capabilities:
                 if cap is None:
                     continue
-                if isinstance(cap, GenericCapabilityConfig):
-                    tool_capabilities.append(cap.build())
+                if isinstance(cap, (GenericCapabilityConfig, EntryPointCapabilityConfig)):
+                    built = cap.build()
                 elif isinstance(cap, _BaseModel):
                     from typing import cast as _cast
 
-                    # Typed built-in config (LoopDetectionCapabilityConfig, etc.)
-                    tool_capabilities.append(build_capability(_cast(Any, cap)))
+                    built = build_capability(_cast(Any, cap))
                 else:
-                    # Pre-instantiated AbstractCapability
-                    tool_capabilities.append(cap)
+                    built = cap
+                tool_capabilities.append(built)
+                self._external_capabilities.append(built)
+                self._config_capabilities_built.append(built)
+
+        # ------------------------------------------------------------------
+        # Model capability resolution — resolve ModelCapabilities for
+        # image_output profile mapping and for populating any
+        # user-configured ModalityFilterCapability instances.
+        # ------------------------------------------------------------------
+        resolved_caps = await self._resolve_model_capabilities(model_)
+        if resolved_caps is not None:
+            # 5.4 — Apply image_output profile to the pydantic-ai Model.
+            model_ = self._apply_image_output_profile(model_, resolved_caps)
+
+            # Populate any user-configured ModalityFilterCapability with
+            # resolved model capabilities.  This is NOT auto-injection —
+            # the user must explicitly configure ``type: modality_filter``
+            # in YAML capabilities for this to activate.
+            from agentpool.capabilities.modality_filter import (
+                ModalityFilterCapability,
+            )
+
+            for i, cap in enumerate(tool_capabilities):
+                if isinstance(cap, ModalityFilterCapability):
+                    populated = ModalityFilterCapability(
+                        capabilities=resolved_caps,
+                        image_strategy=cap.image_strategy,
+                        audio_strategy=cap.audio_strategy,
+                        video_strategy=cap.video_strategy,
+                        document_strategy=cap.document_strategy,
+                    )
+                    tool_capabilities[i] = populated
+                    # Also replace in _external_capabilities so listing
+                    # endpoints see the populated instance.
+                    for j, ext_cap in enumerate(self._external_capabilities):
+                        if ext_cap is cap:
+                            self._external_capabilities[j] = populated
+                            break
+
+                    # Register the populated ModalityFilterCapability at
+                    # TURN scope — it depends on the resolved model which
+                    # is specific to this turn's model resolution.
+                    if self.host_context is not None and run_ctx is not None:
+                        registry = self.host_context.extension_registry
+                        if registry is not None:
+                            from agentpool.capabilities.extension_registry import (
+                                Scope,
+                                ScopeLevel,
+                            )
+
+                            turn_id = run_ctx.turn_id or ""
+                            turn_scope = Scope(
+                                level=ScopeLevel.TURN,
+                                agent_name=self.name,
+                                session_id=run_ctx.session_id,
+                                turn_id=turn_id,
+                            )
+                            registry.register(populated, turn_scope)
 
         # Handle retries parameter: newer pydantic-ai uses dict form for output_retries
         if AgentRetries is not None and self._output_retries is not None:
@@ -1279,16 +1609,266 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
     async def get_available_models(self) -> list[ModelInfo] | None:
         """Get available models for this agent.
 
-        Uses tokonomics model discovery to fetch models from configured providers.
-        Defaults to models.dev if no providers specified.
+        Fetches model data from the npmmirror CDN (Alibaba China mirror),
+        which mirrors the ``@opencode-ai/models`` npm package containing
+        the same data as ``models.dev/api.json``.  This avoids direct
+        access to ``models.dev`` which may be unreachable from China.
+
+        Falls back to the original tokonomics discovery when the
+        ``MODELS_DEV_FALLBACK`` environment variable is set to ``"1"``.
 
         Returns:
             List of tokonomics ModelInfo, or None if discovery fails
         """
-        from tokonomics.model_discovery import get_all_models
+        import os
 
+        if os.environ.get("MODELS_DEV_FALLBACK") == "1":
+            from tokonomics.model_discovery import get_all_models
+
+            delta = timedelta(days=200)
+            try:
+                async with asyncio.timeout(30):
+                    return await get_all_models(
+                        providers=self._providers or ["models.dev"], max_age=delta
+                    )
+            except TimeoutError:
+                self.log.warning("Model discovery (tokonomics) timed out after 30s")
+                return None
+            except Exception:
+                self.log.warning("Model discovery (tokonomics) failed", exc_info=True)
+                return None
+
+        return await self._fetch_models_from_npmmirror()
+
+    async def _fetch_models_from_npmmirror(self) -> list[ModelInfo] | None:
+        """Fetch models from npmmirror CDN (China-accessible).
+
+        Downloads the ``@opencode-ai/models`` npm package tarball from
+        ``registry.npmmirror.com``, extracts ``dist/snapshot.js``, and
+        parses it into a list of ``ModelInfo`` objects.
+
+        The snapshot data has the same structure as ``models.dev/api.json``:
+        ``{providers: {provider_id: {models: {model_id: {...}}}}}``
+        """
+        import io
+        import json
+        import re
+        import tarfile
+        import urllib.request
+
+        provider_name_map: dict[str, str] = {
+            "amazon-bedrock": "bedrock",
+            "fireworks-ai": "fireworks",
+            "google": "google-gla",
+            "togetherai": "together",
+            "github-models": "github",
+            "xai": "grok",
+        }
+
+        url = "https://registry.npmmirror.com/@opencode-ai/models/-/models-0.0.26.tgz"
+
+        try:
+            async with asyncio.timeout(30):
+                # run_in_executor avoids blocking the event loop during HTTP download
+                loop = asyncio.get_running_loop()
+                tgz_data = await loop.run_in_executor(
+                    None,
+                    lambda: urllib.request.urlopen(url, timeout=15).read(),
+                )
+
+                with tarfile.open(fileobj=io.BytesIO(tgz_data), mode="r:gz") as tar:
+                    snapshot_file = tar.extractfile("package/dist/snapshot.js")
+                    if snapshot_file is None:
+                        self.log.warning("snapshot.js not found in npmmirror tarball")
+                        return None
+                    snapshot_content = snapshot_file.read().decode("utf-8")
+
+                match = re.search(r'JSON\.parse\("(.+?)"\)', snapshot_content, re.DOTALL)
+                if match is None:
+                    self.log.warning("Could not extract JSON from snapshot.js")
+                    return None
+                json_str = match.group(1).encode().decode("unicode_escape")
+                data = json.loads(json_str)
+        except TimeoutError:
+            self.log.warning("Model discovery (npmmirror) timed out after 30s")
+            return None
+        except Exception:
+            self.log.warning("Model discovery (npmmirror) failed", exc_info=True)
+            return None
+
+        all_models = self._parse_npmmirror_providers(data, provider_name_map)
+
+        self.log.info(
+            "Fetched %d models from %d providers via npmmirror",
+            len(all_models),
+            len({m.provider for m in all_models}),
+        )
+        return all_models if all_models else None
+
+    def _parse_npmmirror_providers(
+        self,
+        data: dict[str, Any],
+        provider_name_map: dict[str, str],
+    ) -> list[ModelInfo]:
+        """Parse provider data from the npmmirror snapshot into ModelInfo list.
+
+        Args:
+            data: Parsed JSON data from the snapshot.
+            provider_name_map: Mapping from models.dev provider names to
+                pydantic-ai provider names.
+
+        Returns:
+            List of parsed ModelInfo objects.
+        """
+        providers_data: dict[str, Any] = data.get("providers", {})
+        selected_providers = self._providers or None
         delta = timedelta(days=200)
-        return await get_all_models(providers=self._providers or ["models.dev"], max_age=delta)
+        cutoff = datetime.now() - delta
+        all_models: list[ModelInfo] = []
+
+        for provider_id, provider_data in providers_data.items():
+            if selected_providers is not None and provider_id not in selected_providers:
+                continue
+
+            if not isinstance(provider_data, dict):
+                continue
+            provider_models = provider_data.get("models")
+            if not isinstance(provider_models, dict):
+                continue
+
+            mapped_provider = provider_name_map.get(provider_id, provider_id)
+
+            for model_id, model_info in provider_models.items():
+                if not isinstance(model_info, dict):
+                    continue
+
+                try:
+                    model = self._parse_npmmirror_model(
+                        model_info,
+                        model_id=model_id,
+                        provider_id=mapped_provider,
+                        cutoff=cutoff,
+                    )
+                except Exception:
+                    self.log.debug(
+                        "Failed to parse model %s from provider %s",
+                        model_id,
+                        provider_id,
+                        exc_info=True,
+                    )
+                    continue
+
+                if model is not None:
+                    all_models.append(model)
+
+        # Passively populate CapabilityCache from the parsed models.
+        # Zero additional network requests — data is already available.
+        if all_models:
+            try:
+                from agentpool.host.stubs import _get_default_cache
+
+                cache = _get_default_cache()
+                for model_info in all_models:
+                    try:
+                        cache.populate_cache_from_model_info(model_info)
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "populate_cache_failed: %s",
+                            getattr(model_info, "id", "unknown"),
+                        )
+            except Exception:  # noqa: BLE001
+                logger.debug("populate_cache_init_failed")
+        return all_models
+
+    @staticmethod
+    def _parse_npmmirror_model(
+        data: dict[str, Any],
+        *,
+        model_id: str,
+        provider_id: str,
+        cutoff: datetime,
+    ) -> ModelInfo | None:
+        """Parse a single model entry from the npmmirror snapshot data.
+
+        Mirrors the field mapping in ``ModelsDevProvider._parse_model``.
+
+        Args:
+            data: Raw model data dict from the snapshot.
+            model_id: The model identifier key.
+            provider_id: Mapped provider name (pydantic-ai convention).
+            cutoff: Only include models created after this datetime.
+                    Models without ``created_at`` are always included.
+
+        Returns:
+            ``ModelInfo`` instance, or ``None`` if the model should be skipped.
+        """
+        import contextlib
+
+        from tokonomics.model_discovery.model_info import Modality, ModelInfo, ModelPricing
+
+        is_embedding = "embedding" in model_id.lower() or "embed" in model_id.lower()
+        if is_embedding:
+            return None
+
+        pricing: ModelPricing | None = None
+        cost = data.get("cost")
+        if isinstance(cost, dict):
+            pricing = ModelPricing(
+                prompt=cost.get("input", 0) / 1_000_000 if "input" in cost else None,
+                completion=cost.get("output", 0) / 1_000_000 if "output" in cost else None,
+                input_cache_read=cost.get("cache_read", 0) / 1_000_000
+                if "cache_read" in cost
+                else None,
+                input_cache_write=cost.get("cache_write", 0) / 1_000_000
+                if "cache_write" in cost
+                else None,
+            )
+
+        input_modalities: set[Modality] = {"text"}
+        output_modalities: set[Modality] = {"text"}
+        modalities = data.get("modalities")
+        if isinstance(modalities, dict):
+            raw_input = modalities.get("input", ["text"])
+            raw_output = modalities.get("output", ["text"])
+            input_modalities = {"file" if m == "pdf" else m for m in raw_input}
+            output_modalities = {"file" if m == "pdf" else m for m in raw_output}
+
+        created_at: datetime | None = None
+        release_date = data.get("release_date")
+        if release_date:
+            with contextlib.suppress(ValueError, TypeError):
+                created_at = datetime.strptime(release_date, "%Y-%m-%d")
+
+        if created_at is not None and created_at < cutoff:
+            return None
+
+        limit = data.get("limit")
+        if not isinstance(limit, dict):
+            limit = {}
+
+        return ModelInfo(
+            id=str(model_id),
+            name=str(data.get("name", model_id)),
+            provider=provider_id,
+            description=None,
+            pricing=pricing,
+            context_window=limit.get("context"),
+            max_output_tokens=limit.get("output"),
+            is_embedding=False,
+            input_modalities=input_modalities,
+            output_modalities=output_modalities,
+            is_free=pricing is not None and pricing.prompt == 0 and pricing.completion == 0,
+            created_at=created_at,
+            metadata={
+                "attachment": data.get("attachment", False),
+                "reasoning": data.get("reasoning", False),
+                "temperature": data.get("temperature", True),
+                "tool_call": data.get("tool_call", False),
+                "knowledge": data.get("knowledge"),
+                "last_updated": data.get("last_updated"),
+                "open_weights": data.get("open_weights", False),
+            },
+        )
 
     async def get_modes(self) -> list[ModeCategory]:
         """Get available mode categories for this agent."""
@@ -1359,21 +1939,22 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
                             variant_name,
                         )
                         break
-            # Validate model exists (check both tokonomics models and model_variants)
+            # Validate model exists — check model_variants FIRST to avoid
+            # slow tokonomics network fetch when the model is configured locally.
             is_valid = False
-            if models := await self.get_available_models():
-                valid_ids = [m.pydantic_ai_id for m in models]
-                if mode_id in valid_ids:
-                    is_valid = True
-                    self.log.info("Model %s validated against tokonomics", mode_id)
-            # Also check model_variants from manifest (by variant name or identifier)
-            if not is_valid and ctx and variant_name in ctx.manifest.model_variants:
+            if ctx and variant_name in ctx.manifest.model_variants:
                 is_valid = True
                 self.log.info(
                     "Model %s validated against model_variants (variant: %s)",
                     mode_id,
                     variant_name,
                 )
+            # Fall back to tokonomics discovery only if not in manifest
+            if not is_valid and (models := await self.get_available_models()):
+                valid_ids = [m.pydantic_ai_id for m in models]
+                if mode_id in valid_ids:
+                    is_valid = True
+                    self.log.info("Model %s validated against tokonomics", mode_id)
             if not is_valid:
                 available = list(ctx.manifest.model_variants.keys()) if ctx else "N/A"
                 self.log.warning(

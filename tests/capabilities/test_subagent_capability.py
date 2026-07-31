@@ -10,7 +10,7 @@ from pydantic_ai.toolsets import FunctionToolset
 import pytest
 
 from agentpool.agents.context import AgentContext as NativeAgentContext
-from agentpool.capabilities.agent_context import AgentContext
+from agentpool.capabilities.agent_context import AgentContextDeps
 from agentpool.capabilities.delegation import AgentNotFoundError, DelegationService
 from agentpool.capabilities.subagent_capability import SubagentCapability
 from agentpool.host.context import RunScope
@@ -37,6 +37,16 @@ class FakeDelegationService:
         self._spawn_output = spawn_output if spawn_output is not None else ["chunk_1", "chunk_2"]
         self.spawn_calls: list[tuple[str, str]] = []
 
+    async def create_child_session(
+        self,
+        agent_name: str,
+        *,
+        parent_session_id: str | None = None,
+        description: str = "",
+        **metadata: Any,
+    ) -> str:
+        return "child_session_001"
+
     def spawn_subagent(self, name: str, prompt: str) -> Any:
         """Yield test chunks, recording the call."""
         self.spawn_calls.append((name, prompt))
@@ -55,7 +65,7 @@ class FakeDelegationService:
 
 
 def _make_ctx(delegation: DelegationService) -> Any:
-    """Create a RunContext-like object with AgentContext as deps.
+    """Create a RunContext-like object with AgentContextDeps as deps.
 
     Sets ``host.session_pool = None`` so the fallback delegation path
     is exercised (matching pre-migration behavior). The
@@ -67,7 +77,7 @@ def _make_ctx(delegation: DelegationService) -> Any:
     agent_registry = MagicMock()
     agent_registry.list_names = MagicMock(return_value=delegation.get_available_agents())
     ctx = MagicMock()
-    ctx.deps = AgentContext(
+    ctx.deps = AgentContextDeps(
         agent_registry=agent_registry,
         delegation=delegation,
         session=MagicMock(),
@@ -242,3 +252,81 @@ def test_agent_not_found_error_message() -> None:
     err = AgentNotFoundError("my_agent")
     assert err.agent_name == "my_agent"
     assert "my_agent" in str(err)
+
+
+# =============================================================================
+# Regression tests: _resolve_agent_context unwrapping
+# =============================================================================
+
+
+async def test_resolve_agent_context_from_runtime_context() -> None:
+    """_resolve_agent_context unwraps AgentContextDeps from RuntimeAgentContext.data.
+
+    In production, PydanticAI wraps our AgentContextDeps inside
+    agents.context.AgentContext.data. The tool functions receive
+    ctx.deps = agents.context.AgentContext, and our
+    capabilities.agent_context.AgentContextDeps is at ctx.deps.data.
+    """
+    from agentpool.agents.context import AgentContext as RuntimeAgentContext
+
+    delegation = FakeDelegationService(agents=["alpha", "beta"])
+    host = MagicMock()
+    host.session_pool = None
+    agent_registry = MagicMock()
+    agent_registry.list_names = MagicMock(return_value=delegation.get_available_agents())
+
+    cap_ctx = AgentContextDeps(
+        agent_registry=agent_registry,
+        delegation=delegation,
+        session=MagicMock(),
+        scope=RunScope(),
+        host=host,
+    )
+    runtime_ctx = RuntimeAgentContext(node=MagicMock())
+    runtime_ctx.data = cap_ctx
+
+    ctx = MagicMock()
+    ctx.deps = runtime_ctx
+
+    result = await SubagentCapability.get_available_agents(ctx)
+
+    assert result == ["alpha", "beta"]
+
+
+async def test_resolve_agent_context_none_deps() -> None:
+    """_resolve_agent_context raises RuntimeError when deps is None."""
+    ctx = MagicMock()
+    ctx.deps = None
+
+    with pytest.raises(
+        RuntimeError, match=r"SubagentCapability requires AgentContextDeps as deps\. Got: None"
+    ):
+        await SubagentCapability.get_available_agents(ctx)
+
+
+async def test_resolve_agent_context_runtime_ctx_none_data() -> None:
+    """_resolve_agent_context raises RuntimeError when RuntimeAgentContext.data is None."""
+    from agentpool.agents.context import AgentContext as RuntimeAgentContext
+
+    runtime_ctx = RuntimeAgentContext(node=MagicMock())
+    runtime_ctx.data = None
+
+    ctx = MagicMock()
+    ctx.deps = runtime_ctx
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"SubagentCapability requires AgentContextDeps at deps\.data\. Got: None",
+    ):
+        await SubagentCapability.get_available_agents(ctx)
+
+
+async def test_resolve_agent_context_neither_type() -> None:
+    """_resolve_agent_context raises RuntimeError for unknown deps type."""
+    ctx = MagicMock()
+    ctx.deps = object()
+
+    with pytest.raises(
+        RuntimeError, match=r"SubagentCapability requires AgentContextDeps as deps\. Got: object"
+    ):
+        await SubagentCapability.get_available_agents(ctx)

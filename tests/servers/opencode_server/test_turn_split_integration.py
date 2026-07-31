@@ -89,6 +89,7 @@ class _FakeBridge(OpenCodeEventBridgeMixin):
         self._contexts: dict[str, EventProcessorContext] = {}
         self._adapters: dict[str, OpenCodeEventAdapter] = {}
         self._message_registered: dict[str, bool] = {}
+        self._steer_split_ids: dict[str, set[str]] = {}
         self._child_to_parent: dict[str, str] = {}
         self._child_spawns: dict[str, SpawnSessionStart] = {}
         self._children_of: dict[str, set[str]] = {}
@@ -165,7 +166,7 @@ async def test_single_steer_creates_two_assistant_messages(
             message_id=steer_msg_id,
             content="steer text",
             delivery="steer",
-            source="background_task",
+            source="processed",
         ),
         _part_start(1, session_id),
         _part_delta(1, session_id, "world"),
@@ -243,7 +244,7 @@ async def test_message_id_ordering_after_split(
             message_id=msg_steer_id,
             content="steer text",
             delivery="steer",
-            source="background_task",
+            source="processed",
         ),
         _part_start(1, session_id),
         _part_delta(1, session_id, "world"),
@@ -266,11 +267,13 @@ async def test_message_id_ordering_after_split(
         f"msg_steer ({msg_steer_id}) must sort before msg_A2 ({msg_a2_id})"
     )
 
-    # Also verify the actual messages in session state match
+    # Also verify the actual messages in session state match.
+    # Note: msg_steer_id is NOT in all_ids because source="processed" does
+    # NOT create a UserMessage (only source="accepted" creates UserMessages).
+    # The split still happens, creating A2 with a new ID.
     all_ids = _all_message_ids(server_state, session_id)
     assert msg_u_id in all_ids
     assert msg_a1_id in all_ids
-    assert msg_steer_id in all_ids
     assert msg_a2_id in all_ids
 
 
@@ -307,7 +310,7 @@ async def test_multiple_steers_create_three_splits(
             message_id=steer_1_id,
             content="steer 1",
             delivery="steer",
-            source="background_task",
+            source="processed",
         ),
         _part_start(1, session_id),
         _part_delta(1, session_id, "part2"),
@@ -316,7 +319,7 @@ async def test_multiple_steers_create_three_splits(
             message_id=steer_2_id,
             content="steer 2",
             delivery="steer",
-            source="background_task",
+            source="processed",
         ),
         _part_start(2, session_id),
         _part_delta(2, session_id, "part3"),
@@ -359,8 +362,7 @@ async def test_followup_does_not_trigger_split(
     Given: A real EventProcessor with an active turn that receives a
         followup UserMessageInsertedEvent (not steer).
     When: Events are fed through _handle_event.
-    Then: Session has only 1 assistant message (no split), and
-        _steer_received flag was never set to True.
+    Then: Session has only 1 assistant message (no split).
     """
     session_id = "test-split-4"
     bridge = _FakeBridge(server_state, server_state.pool.session_pool)
@@ -376,7 +378,7 @@ async def test_followup_does_not_trigger_split(
             message_id=followup_msg_id,
             content="followup text",
             delivery="followup",
-            source="background_task",
+            source="accepted",
         ),
         _part_delta(0, session_id, "hello"),
         StreamCompleteEvent(
@@ -390,10 +392,6 @@ async def test_followup_does_not_trigger_split(
     assert len(assistant_msgs) == 1, (
         f"Expected 1 assistant message (no split), got {len(assistant_msgs)}"
     )
-
-    # Verify _steer_received was never set to True
-    ctx = bridge._contexts[session_id]
-    assert ctx._steer_received is False, "_steer_received should remain False for followup delivery"
 
 
 # =============================================================================
@@ -444,7 +442,7 @@ async def test_split_preserves_tool_parts_in_a1(
             message_id=steer_msg_id,
             content="steer text",
             delivery="steer",
-            source="background_task",
+            source="processed",
         ),
         _part_start(1, session_id),
         _part_delta(1, session_id, "after steer"),
@@ -511,7 +509,7 @@ async def test_d1_reset_still_works_after_split(
             message_id=steer_msg_id,
             content="steer text",
             delivery="steer",
-            source="background_task",
+            source="processed",
         ),
         _part_start(1, session_id),
         _part_delta(1, session_id, "turn1-after-steer"),
@@ -562,3 +560,394 @@ async def test_d1_reset_still_works_after_split(
     # A3 should also have time.completed set (by StreamCompleteEvent)
     assert isinstance(a3.info, AssistantMessage)
     assert a3.info.time.completed is not None, "A3 time.completed should be set"
+
+
+# =============================================================================
+# TEST 7: Split triggers on processed steer event (precise trigger)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_split_triggers_on_processed_steer_event_precise(
+    server_state: ServerState,
+) -> None:
+    """UserMessageInsertedEvent(source="processed", delivery="steer") triggers split.
+
+    Given: A real EventProcessor with an active turn that receives a processed
+        steer UserMessageInsertedEvent (from EnqueuedMessagesEvent drain time).
+    When: Events are fed through _handle_event.
+    Then: Session has 2 assistant messages (split happened immediately on the
+        processed steer event, no PartStartEvent heuristic needed).
+    """
+    session_id = "test-split-7"
+    bridge = _FakeBridge(server_state, server_state.pool.session_pool)
+    await bridge._before_consumer_loop(session_id)
+
+    steer_msg_id = identifier.ascending("message")
+
+    events: list[Any] = [
+        RunStartedEvent(run_id="run-1", agent_name="test-agent", session_id=session_id),
+        _part_start(0, session_id),
+        _part_delta(0, session_id, "hello"),
+        UserMessageInsertedEvent(
+            session_id=session_id,
+            message_id=steer_msg_id,
+            content="steer text",
+            delivery="steer",
+            source="processed",
+        ),
+        _part_delta(0, session_id, "world"),
+        StreamCompleteEvent(
+            message=ChatMessage(content="done", role="assistant"),
+            session_id=session_id,
+        ),
+    ]
+    await _feed_events(bridge, session_id, events)
+
+    assistant_msgs = _assistant_messages(server_state, session_id)
+    assert len(assistant_msgs) == 2, f"Expected 2 assistant messages, got {len(assistant_msgs)}"
+
+
+# =============================================================================
+# TEST 8: Split DOES trigger on internal steer event (fire-and-forget fallback)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_split_triggers_on_processed_steer_event(
+    server_state: ServerState,
+) -> None:
+    """UserMessageInsertedEvent(source="processed", delivery="steer") DOES split.
+
+    source="processed" (fire-and-forget) is a fallback when
+    EnqueuedMessagesEvent is not available. The split triggers on
+    processed source to ensure the turn boundary is created.
+    """
+    session_id = "test-split-8"
+    bridge = _FakeBridge(server_state, server_state.pool.session_pool)
+    await bridge._before_consumer_loop(session_id)
+
+    steer_msg_id = identifier.ascending("message")
+
+    events: list[Any] = [
+        RunStartedEvent(run_id="run-1", agent_name="test-agent", session_id=session_id),
+        _part_start(0, session_id),
+        _part_delta(0, session_id, "hello"),
+        UserMessageInsertedEvent(
+            session_id=session_id,
+            message_id=steer_msg_id,
+            content="steer text",
+            delivery="steer",
+            source="processed",
+        ),
+        _part_delta(0, session_id, "world"),
+        StreamCompleteEvent(
+            message=ChatMessage(content="done", role="assistant"),
+            session_id=session_id,
+        ),
+    ]
+    await _feed_events(bridge, session_id, events)
+
+    assistant_msgs = _assistant_messages(server_state, session_id)
+    assert len(assistant_msgs) == 2, (
+        f"Expected 2 assistant messages (split on processed source), got {len(assistant_msgs)}"
+    )
+
+
+# =============================================================================
+# TEST 9: Split does NOT trigger on internal followup event
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_split_does_not_trigger_on_accepted_followup_event(
+    server_state: ServerState,
+) -> None:
+    """UserMessageInsertedEvent(source="accepted", delivery="followup") does NOT split.
+
+    Given: A real EventProcessor with an active turn that receives an accepted
+        followup UserMessageInsertedEvent (not steer delivery).
+    When: Events are fed through _handle_event.
+    Then: Session has only 1 assistant message (no split).
+    """
+    session_id = "test-split-9"
+    bridge = _FakeBridge(server_state, server_state.pool.session_pool)
+    await bridge._before_consumer_loop(session_id)
+
+    followup_msg_id = identifier.ascending("message")
+
+    events: list[Any] = [
+        RunStartedEvent(run_id="run-1", agent_name="test-agent", session_id=session_id),
+        _part_start(0, session_id),
+        _part_delta(0, session_id, "hello"),
+        UserMessageInsertedEvent(
+            session_id=session_id,
+            message_id=followup_msg_id,
+            content="followup text",
+            delivery="followup",
+            source="accepted",
+        ),
+        _part_delta(0, session_id, "world"),
+        StreamCompleteEvent(
+            message=ChatMessage(content="done", role="assistant"),
+            session_id=session_id,
+        ),
+    ]
+    await _feed_events(bridge, session_id, events)
+
+    assistant_msgs = _assistant_messages(server_state, session_id)
+    assert len(assistant_msgs) == 1, (
+        f"Expected 1 assistant message (no split for followup), got {len(assistant_msgs)}"
+    )
+
+
+# =============================================================================
+# TEST 10: Split does NOT trigger when no message registered
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_split_does_not_trigger_when_no_message_registered(
+    server_state: ServerState,
+) -> None:
+    """Accepted steer event with no registered message does NOT split.
+
+    Given: A real EventProcessor where _message_registered is False (no
+        assistant message registered yet) receives a processed steer event.
+    When: Events are fed through _handle_event.
+    Then: Session has only 1 assistant message (no split), because the
+        _message_registered guard prevents splitting before any content.
+    """
+    session_id = "test-split-10"
+    bridge = _FakeBridge(server_state, server_state.pool.session_pool)
+    await bridge._before_consumer_loop(session_id)
+
+    steer_msg_id = identifier.ascending("message")
+
+    # Feed the internal steer event as the VERY FIRST event, before
+    # RunStartedEvent. At this point _message_registered is False (default),
+    # so the split guard should prevent the split.
+    events: list[Any] = [
+        UserMessageInsertedEvent(
+            session_id=session_id,
+            message_id=steer_msg_id,
+            content="steer text",
+            delivery="steer",
+            source="processed",
+        ),
+        RunStartedEvent(run_id="run-1", agent_name="test-agent", session_id=session_id),
+        _part_start(0, session_id),
+        _part_delta(0, session_id, "hello"),
+        StreamCompleteEvent(
+            message=ChatMessage(content="done", role="assistant"),
+            session_id=session_id,
+        ),
+    ]
+    await _feed_events(bridge, session_id, events)
+
+    assistant_msgs = _assistant_messages(server_state, session_id)
+    assert len(assistant_msgs) == 1, (
+        f"Expected 1 assistant message (no split when unregistered), got {len(assistant_msgs)}"
+    )
+
+
+# =============================================================================
+# TEST 11: Split creates new assistant message with fresh ID
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_split_creates_new_assistant_message(
+    server_state: ServerState,
+) -> None:
+    """Split creates a new assistant message with a fresh message ID.
+
+    Given: A real EventProcessor with an active turn that receives a processed
+        steer event.
+    When: Events are fed through _handle_event.
+    Then: The split creates a new assistant message (A2) whose ID is different
+        from the original (A1), and A2 is registered in the session.
+    """
+    session_id = "test-split-11"
+    bridge = _FakeBridge(server_state, server_state.pool.session_pool)
+    await bridge._before_consumer_loop(session_id)
+
+    ctx = bridge._contexts[session_id]
+    original_msg_id = ctx.assistant_msg_id
+
+    steer_msg_id = identifier.ascending("message")
+
+    events: list[Any] = [
+        RunStartedEvent(run_id="run-1", agent_name="test-agent", session_id=session_id),
+        _part_start(0, session_id),
+        _part_delta(0, session_id, "hello"),
+        UserMessageInsertedEvent(
+            session_id=session_id,
+            message_id=steer_msg_id,
+            content="steer text",
+            delivery="steer",
+            source="processed",
+        ),
+        _part_delta(0, session_id, "world"),
+        StreamCompleteEvent(
+            message=ChatMessage(content="done", role="assistant"),
+            session_id=session_id,
+        ),
+    ]
+    await _feed_events(bridge, session_id, events)
+
+    # After split, ctx.assistant_msg_id should be different (A2's ID)
+    assert ctx.assistant_msg_id != original_msg_id, (
+        "Split should have created a new assistant message with a fresh ID"
+    )
+
+    # Both messages should be in session state
+    all_ids = _all_message_ids(server_state, session_id)
+    assert original_msg_id in all_ids, "A1 (original) should be in session messages"
+    assert ctx.assistant_msg_id in all_ids, "A2 (new) should be in session messages"
+
+
+# =============================================================================
+# TEST 12: Split triggers on processed source (5.17)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_split_triggers_on_processed_source(
+    server_state: ServerState,
+) -> None:
+    """UserMessageInsertedEvent(source="processed", delivery="steer") triggers split.
+
+    Given: A real EventProcessor with an active turn that receives a
+        processed steer UserMessageInsertedEvent.
+    When: Events are fed through _handle_event.
+    Then: Session has 2 assistant messages (split triggered by processed source).
+    """
+    session_id = "test-split-12"
+    bridge = _FakeBridge(server_state, server_state.pool.session_pool)
+    await bridge._before_consumer_loop(session_id)
+
+    steer_msg_id = identifier.ascending("message")
+
+    events: list[Any] = [
+        RunStartedEvent(run_id="run-1", agent_name="test-agent", session_id=session_id),
+        _part_start(0, session_id),
+        _part_delta(0, session_id, "hello"),
+        UserMessageInsertedEvent(
+            session_id=session_id,
+            message_id=steer_msg_id,
+            content="steer text",
+            delivery="steer",
+            source="processed",
+        ),
+        _part_delta(0, session_id, "world"),
+        StreamCompleteEvent(
+            message=ChatMessage(content="done", role="assistant"),
+            session_id=session_id,
+        ),
+    ]
+    await _feed_events(bridge, session_id, events)
+
+    assistant_msgs = _assistant_messages(server_state, session_id)
+    assert len(assistant_msgs) == 2, (
+        f"Expected 2 assistant messages (split on processed source), got {len(assistant_msgs)}"
+    )
+
+
+# =============================================================================
+# TEST 13: Split does NOT trigger on accepted source (5.18)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_split_does_not_trigger_on_accepted_source(
+    server_state: ServerState,
+) -> None:
+    """UserMessageInsertedEvent(source="accepted", delivery="steer") does NOT split.
+
+    Given: A real EventProcessor with an active turn that receives an
+        accepted steer UserMessageInsertedEvent.
+    When: Events are fed through _handle_event.
+    Then: Session has only 1 assistant message (accepted source does NOT
+        trigger split — only processed source does).
+    """
+    session_id = "test-split-13"
+    bridge = _FakeBridge(server_state, server_state.pool.session_pool)
+    await bridge._before_consumer_loop(session_id)
+
+    steer_msg_id = identifier.ascending("message")
+
+    events: list[Any] = [
+        RunStartedEvent(run_id="run-1", agent_name="test-agent", session_id=session_id),
+        _part_start(0, session_id),
+        _part_delta(0, session_id, "hello"),
+        UserMessageInsertedEvent(
+            session_id=session_id,
+            message_id=steer_msg_id,
+            content="steer text",
+            delivery="steer",
+            source="accepted",
+        ),
+        _part_delta(0, session_id, "world"),
+        StreamCompleteEvent(
+            message=ChatMessage(content="done", role="assistant"),
+            session_id=session_id,
+        ),
+    ]
+    await _feed_events(bridge, session_id, events)
+
+    assistant_msgs = _assistant_messages(server_state, session_id)
+    assert len(assistant_msgs) == 1, (
+        f"Expected 1 assistant message (accepted source does NOT split), got {len(assistant_msgs)}"
+    )
+
+
+# =============================================================================
+# TEST 14: Split skipped during replay (5.22)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_split_skipped_during_replay(
+    server_state: ServerState,
+) -> None:
+    """EventBridge does NOT split when _replaying=True even for processed+steer.
+
+    Given: A real EventProcessor with an active turn and _replaying=True
+        that receives a processed steer UserMessageInsertedEvent.
+    When: Events are fed through _handle_event with _replaying set.
+    Then: Session has only 1 assistant message (split is skipped during
+        replay to avoid duplicate splits from journaled events).
+    """
+    session_id = "test-split-14"
+    bridge = _FakeBridge(server_state, server_state.pool.session_pool)
+    await bridge._before_consumer_loop(session_id)
+
+    # Set _replaying flag to simulate crash-recovery replay.
+    bridge._replaying = True
+
+    steer_msg_id = identifier.ascending("message")
+
+    events: list[Any] = [
+        RunStartedEvent(run_id="run-1", agent_name="test-agent", session_id=session_id),
+        _part_start(0, session_id),
+        _part_delta(0, session_id, "hello"),
+        UserMessageInsertedEvent(
+            session_id=session_id,
+            message_id=steer_msg_id,
+            content="steer text",
+            delivery="steer",
+            source="processed",
+        ),
+        _part_delta(0, session_id, "world"),
+        StreamCompleteEvent(
+            message=ChatMessage(content="done", role="assistant"),
+            session_id=session_id,
+        ),
+    ]
+    await _feed_events(bridge, session_id, events)
+
+    assistant_msgs = _assistant_messages(server_state, session_id)
+    assert len(assistant_msgs) == 1, (
+        f"Expected 1 assistant message (split skipped during replay), got {len(assistant_msgs)}"
+    )

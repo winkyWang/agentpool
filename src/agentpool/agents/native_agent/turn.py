@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import time
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -22,6 +23,8 @@ from pydantic_graph import End
 
 from agentpool.agents.events.events import (
     RunErrorEvent,
+    StepErrorMetadata,
+    StepUsageEvent,
     StreamCompleteEvent,
     ToolCallCompleteEvent,
 )
@@ -33,11 +36,13 @@ from agentpool.observability.spans import safe_span
 from agentpool.orchestrator.event_mapper import (
     EventMapper,
     normalize_thinking_parts_in_messages,
+    sanitize_tool_call_args_in_messages,
 )
 from agentpool.orchestrator.turn import HookAwareTurn, Turn
 from agentpool.tasks.exceptions import RunAbortedError
 from agentpool.tools.base import is_terminal_tool
 from agentpool.utils.pydantic_ai_helpers import flatten_prompts
+from agentpool.utils.usage import diff_usage
 
 
 if TYPE_CHECKING:
@@ -123,14 +128,18 @@ class NativeTurn(HookAwareTurn, Turn):
         return str(self._prompts)
 
     def _set_message_history(self, messages: list[ModelMessage]) -> None:
-        """Store message history with ThinkingPart normalization.
+        """Store message history with ThinkingPart normalization and tool call args sanitization.
 
         Wraps ``self._message_history = ...`` to ensure raw CoT providers
         (vLLM, gpt-oss, etc.) have their reasoning text copied from
         ``provider_details['raw_content']`` into ``ThinkingPart.content``
         before the history is persisted.  See issue #155.
+
+        Also repairs duplicated tool call arguments caused by streaming bugs
+        in inference backends (vLLM glm47 parser, SGLang GLM detectors).
         """
         normalize_thinking_parts_in_messages(messages)
+        sanitize_tool_call_args_in_messages(messages)
         self._message_history = messages
 
     async def execute(self) -> AsyncGenerator[RichAgentStreamEvent[Any]]:  # noqa: PLR0915, PLR0911
@@ -176,6 +185,7 @@ class NativeTurn(HookAwareTurn, Turn):
                 mapper = EventMapper(
                     agent_name=self._agent.name,
                     message_id=self._message_id,
+                    _enqueue_message_ids=self._run_ctx._pending_enqueue_message_ids,
                 )
 
                 terminal_tool_names: set[str] = set()
@@ -198,7 +208,7 @@ class NativeTurn(HookAwareTurn, Turn):
                         "get_tools() timed out after 5s, skipping tool kind map",
                         agent=self._agent.name,
                     )
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.debug("Failed to build tool kind map", exc_info=True)
 
                 agent_deps = self._agent.get_context(
@@ -229,6 +239,7 @@ class NativeTurn(HookAwareTurn, Turn):
                     effective_prompts = flattened
 
                 agent_run: Any = None
+                current_node: Any = None
                 try:
                     iter_kwargs: dict[str, Any] = dict(
                         deps=agent_deps,
@@ -242,8 +253,20 @@ class NativeTurn(HookAwareTurn, Turn):
                     ) as agent_run:
                         if self._run_ctx._run_handle is not None:
                             self._run_ctx._run_handle.active_agent_run = agent_run
+                            # Drain steer messages that arrived before
+                            # active_agent_run was set (e.g., during
+                            # start() feedback_queue drain or race window).
+                            self._run_ctx._run_handle.drain_queued_steer_messages()
 
                         node = agent_run.next_node
+                        current_node = node
+
+                        # Track per-step token usage.  ``agent_run.usage``
+                        # is a live mutable ``RunUsage`` — snapshot with
+                        # ``copy.copy()`` (uses ``RunUsage.__copy__`` which
+                        # deep-copies the ``details`` dict).
+                        prev_usage = copy.copy(agent_run.usage)
+                        step_index = 0
 
                         while not isinstance(node, End):
                             if self._run_ctx.cancelled:
@@ -259,7 +282,10 @@ class NativeTurn(HookAwareTurn, Turn):
                                             if self._run_ctx.cancelled:
                                                 break
 
-                                            mapped = mapper.map_event(event)
+                                            mapped = mapper.map_event(
+                                                event,
+                                                current_node_type=type(node).__name__,
+                                            )
                                             if mapped is not None:
                                                 yield mapped
 
@@ -293,12 +319,45 @@ class NativeTurn(HookAwareTurn, Turn):
                                 iteration_task = asyncio.create_task(agent_run.next(node))
                                 self._agent._iteration_task = iteration_task
                                 node = await iteration_task
+                                current_node = node
+
+                                # Repair duplicated tool call args before CallToolsNode
+                                # validates and executes them. vLLM's glm47 parser can
+                                # emit args twice in streaming mode (vllm#47504).
+                                if isinstance(node, CallToolsNode):
+                                    sanitize_tool_call_args_in_messages([node.model_response])
+
                                 logger.info(
                                     "agent_run.next() completed",
                                     next_node_type=type(node).__name__,
                                 )
                             finally:
                                 self._agent._iteration_task = None
+
+                            # Emit per-step token usage after each
+                            # ``agent_run.next(node)`` call.  Only emit when
+                            # the step involved an LLM call
+                            # (``step_diff.requests > 0``); tool-only
+                            # iterations (e.g. CallToolsNode advancing
+                            # without a new model request) are skipped.
+                            step_diff = diff_usage(agent_run.usage, prev_usage)
+                            if step_diff.requests > 0:
+                                logger.info(
+                                    "Emitting StepUsageEvent",
+                                    step_index=step_index,
+                                    step_usage_input=step_diff.input_tokens,
+                                    step_usage_output=step_diff.output_tokens,
+                                    step_usage_total=step_diff.total_tokens,
+                                    cumulative_input=agent_run.usage.input_tokens,
+                                    cumulative_output=agent_run.usage.output_tokens,
+                                )
+                                yield StepUsageEvent(
+                                    step_index=step_index,
+                                    step_usage=step_diff,
+                                    cumulative_usage=copy.copy(agent_run.usage),
+                                )
+                                step_index += 1
+                            prev_usage = copy.copy(agent_run.usage)
 
                         self._set_message_history(agent_run.all_messages())
                         logger.info("After while loop — building final message")
@@ -363,10 +422,11 @@ class NativeTurn(HookAwareTurn, Turn):
                 except asyncio.CancelledError:
                     if self._run_ctx.cancelled:
                         # Cancellation came from cancel() — exit gracefully
-                        # without yielding StreamCompleteEvent. Set _final_message
-                        # so turn.final_message doesn't raise for callers.
-                        # Capture _message_history from agent_run so the cancelled
-                        # turn's partial messages are preserved for the next turn.
+                        # with a StreamCompleteEvent(cancelled=True). Set
+                        # _final_message so turn.final_message is accessible
+                        # to callers. Capture _message_history from agent_run
+                        # so the cancelled turn's partial messages are
+                        # preserved for the next turn.
                         if agent_run is not None:
                             with contextlib.suppress(Exception):
                                 self._set_message_history(agent_run.all_messages())
@@ -384,6 +444,11 @@ class NativeTurn(HookAwareTurn, Turn):
                             message_id=self._message_id,
                             session_id=self._run_ctx.session_id,
                             parent_id=self._parent_id,
+                            messages=self._message_history or [],
+                        )
+                        yield StreamCompleteEvent(
+                            message=self._final_message,
+                            cancelled=True,
                         )
                         return
                     raise
@@ -401,6 +466,18 @@ class NativeTurn(HookAwareTurn, Turn):
                         if agent_run is not None:
                             with contextlib.suppress(Exception):
                                 self._set_message_history(agent_run.all_messages())
+                        self._final_message = ChatMessage(
+                            content="",
+                            role="assistant",
+                            name=self._agent.name,
+                            message_id=self._message_id,
+                            session_id=self._run_ctx.session_id,
+                            parent_id=self._parent_id,
+                        )
+                        yield StreamCompleteEvent(
+                            message=self._final_message,
+                            cancelled=True,
+                        )
                         return
                     raise
 
@@ -431,10 +508,19 @@ class NativeTurn(HookAwareTurn, Turn):
                         yield StreamCompleteEvent(message=self._final_message)
                         return
                     logger.exception("NativeTurn execution failed")
+                    node_type_str = (
+                        type(current_node).__name__ if current_node is not None else "unknown"
+                    )
+                    step_error = StepErrorMetadata(
+                        node_type=node_type_str,
+                        exception_type=type(exc).__name__,
+                        exception_message=str(exc),
+                    )
                     yield RunErrorEvent(
                         message=str(exc),
                         agent_name=self._agent.name,
                         run_id=self._run_ctx.run_id,
+                        step_error=step_error,
                     )
                     return
 
@@ -444,9 +530,9 @@ class NativeTurn(HookAwareTurn, Turn):
 
                 # Build final message always (even when cancelled) so that
                 # turn.final_message is accessible to callers after execute()
-                # returns. When cancelled via cancel(), we skip yielding
-                # StreamCompleteEvent to avoid double turn_complete (end_turn
-                # + cancelled).
+                # returns. When cancelled via cancel(), the cancelled paths
+                # above already yielded StreamCompleteEvent(cancelled=True)
+                # and returned, so this code only runs on the success path.
                 if self._message_history is not None:
                     # Only extract text from messages generated in THIS turn,
                     # not from the input history (which may contain previous
@@ -466,7 +552,7 @@ class NativeTurn(HookAwareTurn, Turn):
                                 structured = getattr(run_result, "output", None)
                                 if structured is not None and not isinstance(structured, str):
                                     content = structured
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             logger.debug(
                                 "Failed to extract structured result from agent run",
                                 exc_info=True,
@@ -478,6 +564,8 @@ class NativeTurn(HookAwareTurn, Turn):
                 # (Talk stats, storage, ACP event converter) can track token usage.
                 cost_info: TokenCost | None = None
                 request_usage: RequestUsage | None = None
+                response_model_name: str | None = None
+                response_provider_name: str | None = None
                 if agent_run is not None:
                     try:
                         run_usage = agent_run.usage
@@ -485,14 +573,20 @@ class NativeTurn(HookAwareTurn, Turn):
                             usage=run_usage,
                             model=self._agent.model_name or "",
                         )
-                        # Extract RequestUsage from the last ModelResponse in new_messages.
-                        # agent_run.usage is RunUsage (cumulative), but ChatMessage.usage
-                        # expects RequestUsage (per-request) for ACP/OpenCode converters.
+                        # Extract RequestUsage and model info from the last
+                        # ModelResponse in new_messages. agent_run.usage is
+                        # RunUsage (cumulative), but ChatMessage.usage expects
+                        # RequestUsage (per-request) for ACP/OpenCode converters.
+                        # model_name/provider_name are needed by the OpenCode
+                        # event processor to resolve variant names for TUI
+                        # context-length display.
                         for msg in reversed(new_messages):
                             if isinstance(msg, ModelResponse):
                                 request_usage = msg.usage
+                                response_model_name = msg.model_name
+                                response_provider_name = msg.provider_name
                                 break
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.debug("Failed to extract usage from agent run", exc_info=True)
 
                 self._final_message = ChatMessage(
@@ -506,11 +600,14 @@ class NativeTurn(HookAwareTurn, Turn):
                     usage=request_usage or RequestUsage(),
                     response_time=time.perf_counter() - self._run_ctx.start_time,
                     messages=new_messages if agent_run is not None else [],
+                    model_name=response_model_name,
+                    provider_name=response_provider_name,
                 )
 
                 # Belt-and-suspenders: if cancelled during execution (e.g.
                 # CancelledError swallowed by pydantic-ai inside agent_run.next()),
-                # exit without yielding StreamCompleteEvent.
+                # yield StreamCompleteEvent(cancelled=True) to ensure consumers
+                # receive a terminal event.
                 if self._run_ctx.cancelled:
                     logger.info("Skipping StreamCompleteEvent — run_ctx.cancelled is True")
                     # Flush pending tool calls so downstream consumers receive
@@ -520,6 +617,18 @@ class NativeTurn(HookAwareTurn, Turn):
                     self._log_cancelled_tool_executions(cancelled_events)
                     for tool_event in cancelled_events:
                         yield tool_event
+                    self._final_message = ChatMessage(
+                        content="",
+                        role="assistant",
+                        name=self._agent.name,
+                        message_id=self._message_id,
+                        session_id=self._run_ctx.session_id,
+                        parent_id=self._parent_id,
+                    )
+                    yield StreamCompleteEvent(
+                        message=self._final_message,
+                        cancelled=True,
+                    )
                     return
 
                 logger.info("Yielding StreamCompleteEvent")
@@ -531,3 +640,17 @@ class NativeTurn(HookAwareTurn, Turn):
                 # producing one — pass it as-is.
                 duration_ms = (time.perf_counter() - turn_start) * 1000
                 await self._fire_post_turn_hooks(self._final_message, duration_ms=duration_ms)
+
+                # Clear TURN-scope capabilities from the ExtensionRegistry.
+                # This cleans up per-turn capabilities (e.g. populated
+                # ModalityFilterCapability) so they don't accumulate.
+                if self._agent.host_context is not None:
+                    registry = self._agent.host_context.extension_registry
+                    if registry is not None:
+                        turn_id = self._run_ctx.turn_id
+                        if turn_id is not None:
+                            registry.clear_turn(
+                                session_id=self._run_ctx.session_id,
+                                agent_name=self._agent.name,
+                                turn_id=turn_id,
+                            )

@@ -183,11 +183,12 @@ async def test_steer_while_running_with_agent_run() -> None:
 
 @pytest.mark.unit
 async def test_steer_with_agent_run_emits_user_message_inserted_event() -> None:
-    """steer() with active agent_run publishes UserMessageInsertedEvent to EventBus.
+    """steer() with active agent_run skips fire-and-forget emission.
 
-    Given: A RunHandle with a real EventBus and active agent_run.
-    When: steer() is called with emit_user_message=True (default).
-    Then: UserMessageInsertedEvent is published to EventBus with delivery="steer".
+    When ``_enqueued_messages_available=True`` and ``active_agent_run`` is
+    set, the display event comes from ``handle_enqueued_messages()`` with
+    ``source="processed"`` instead of the fire-and-forget
+    ``_schedule_user_message_emission()`` path.
     """
     from agentpool.agents.events.events import UserMessageInsertedEvent
 
@@ -211,23 +212,29 @@ async def test_steer_with_agent_run_emits_user_message_inserted_event() -> None:
         envelope = queue.get_nowait()
         received_events.append(envelope.event)
 
-    # Verify UserMessageInsertedEvent was published
+    # Emission is SKIPPED when EnqueuedMessagesEvent is available and
+    # active_agent_run is set — the display event comes from
+    # handle_enqueued_messages() instead.
     user_msg_events = [e for e in received_events if isinstance(e, UserMessageInsertedEvent)]
-    assert len(user_msg_events) == 1
-    assert user_msg_events[0].delivery == "steer"
-    assert user_msg_events[0].source == "internal"
-    assert user_msg_events[0].content == "inject me"
+    assert len(user_msg_events) == 0
+    # Verify the actual enqueue happened.
+    mock_agent_run.enqueue.assert_called_once_with("inject me", priority="asap")
 
 
 @pytest.mark.unit
 async def test_steer_while_running_without_agent_run() -> None:
-    """Given a running RunHandle without active_agent_run, steer() queues to run_ctx."""
+    """Given a running RunHandle without active_agent_run, steer() re-enqueues to feedback_queue."""
     handle = _make_run_handle()
     handle.active_agent_run = None
 
     result = handle.steer("queue me")
     assert result is not None
-    assert "queue me" in handle.run_ctx.queued_steer_messages
+    # With fix A, steer() fallback writes to session.feedback_queue (not queued_steer_messages)
+    assert handle.session is not None
+    assert not handle.session.feedback_queue.empty()
+    fb = handle.session.feedback_queue.get_nowait()
+    assert fb.content == "queue me"
+    assert fb.is_steer is True
 
 
 @pytest.mark.unit
@@ -267,13 +274,18 @@ async def test_steer_with_list_content_blocks() -> None:
 
 @pytest.mark.unit
 async def test_steer_with_list_content_blocks_queued() -> None:
-    """steer() with list message and no agent_run queues content_blocks."""
+    """steer() with list message and no agent_run re-enqueues content_blocks to feedback_queue."""
     handle = _make_run_handle()
     handle.active_agent_run = None
     blocks: list[Any] = ["text", {"type": "image"}]
     result = handle.steer(blocks, message_id="list-msg-queued")
     assert result == "list-msg-queued"
-    assert blocks in handle.run_ctx.queued_steer_messages
+    # With fix A, steer() fallback writes to session.feedback_queue (not queued_steer_messages)
+    assert handle.session is not None
+    assert not handle.session.feedback_queue.empty()
+    fb = handle.session.feedback_queue.get_nowait()
+    assert fb.content_blocks == blocks
+    assert fb.is_steer is True
 
 
 # ---------------------------------------------------------------------------
@@ -1018,16 +1030,19 @@ async def test_no_value_error_when_generator_abandoned_in_different_context() ->
 
 
 @pytest.mark.unit
-async def test_start_empty_prompt_terminates_immediately() -> None:
-    """start('') produces no events and terminates immediately.
+async def test_start_empty_prompt_no_staged_content_terminates_immediately() -> None:
+    """start('') with no staged_content produces no events and terminates.
 
-    In the per-prompt model, an empty prompt means no turn is executed
-    and the generator returns immediately.
+    In the per-prompt model, an empty prompt with no staged_content means
+    no turn is executed and the generator returns immediately.
     """
+    from agentpool.agents.staged_content import StagedContent
+
     agent = MagicMock()
     agent.create_turn = MagicMock(return_value=_StubTurn())
     agent.name = "test-agent"
     agent.conversation = MessageHistory()
+    agent.staged_content = StagedContent()  # empty
     handle = _make_run_handle(agent=agent)
     gen = handle.start("")
     events: list[Any] = []
@@ -1046,6 +1061,75 @@ async def test_start_empty_prompt_terminates_immediately() -> None:
     assert handle.complete_event.is_set()
     # No turn should have been created
     agent.create_turn.assert_not_called()
+
+
+@pytest.mark.unit
+async def test_start_empty_list_no_staged_content_terminates_immediately() -> None:
+    """start([]) with no staged_content produces no events and terminates.
+
+    An empty list is falsy and should be treated the same as an empty
+    string — no turn executes.
+    """
+    from agentpool.agents.staged_content import StagedContent
+
+    agent = MagicMock()
+    agent.create_turn = MagicMock(return_value=_StubTurn())
+    agent.name = "test-agent"
+    agent.conversation = MessageHistory()
+    agent.staged_content = StagedContent()  # empty
+    handle = _make_run_handle(agent=agent)
+    gen = handle.start([])
+    events: list[Any] = []
+    try:
+        async with asyncio.timeout(5):
+            events = [event async for event in gen]
+    except (TimeoutError, asyncio.CancelledError):
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            await gen.aclose()
+
+    assert len(events) == 0
+    assert handle.complete_event.is_set()
+    agent.create_turn.assert_not_called()
+
+
+@pytest.mark.unit
+async def test_start_empty_list_with_staged_content_executes_turn() -> None:
+    """start([]) with staged_content executes a turn to consume it.
+
+    When a skill command injects content into ``staged_content`` and the
+    user's entire message was a slash command (leaving non_command_content
+    empty), ``start([])`` must still execute a turn so ``NativeTurn`` can
+    consume the staged content. Without this, skill instructions are
+    silently discarded (issue #284).
+    """
+    from agentpool.agents.staged_content import StagedContent
+
+    staged = StagedContent()
+    staged.add_text("IMPORTANT_SKILL_DIRECTIVE")
+
+    agent = MagicMock()
+    agent.create_turn = MagicMock(return_value=_StubTurn())
+    agent.name = "test-agent"
+    agent.conversation = MessageHistory()
+    agent.staged_content = staged
+    handle = _make_run_handle(agent=agent)
+    gen = handle.start([])
+    try:
+        async with asyncio.timeout(5):
+            async for _ in gen:
+                pass
+    except (TimeoutError, asyncio.CancelledError):
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            await gen.aclose()
+
+    # A turn SHOULD have been created to consume staged_content
+    agent.create_turn.assert_called_once()
+    # complete_event should be set
+    assert handle.complete_event.is_set()
 
 
 # ---------------------------------------------------------------------------
@@ -1501,18 +1585,26 @@ async def test_multiple_steer_messages_drained_fifo_from_feedback_queue() -> Non
 
 @pytest.mark.unit
 async def test_empty_prompt_drains_feedback_queue_but_messages_unprocessed() -> None:
-    """Empty prompt drains feedback_queue but queued_steer_messages are never processed.
+    """Empty prompt drains feedback_queue into queued_steer_messages but no turn executes.
 
-    Known limitation: when initial_prompt is empty, start() drains
-    feedback_queue into queued_steer_messages but returns immediately
-    without executing a turn. The steer messages are technically in
-    queued_steer_messages but no turn processes them.
+    When initial_prompt is empty, start() drains feedback_queue into
+    queued_steer_messages (for the next RunHandle to pick up) but returns
+    immediately without executing a turn. The steer messages are in
+    queued_steer_messages but no turn processes them in THIS RunHandle.
 
-    This test documents the current behavior. If this is considered a bug,
-    the fix would be to either:
-    1. Not drain feedback_queue when there's no prompt, OR
-    2. Re-enqueue the messages back to feedback_queue for the next RunHandle
+    However, the messages are NOT permanently lost — they remain in
+    queued_steer_messages for this RunHandle's lifetime. If the same
+    run_ctx is reused (e.g., by SessionController chaining), a subsequent
+    turn with a non-empty prompt would drain them via
+    drain_queued_steer_messages(). In the per-prompt model, a new
+    RunHandle is created instead, so the messages in this run_ctx are
+    discarded — but the source feedback_queue was already drained.
+
+    To avoid permanent loss, the caller (SessionController) should check
+    queued_steer_messages after start() returns and re-enqueue any
+    unprocessed messages back to feedback_queue for the next RunHandle.
     """
+    from agentpool.agents.staged_content import StagedContent
     from agentpool.lifecycle import DirectChannel, Feedback, MemoryJournal
     from agentpool.orchestrator.session_controller import SessionState
 
@@ -1520,6 +1612,7 @@ async def test_empty_prompt_drains_feedback_queue_but_messages_unprocessed() -> 
     agent.create_turn = MagicMock(return_value=_StubTurn())
     agent.name = "test-agent"
     agent.conversation = MessageHistory()
+    agent.staged_content = StagedContent()  # empty — no staged content
 
     session = SessionState(session_id="test-empty-drain", agent_name="test-agent")
     session._comm_channel = DirectChannel(MemoryJournal())

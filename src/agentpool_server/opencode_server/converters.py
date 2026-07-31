@@ -20,7 +20,6 @@ from pydantic_ai import (
 from agentpool import log
 from agentpool.messaging.messages import ChatMessage
 from agentpool.sessions.models import SessionData
-from agentpool.tools.exceptions import ToolError
 from agentpool.utils import identifiers as identifier
 from agentpool.utils.pydantic_ai_helpers import safe_args_as_dict, to_user_content_or_path_ref
 from agentpool.utils.time_utils import datetime_to_ms, ms_to_datetime
@@ -63,6 +62,7 @@ if TYPE_CHECKING:
 
     from agentpool.agents.base_agent import BaseAgent
     from agentpool.common_types import MCPConnectionStatus, MCPServerStatus, PathReference
+    from agentpool.models.model_configs import AnyModelConfig
     from agentpool_server.opencode_server.models import ToolState
     from agentpool_server.opencode_server.models.mcp import (
         MCPConnectionStatus as OpenCodeMCPConnectionStatus,
@@ -129,25 +129,45 @@ def _get_input_from_state(state: ToolState, *, convert_params: bool = False) -> 
     return _convert_params_for_ui(state.input) if convert_params else state.input
 
 
-async def _resolve_mcp_resource(source: ResourceSource, agent: BaseAgent[Any, Any]) -> str | None:
-    """Resolve an MCP resource and return its content as text (or None if cant be read)."""
-    try:
-        resource = await agent.get_resource(source.uri)
-    except ToolError:
-        logger.warning("MCP resource not found", client_name=source.client_name, uri=source.uri)
-        return None
-    try:
-        contents = await resource.read()
-        return "\n".join(contents) if contents else None
-    except Exception:
-        logger.exception(
-            "Failed to read MCP resource", client_name=source.client_name, uri=source.uri
+async def _resolve_resource(
+    source: ResourceSource, agent: BaseAgent[Any, Any], session_id: str
+) -> list[UserContent] | None:
+    """Resolve a resource and return its content as a list of UserContent items.
+
+    Uses the agent's ``ExtensionRegistry`` (via ``host_context``) with a
+    session-scoped ``Scope`` (including ``agent_name``) to find
+    ``ResourceAccess`` and ``SkillResource`` providers.
+
+    Returns None if the resource is not found.
+    """
+    from agentpool.capabilities.extension_registry import Scope, ScopeLevel
+    from agentpool.capabilities.resource_resolver import resolve_resource_content
+
+    scope = Scope(
+        level=ScopeLevel.SESSION,
+        agent_name=agent.name,
+        session_id=session_id,
+    )
+    host_ctx = agent.host_context
+    if host_ctx is None:
+        raise RuntimeError(f"Agent host_context is None, cannot resolve resource {source.uri!r}")
+    registry = host_ctx.extension_registry
+    if registry is None:
+        raise RuntimeError(
+            f"Agent extension_registry is None, cannot resolve resource {source.uri!r}"
         )
-        return None
+    resource_caps = registry.get_resource_access(scope)
+    skill_caps = registry.get_skill_resources(scope)
+
+    content = await resolve_resource_content(source.uri, resource_caps, skill_caps)
+    if content is None:
+        logger.warning("Resource not found", client_name=source.client_name, uri=source.uri)
+    return content
 
 
 async def extract_user_prompt_from_parts(
     parts: list[PartInput],
+    session_id: str,
     fs: AsyncFileSystem | None = None,
     agent: BaseAgent[Any, Any] | None = None,
 ) -> Sequence[UserContent | PathReference]:
@@ -165,6 +185,8 @@ async def extract_user_prompt_from_parts(
         parts: List of OpenCode message input parts
         fs: Optional async filesystem for PathReference resolution
         agent: Optional agent for resolving MCP resources
+        session_id: Session ID for scoped resource resolution via
+            ExtensionRegistry.
 
     Returns:
         Either a simple string (text-only) or a list of UserContent/PathReference items
@@ -177,9 +199,9 @@ async def extract_user_prompt_from_parts(
             case TextPartInput(text=text):
                 result.append(text)
             case FilePartInput(source=ResourceSource() as resource) if agent is not None:
-                content = await _resolve_mcp_resource(resource, agent)
+                content = await _resolve_resource(resource, agent, session_id=session_id)
                 if content is not None:
-                    result.append(content)
+                    result.extend(content)
             case FilePartInput(mime=mime, url=url, filename=filename):
                 file_content = to_user_content_or_path_ref(mime, url, filename, fs=fs)
                 result.append(file_content)
@@ -220,6 +242,7 @@ def chat_message_to_opencode(  # noqa: PLR0915
     agent_name: str = "default",
     model_id: str = "unknown",
     provider_id: str = "agentpool",
+    model_variants: dict[str, AnyModelConfig] | None = None,
 ) -> MessageWithParts:
     """Convert a ChatMessage to OpenCode MessageWithParts.
 
@@ -228,8 +251,11 @@ def chat_message_to_opencode(  # noqa: PLR0915
         session_id: OpenCode session ID
         working_dir: Working directory for path context
         agent_name: Name of the agent
-        model_id: Model identifier
-        provider_id: Provider identifier
+        model_id: Model identifier (fallback when model_variants is None)
+        provider_id: Provider identifier (fallback when model_variants is None)
+        model_variants: Optional dict of variant name → config from manifest.
+            When provided and non-empty, resolves model_id/provider_id from
+            the message's raw model_name/provider_name via variant lookup.
 
     Returns:
         OpenCode MessageWithParts with appropriate info and parts
@@ -270,12 +296,23 @@ def chat_message_to_opencode(  # noqa: PLR0915
             completed_ms = created_ms + int(msg.response_time * 1000)
 
         tokens = Tokens.from_pydantic_ai(msg.usage)
+        if model_variants:
+            from agentpool_server.shared.model_utils import resolve_model_info_from_response
+
+            resolved_id, resolved_provider = resolve_model_info_from_response(
+                msg.model_name, msg.provider_name, model_variants
+            )
+            model_id = resolved_id
+            provider_id = resolved_provider
+        else:
+            model_id = msg.model_name or model_id
+            provider_id = msg.provider_name or provider_id
         result = MessageWithParts.assistant(
             message_id=message_id,
             session_id=session_id,
             parent_id="",  # Would need to track parent user message
-            model_id=msg.model_name or model_id,
-            provider_id=msg.provider_name or provider_id,
+            model_id=model_id,
+            provider_id=provider_id,
             agent_name=msg.name or agent_name,
             path=MessagePath(cwd=working_dir, root=working_dir),
             time=MessageTime(created=created_ms, completed=completed_ms),
@@ -329,7 +366,7 @@ def chat_message_to_opencode(  # noqa: PLR0915
                     case PydanticToolCallPart(tool_name=tool_name, tool_call_id=call_id):
                         tool_input = _convert_params_for_ui(safe_args_as_dict(p))
                         ts = TimeStart(start=created_ms)
-                        title = f"Running {tool_name}"
+                        title = "Running"
                         running_state = ToolStateRunning(time=ts, input=tool_input, title=title)
                         tool_part = result.add_tool_part(tool_name, call_id, state=running_state)
                         tool_calls[call_id] = tool_part
@@ -379,7 +416,7 @@ def chat_message_to_opencode(  # noqa: PLR0915
                                     time=TimeStartEnd(start=created_ms, end=end_ms),
                                 )
                             else:
-                                title = f"Completed {tool_name}"
+                                title = "Completed"
                                 tsc = TimeStartEndCompacted(start=created_ms, end=end_ms)
                                 # Extract metadata from tool result if present
                                 # (e.g., subagent sessionId)
@@ -403,7 +440,7 @@ def chat_message_to_opencode(  # noqa: PLR0915
                                 ts_end = TimeStartEnd(start=created_ms, end=end_ms)
                                 state = ToolStateError(error=err, time=ts_end)
                             else:
-                                title = f"Completed {tool_name}"
+                                title = "Completed"
                                 tsc = TimeStartEndCompacted(start=created_ms, end=end_ms)
                                 # Extract metadata for orphan returns too
                                 metadata = (
@@ -575,6 +612,16 @@ def session_data_to_opencode(data: SessionData) -> Session:
     # Convert datetime to milliseconds timestamp
     created_ms = datetime_to_ms(data.created_at)
     updated_ms = datetime_to_ms(data.last_active)
+    # Override created_ms with the timestamp embedded in the session ID
+    # when available.  Old sessions persisted before the created_at_ns
+    # sync fix have stored created_at from get_now() (a separate wall-
+    # clock call), which can differ from the session ID's timestamp by
+    # milliseconds — enough to cause sort mismatches in the TUI.
+    from agentpool.utils.identifiers import extract_timestamp_ms
+
+    id_ts = extract_timestamp_ms(data.session_id)
+    if id_ts is not None:
+        created_ms = id_ts
     # Extract revert/share from metadata if present
     revert = None
     share = None

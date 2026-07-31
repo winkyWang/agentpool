@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, cast
 
 from agentpool.agents.events.events import (
     CustomEvent,
-    PartStartEvent,
     RunErrorEvent,
     RunFailedEvent,
     RunStartedEvent,
@@ -99,12 +98,18 @@ class OpenCodeEventBridgeMixin:
     _contexts: dict[str, EventProcessorContext]
     _adapters: dict[str, OpenCodeEventAdapter]
     _message_registered: dict[str, bool]
+    _steer_split_ids: dict[str, set[str]]
     _child_to_parent: dict[str, str]
     _child_spawns: dict[str, SpawnSessionStart]
     _children_of: dict[str, set[str]]
     _resume_contexts: dict[str, dict[str, Any]]
     _pending_message_ids: dict[str, str]
     _pending_message_metadata: dict[str, dict[str, str | None]]
+
+    # Crash recovery replay guard: when True, skip side-effectful actions
+    # like steer split (events are being replayed, not live). Set by the
+    # ProtocolEventConsumerMixin during crash recovery replay.
+    _replaying: bool = False
 
     if TYPE_CHECKING:
 
@@ -167,6 +172,12 @@ class OpenCodeEventBridgeMixin:
         session_state = self.session_pool.sessions.get_session(session_id)
         if session_state is not None:
             agent_name = session_state.agent_name
+            # Team member sessions: use the member's display name as the
+            # mode so the TUI footer shows e.g. "Critic-1" instead of the
+            # registered agent name (e.g. "artisan").
+            team_member_name = session_state.metadata.get("team_member_name")
+            if team_member_name is not None:
+                agent_name = team_member_name
             # For child sessions that bypass route_message(), resolve model
             # from the session's agent instance instead of the server default
             # (which is the parent/lead agent's model).  _pending_message_metadata
@@ -174,7 +185,21 @@ class OpenCodeEventBridgeMixin:
             # created via create_child_session() never go through that path.
             if session_state.agent is not None:
                 agent_model_name = cast("BaseAgent[Any, Any]", session_state.agent).model_name
-                if isinstance(agent_model_name, str) and ":" in agent_model_name:
+                model_variants = self.server_state.model_variants
+                from agentpool_server.shared.model_utils import (
+                    _extract_provider,
+                    _find_variant_name,
+                )
+
+                variant_name = (
+                    _find_variant_name(model_variants, agent_model_name)
+                    if agent_model_name is not None
+                    else None
+                )
+                if variant_name:
+                    config = model_variants[variant_name]
+                    model_id, provider_id = variant_name, _extract_provider(config)
+                elif isinstance(agent_model_name, str) and ":" in agent_model_name:
                     provider, model = agent_model_name.split(":", 1)
                     model_id, provider_id = model, provider
         pending_meta = self._pending_message_metadata.pop(session_id, None)
@@ -355,7 +380,7 @@ class OpenCodeEventBridgeMixin:
             # block ToolPart creation or assistant message registration.
             try:
                 await self._ensure_child_session_visible(session_id, event)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning(
                     "Failed to ensure child session visible",
                     session_id=session_id,
@@ -413,11 +438,34 @@ class OpenCodeEventBridgeMixin:
         user message here would cause double-rendering in the TUI.
         """
         child_session_id = spawn_event.child_session_id
-        await ensure_session(
+        # Use source_name (ASCII registered name) for the @xxx subagent pattern
+        # so the TUI regex @(\w+) subagent matches. display_name may contain
+        # non-ASCII characters (e.g. Chinese) that \w cannot match.
+        source_name = spawn_event.source_name
+        # Team members get a richer title with team name and role
+        team_id = spawn_event.metadata.get("team_id")
+        if team_id is not None:
+            team_name = spawn_event.metadata.get("team_name", "")
+            team_role = spawn_event.metadata.get("team_role", "member")
+            role_label = "Lead" if team_role == "lead" else "Member"
+            team_prefix = f"Team '{team_name}' · {role_label} " if team_name else ""
+            title = f"{team_prefix}(@{source_name} subagent)"
+        else:
+            title = f"(@{source_name} subagent)"
+        session = await ensure_session(
             self.server_state,
             child_session_id,
             parent_id=parent_session_id,
+            title=title,
         )
+        # ensure_session does not update the title if the session already
+        # exists (fast path / store-first path). Update it explicitly so the
+        # TUI shows the enriched title (e.g. "Team 'X' · Member (@Y subagent)").
+        if title is not None and session.title != title:
+            session.title = title
+            from agentpool_server.opencode_server.models import SessionUpdatedEvent
+
+            await self.server_state.broadcast_event(SessionUpdatedEvent.create(session))
 
     async def _handle_event(  # noqa: PLR0915
         self, session_id: str, envelope: EventEnvelope
@@ -583,6 +631,52 @@ class OpenCodeEventBridgeMixin:
                     # P3: Serialize context for resume, same as
                     # StreamCompleteEvent path.
                     await self._persist_context_for_resume(session_id)
+                case RunErrorEvent(message=error_msg):
+                    # RunErrorEvent is a terminal event (no trailing
+                    # StreamCompleteEvent). Without this case, the session
+                    # status stays "busy" forever because the match block
+                    # never sets it to "idle".
+                    #
+                    # The EventProcessor.process() already yields
+                    # SessionErrorEvent for RunErrorEvent, so we do NOT
+                    # broadcast it here — only the session status and
+                    # assistant message cleanup are our responsibility.
+                    await set_session_status(
+                        self.server_state, session_id, SessionStatus(type="idle")
+                    )
+                    # C3 fallback: same as RunFailedEvent — if no event
+                    # triggered C3 registration, register now so
+                    # _finalize_assistant_time can finalize and broadcast.
+                    if not self._message_registered.get(session_id, False):
+                        ctx = self._contexts.get(session_id)
+                        if ctx is not None:
+                            await append_message_to_session(
+                                self.server_state, session_id, ctx.assistant_msg
+                            )
+                            await self.server_state.broadcast_event(
+                                MessageUpdatedEvent.create(ctx.assistant_msg.info)
+                            )
+                            self._message_registered[session_id] = True
+                    # D3: Finalize time.completed for errored runs too.
+                    await self._finalize_assistant_time(session_id)
+                    # Set aborted error on the assistant message, using
+                    # the RunErrorEvent's message as the error reason.
+                    ctx = self._contexts.get(session_id)
+                    if ctx is not None and isinstance(ctx.assistant_msg.info, AssistantMessage):
+                        info = ctx.assistant_msg.info
+                        if info.error is None:
+                            info.error = MessageAbortedError(
+                                data=MessageAbortedErrorData(message=error_msg)
+                            )
+                            await self.server_state.broadcast_event(
+                                MessageUpdatedEvent.create(info)
+                            )
+                    # Persist the aborted assistant message to storage.
+                    await self._persist_assistant_message(session_id)
+                    # NOTE: Do NOT reset _message_registered here (same
+                    # reasoning as StreamCompleteEvent/RunFailedEvent).
+                    # P3: Serialize context for resume.
+                    await self._persist_context_for_resume(session_id)
                 case _:
                     pass
 
@@ -633,6 +727,7 @@ class OpenCodeEventBridgeMixin:
                 ctx.stream_start_ms = now_ms()
 
                 self._message_registered[session_id] = False
+                self._steer_split_ids.pop(session_id, None)
 
             # Update assistant message with real agent info from RunStartedEvent.
             # RunStartedEvent is the first event in a run and carries the real
@@ -643,7 +738,15 @@ class OpenCodeEventBridgeMixin:
                 msg_info = ctx.assistant_msg.info
                 if isinstance(msg_info, AssistantMessage):
                     msg_info.agent = event.agent_name
-                    msg_info.mode = event.agent_name
+                    # Team member sessions: prefer team_member_name over the
+                    # registered agent name for the TUI footer display.
+                    display_mode = event.agent_name
+                    session_state = self.session_pool.sessions.get_session(session_id)
+                    if session_state is not None:
+                        team_member_name = session_state.metadata.get("team_member_name")
+                        if team_member_name is not None:
+                            display_mode = team_member_name
+                    msg_info.mode = display_mode
             # NOTE: Do NOT overwrite ctx.assistant_msg_id from event.message_id.
             # NativeTurn generates its own UUID for _message_id (uuid4().hex)
             # which is different from the canonical assistant_msg_id generated
@@ -653,20 +756,24 @@ class OpenCodeEventBridgeMixin:
             # handler's ID, so the UI cannot associate parts with the message.
             # The canonical assistant_msg_id from the REST handler is correct.
 
-            # Steer split: When a steer UserMessageInsertedEvent was received
-            # during an active turn, the next PartStartEvent (from the new
-            # ModelRequestNode after steer drain) triggers a logical turn split.
-            # This finalizes the current assistant message (A1) and creates a
-            # new one (A2) with a fresh message ID, so the steer user message
-            # sorts between A1 and A2 in the TUI's lexicographic message ID
-            # ordering. Without this split, the steer user message would sort
-            # after the entire assistant message (which reuses one ID for both
-            # pre-steer and post-steer content).
+            # Steer split: When a steer UserMessageInsertedEvent arrives,
+            # split the logical turn: finalize A1, create A2 with fresh ID.
+            #
+            # Only source="processed" events trigger the split. These are
+            # processing-time events from EnqueuedMessagesEvent mapping.
+            # source="accepted" events (fire-and-forget from steer()/followup())
+            # are handled by the EventProcessor which creates UserMessage + SSE.
+            # Dedup by message_id via _steer_split_ids prevents double splits
+            # when both events fire for the same steer message.
             if (
-                isinstance(event, PartStartEvent)
-                and ctx._steer_received
+                isinstance(event, UserMessageInsertedEvent)
+                and event.delivery == "steer"
+                and event.source == "processed"
+                and not self._replaying
                 and self._message_registered.get(session_id, False)
+                and event.message_id not in self._steer_split_ids.setdefault(session_id, set())
             ):
+                self._steer_split_ids[session_id].add(event.message_id)
                 await self._finalize_assistant_time(session_id)
 
                 assistant_msg_id, assistant_msg = self._create_assistant_message(session_id)
@@ -687,12 +794,6 @@ class OpenCodeEventBridgeMixin:
                 ctx.stream_start_ms = now_ms()
 
                 self._message_registered[session_id] = False
-                ctx._steer_received = False
-
-            # Set _steer_received flag when a steer user message arrives during
-            # an active turn. The next PartStartEvent will trigger the split.
-            if isinstance(event, UserMessageInsertedEvent) and event.delivery == "steer":
-                ctx._steer_received = True
 
             # Register assistant message on first non-spawn, non-custom,
             # non-user-message-inserted event.
@@ -741,16 +842,17 @@ class OpenCodeEventBridgeMixin:
             # via MessageUpdatedEvent.
             if isinstance(event, StreamCompleteEvent):
                 finalize_ctx = self._contexts.get(session_id)
-                if finalize_ctx is not None:
+                if finalize_ctx is not None and isinstance(
+                    finalize_ctx.assistant_msg.info, AssistantMessage
+                ):
                     info = finalize_ctx.assistant_msg.info
-                    if isinstance(info, AssistantMessage):
-                        info.tokens = Tokens(
-                            cache=TokenCache(read=0, write=0),
-                            input=finalize_ctx.input_tokens,
-                            output=finalize_ctx.output_tokens,
-                            reasoning=0,
-                        )
-                        info.cost = finalize_ctx.total_cost
+                    info.tokens = Tokens(
+                        cache=TokenCache(read=0, write=0),
+                        input=finalize_ctx.input_tokens,
+                        output=finalize_ctx.output_tokens,
+                        reasoning=0,
+                    )
+                    info.cost = finalize_ctx.total_cost
                 await self._finalize_assistant_time(session_id)
                 await self._persist_assistant_message(session_id)
                 # P3: Serialize the EventProcessorContext and store it

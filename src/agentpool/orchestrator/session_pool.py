@@ -453,7 +453,7 @@ class SessionPool(
                         stored_hash=session_data.agent_config_hash,
                         current_hash=current_hash,
                     )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.debug(
                     "Could not compute agent config hash for drift check",
                     session_id=session_data.session_id,
@@ -526,6 +526,8 @@ class SessionPool(
         if elicitation_payloads:
             from mcp.types import ElicitResult as MCPElicitResult
 
+            from agentpool.ui.elicitation import normalize_elicit_content
+
             for payload in elicitation_payloads:
                 # Map elicitation handle to ToolCallPart.tool_call_id
                 actual_tool_call_id = tool_call_id_map.get(
@@ -539,7 +541,7 @@ class SessionPool(
                     case "accept":
                         cached_elicitation[payload.deferred_handle] = MCPElicitResult(
                             action="accept",
-                            content=payload.content,
+                            content=normalize_elicit_content(payload.content),
                         )
                         elicitation_tool_results[actual_tool_call_id] = ToolReturnPart(
                             tool_name=tool_name,

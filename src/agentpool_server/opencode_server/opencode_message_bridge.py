@@ -91,8 +91,7 @@ async def get_messages_for_session(
     When ``prefer_in_memory`` is True (default, used by sync/TUI), the
     in-memory ``state.messages`` cache is preferred because it retains
     the ORIGINAL part IDs that match SSE PartUpdatedEvent. DB-reconstructed
-    messages get NEW part IDs, causing TUI duplication. User message parts
-    are stripped so SSE is the sole source (prevents TUI duplication).
+    messages get NEW part IDs, causing TUI duplication.
 
     When ``prefer_in_memory`` is False (used by share/fork), the DB
     (SessionPool) is preferred because it has the complete history.
@@ -105,9 +104,8 @@ async def get_messages_for_session(
     Args:
         state: The OpenCode server state.
         session_id: The session ID to get messages for.
-        prefer_in_memory: If True, prefer in-memory messages and strip
-            user message parts (for sync/TUI). If False, prefer DB
-            (for share/fork).
+        prefer_in_memory: If True, prefer in-memory messages (for sync/TUI).
+            If False, prefer DB (for share/fork).
 
     Returns:
         List of MessageWithParts for the session.
@@ -115,28 +113,13 @@ async def get_messages_for_session(
     messages: list[MessageWithParts] = getattr(state, "messages", {}).get(session_id, []) or []
 
     cached_session = state.sessions.get(session_id)
-    # Subagent sessions don't go through TUI sync() — their messages are
-    # displayed via the parent's tool call, not via REST sync endpoint.
-    # So no need to strip parts for subagents.
-    is_subagent = cached_session is not None and cached_session.parent_id is not None
-
-    # When prefer_in_memory is True (sync/TUI path), strip parts from user
-    # messages to prevent duplication with SSE PartUpdatedEvent. The TUI has
-    # no part deduplication — if both sync() and SSE deliver parts, the TUI
-    # renders both. By stripping user message parts from sync(), SSE becomes
-    # the sole source of user message parts.
-    # This applies to ALL return paths (in-memory and DB fallback).
-    # Subagent sessions are exempt (no TUI sync race).
-    def _strip_user_parts(msgs: list[MessageWithParts]) -> list[MessageWithParts]:
-        if not prefer_in_memory or is_subagent:
-            return msgs
-        return [msg.model_copy(update={"parts": []}) if msg.role == "user" else msg for msg in msgs]
 
     # Fast-path: in-memory messages retain original part IDs matching SSE.
     if prefer_in_memory and messages:
-        return _apply_revert_filter(cached_session, _strip_user_parts(messages))
+        return _apply_revert_filter(cached_session, messages)
 
-    session_pool = getattr(state.pool, "session_pool", None)
+    pool = state.pool_or_none
+    session_pool = getattr(pool, "session_pool", None) if pool is not None else None
     if session_pool is not None:
         try:
             sp_messages = await session_pool.get_messages(session_id)
@@ -148,19 +131,21 @@ async def get_messages_for_session(
             if existing_agent is not None:
                 agent = existing_agent
             default_model_id, default_provider_id = state.resolve_default_model_info()
+            model_variants = state.model_variants
             converted = [
                 chat_message_to_opencode(
                     chat_msg,
                     session_id=session_id,
                     working_dir=state.working_dir,
                     agent_name=agent.name,
-                    model_id=getattr(chat_msg, "model_name", None) or default_model_id,
-                    provider_id=getattr(chat_msg, "provider_name", None) or default_provider_id,
+                    model_id=default_model_id,
+                    provider_id=default_provider_id,
+                    model_variants=model_variants,
                 )
                 for chat_msg in sp_messages
             ]
-            return _apply_revert_filter(cached_session, _strip_user_parts(converted))
-    return _apply_revert_filter(cached_session, _strip_user_parts(messages))
+            return _apply_revert_filter(cached_session, converted)
+    return _apply_revert_filter(cached_session, messages)
 
 
 async def append_message_to_session(
@@ -179,9 +164,8 @@ async def append_message_to_session(
         session_id: The session ID to append to.
         msg: The OpenCode message to append.
     """
-    session_pool = None
-    if hasattr(state, "pool") and state.pool is not None:
-        session_pool = getattr(state.pool, "session_pool", None)
+    pool = state.pool_or_none
+    session_pool = getattr(pool, "session_pool", None) if pool is not None else None
     if session_pool is not None:
         chat_msg = opencode_to_chat_message(msg, session_id=session_id)
         try:
@@ -315,11 +299,8 @@ def _reconstruct_tool_parts_from_checkpoint(
     # session state instead of hardcoding "agentpool". Falls back to
     # "agentpool" when the session state is unavailable.
     agent_name = "agentpool"
-    try:
-        pool = state.pool
-        session_pool = pool.session_pool
-    except RuntimeError:
-        session_pool = None
+    pool = state.pool_or_none
+    session_pool = pool.session_pool if pool is not None else None
     if session_pool is not None:
         session_state = session_pool.sessions.get_session(session_id)
         if session_state is not None:
@@ -426,17 +407,34 @@ class OpenCodeMessageBridgeMixin:
                 logger.debug("ToolPart already exists for child session %s", child_session_id)
                 return None
 
-        source_name = spawn_event.source_name or "subagent"
-        tool_title = source_name
+        display_name = spawn_event.display_name or spawn_event.source_name or "subagent"
+        # Team members get a "Team ·" prefix to distinguish from regular subagents
+        team_id = spawn_event.metadata.get("team_id")
+        if team_id is not None:
+            team_name = spawn_event.metadata.get("team_name", "")
+            team_role = spawn_event.metadata.get("team_role", "member")
+            role_label = "Lead" if team_role == "lead" else "Member"
+            tool_title = f"Team · {display_name}"
+            card_description = f"{role_label} in '{team_name}'" if team_name else role_label
+        else:
+            tool_title = display_name
+            card_description = spawn_event.description or tool_title
         ts = TimeStart(start=now_ms())
         running_state = ToolStateRunning(
             time=ts,
             input={
-                "description": tool_title,
+                "description": card_description,
                 "subagent_type": tool_title,
                 "prompt": spawn_event.metadata.get("prompt", ""),
             },
-            metadata={"sessionId": child_session_id, "title": tool_title},
+            metadata={
+                "sessionId": child_session_id,
+                "title": tool_title,
+                "model_id": spawn_event.model_id,
+                "mode": spawn_event.mode,
+                "source_type": spawn_event.source_type,
+                "background": spawn_event.spawn_mechanism == "task",
+            },
             title=tool_title,
         )
         tool_part = ToolPart(
@@ -507,8 +505,17 @@ class OpenCodeMessageBridgeMixin:
             )
             return
 
-        source_name = spawn_event.source_name or "subagent"
-        tool_title = source_name
+        display_name = spawn_event.display_name or spawn_event.source_name or "subagent"
+        team_id = spawn_event.metadata.get("team_id")
+        if team_id is not None:
+            team_name = spawn_event.metadata.get("team_name", "")
+            team_role = spawn_event.metadata.get("team_role", "member")
+            role_label = "Lead" if team_role == "lead" else "Member"
+            tool_title = f"Team · {display_name}"
+            card_description = f"{role_label} in '{team_name}'" if team_name else role_label
+        else:
+            tool_title = display_name
+            card_description = spawn_event.description or tool_title
         complete_msg = event.message
         content = str(complete_msg.content) if complete_msg.content else "(no output)"
 
@@ -519,13 +526,20 @@ class OpenCodeMessageBridgeMixin:
         )
         completed_state = ToolStateCompleted(
             input={
-                "description": tool_title,
+                "description": card_description,
                 "subagent_type": tool_title,
                 "prompt": spawn_event.metadata.get("prompt", ""),
             },
             output=content,
             title=tool_title,
-            metadata={"sessionId": child_session_id, "title": tool_title},
+            metadata={
+                "sessionId": child_session_id,
+                "title": tool_title,
+                "model_id": spawn_event.model_id,
+                "mode": spawn_event.mode,
+                "source_type": spawn_event.source_type,
+                "background": spawn_event.spawn_mechanism == "task",
+            },
             time=TimeStartEndCompacted(start=start_time, end=now_ms()),
         )
         updated = ToolPart(
@@ -594,8 +608,17 @@ class OpenCodeMessageBridgeMixin:
         if tool_part is None or assistant_msg is None:
             return
 
-        source_name = spawn_event.source_name or "subagent"
-        tool_title = source_name
+        display_name = spawn_event.display_name or spawn_event.source_name or "subagent"
+        team_id = spawn_event.metadata.get("team_id")
+        if team_id is not None:
+            team_name = spawn_event.metadata.get("team_name", "")
+            team_role = spawn_event.metadata.get("team_role", "member")
+            role_label = "Lead" if team_role == "lead" else "Member"
+            tool_title = f"Team · {display_name}"
+            card_description = f"{role_label} in '{team_name}'" if team_name else role_label
+        else:
+            tool_title = display_name
+            card_description = spawn_event.description or tool_title
         error_msg = event.message or "Unknown error"
 
         start_time = (
@@ -606,11 +629,18 @@ class OpenCodeMessageBridgeMixin:
         error_state = ToolStateError(
             error=error_msg,
             input={
-                "description": tool_title,
+                "description": card_description,
                 "subagent_type": tool_title,
                 "prompt": spawn_event.metadata.get("prompt", ""),
             },
-            metadata={"sessionId": child_session_id, "title": tool_title},
+            metadata={
+                "sessionId": child_session_id,
+                "title": tool_title,
+                "model_id": spawn_event.model_id,
+                "mode": spawn_event.mode,
+                "source_type": spawn_event.source_type,
+                "background": spawn_event.spawn_mechanism == "task",
+            },
             time=TimeStartEnd(start=start_time, end=now_ms()),
         )
         updated = ToolPart(

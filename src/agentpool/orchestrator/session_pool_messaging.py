@@ -183,6 +183,7 @@ class SessionPoolMessagingMixin:
         deps: Any = None,
         input_provider: Any = None,
         meta: Any = None,
+        source: str = "accepted",
     ) -> str | None:
         """Send a message to a session using the typed ``DeliveryMode`` enum.
 
@@ -211,10 +212,22 @@ class SessionPoolMessagingMixin:
                 uses it to reconstruct the full user message (e.g. OpenCode
                 parts, ACP content blocks) instead of falling back to
                 text-only content.
+            source: Originator of the message — ``"accepted"`` (default)
+                for protocol handler requests, ``"team"`` for team-mode
+                coordination messages. Passed through to
+                ``UserMessageInsertedEvent.source`` so protocol frontends
+                can render team messages with a distinct visual style.
 
         Returns:
             The ``message_id`` string on success (both new runs and
             steer/followup), ``None`` on failure.
+
+        Note:
+            For ``DeliveryMode.QUEUE`` when the session is busy, the
+            return value is ``None`` even though the message was
+            successfully queued. Callers that need to distinguish
+            ``None``-as-queued from ``None``-as-failure should verify
+            session existence before calling.
         """
         priority = "asap" if mode is DeliveryMode.STEER else "when_idle"
         # Delegate directly to _route_message() to avoid the deprecated
@@ -241,6 +254,7 @@ class SessionPoolMessagingMixin:
             deps=deps,
             message_id=message_id,
             meta=meta,
+            source=source,
         )
 
     async def run_agent(
@@ -379,7 +393,14 @@ class SessionPoolMessagingMixin:
             return run_handle.followup(str(message))
         return None
 
-    async def steer(self, session_id: str, message: str, **kwargs: Any) -> str | None:
+    async def steer(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        emit_user_message: bool = True,
+        **kwargs: Any,
+    ) -> str | None:
         """Inject a steer message with agent-type-aware routing.
 
         Delegates to ``RunHandle.steer()`` when an active run exists.
@@ -387,6 +408,9 @@ class SessionPoolMessagingMixin:
         Args:
             session_id: Target session.
             message: The steer message to deliver.
+            emit_user_message: When ``True`` (default), publish a
+                ``UserMessageInsertedEvent`` so protocol frontends display
+                the injected message.  Set to ``False`` to suppress.
             **kwargs: Additional arguments (ignored).
 
         Returns:
@@ -394,7 +418,7 @@ class SessionPoolMessagingMixin:
         """
         run_handle = self._get_active_run_handle(session_id)
         if run_handle is not None:
-            return run_handle.steer(message)
+            return run_handle.steer(message, emit_user_message=emit_user_message)
         return None
 
     async def steer_from_background_task(self, session_id: str, message: str) -> str | None:
@@ -402,7 +426,7 @@ class SessionPoolMessagingMixin:
 
         This is the preferred entry point for background task capabilities
         (e.g. ``SubagentCapability``, ``BackgroundTaskCapability``) because:
-        - It emits ``UserMessageInsertedEvent(source="background_task")``
+        - It emits ``UserMessageInsertedEvent(source="accepted")``
           for TUI display
         - It injects into the active RunHandle when one exists
         - It falls back to ``feedback_queue`` when no run is active
@@ -427,24 +451,28 @@ class SessionPoolMessagingMixin:
         # Use self.event_bus (SessionPoolMessagingMixin property, always set by
         # SessionPool.__init__) instead of session._event_bus (SessionState's
         # field, only set by _initialize_lifecycle_and_recovery).
+        #
+        # Generate message_id ONCE and share with steer() so that
+        # EnqueuedMessagesEvent-derived event uses the same ID for dedup.
+        message_id = ascending("message")
         event_bus = self.event_bus
         if event_bus is not None:
             with logfire.span(
                 "event.user_message_inserted.emit",
                 session_id=session_id,
                 delivery="steer",
-                source="background_task",
+                source="accepted",
             ):
                 try:
                     event: UserMessageInsertedEvent[Any] = UserMessageInsertedEvent(
                         session_id=session_id,
-                        message_id=ascending("message"),
+                        message_id=message_id,
                         content=message,
                         delivery="steer",
-                        source="background_task",
+                        source="accepted",
                     )
                     await event_bus.publish(session_id, event)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.warning(
                         "Failed to emit UserMessageInsertedEvent from background task",
                         exc_info=True,
@@ -452,7 +480,7 @@ class SessionPoolMessagingMixin:
         # Try injecting into the active RunHandle.
         run_handle = self._get_active_run_handle(session_id)
         if run_handle is not None:
-            return run_handle.steer(message, emit_user_message=False)
+            return run_handle.steer(message, message_id=message_id, emit_user_message=False)
         # No active run — enqueue for next RunHandle via feedback_queue.
         fb = Feedback(content=message, is_steer=True)
         session.feedback_queue.put_nowait(fb)

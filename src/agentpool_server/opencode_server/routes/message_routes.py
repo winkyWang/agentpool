@@ -111,7 +111,7 @@ async def _ensure_assistant_in_state(
 
 def _session_disables_title_generation(state: ServerState, session_id: str) -> bool:
     """Return whether SessionPool metadata disables title generation."""
-    session_pool = state.pool.session_pool if state.pool else None
+    session_pool = state.pool_or_none.session_pool if state.pool_or_none else None
     if session_pool is None:
         return False
 
@@ -188,10 +188,14 @@ async def _maybe_generate_title(
     session_id: str,
     user_prompt: Sequence[UserContent | PathReference],
 ) -> None:
-    """Generate title for session if this is the first user message.
+    """Generate title for session if the title is still the default.
 
-    Checks if the session only has system/initialization messages (no user messages yet).
-    If so, triggers title generation via the storage manager.
+    Triggers title generation via the storage manager when the session
+    title has not been set yet (still ``"New Session"``). The
+    ``user_prompt`` is passed directly from the REST handler, so we do
+    not need to read ``state.messages`` — which may not yet contain the
+    user message because ``append_message_to_session`` runs asynchronously
+    via the EventProcessor on ``UserMessageInsertedEvent``.
 
     Args:
         state: Server state containing storage manager
@@ -201,24 +205,13 @@ async def _maybe_generate_title(
     if _session_disables_title_generation(state, session_id):
         return
 
-    # Check if this is the first user message by looking at existing messages
-    existing_messages = await get_messages_for_session(state, session_id)
-
-    # Count user messages (not assistant, not system)
-    user_message_count = sum(
-        1 for msg in existing_messages if hasattr(msg.info, "role") and msg.info.role == "user"
-    )
-
-    # Only generate title on first user message
-    if user_message_count != 1:
-        return
-
     # Check if storage manager has title generation configured
-    storage = state.pool.storage if state.pool else None
+    storage = state.pool_or_none.storage if state.pool_or_none else None
     if storage is None:
         return
 
-    # Check if title is already set (not default)
+    # Only generate title when the session still has the default title.
+    # This guards against duplicate generation on subsequent messages.
     session = state.sessions.get(session_id)
     if session and session.title and session.title != "New Session":
         return
@@ -347,7 +340,13 @@ async def _process_message(
                     )
                 case _ as unreachable:
                     assert_never(unreachable)
-        await persist_message_to_storage(state, user_msg_with_parts, session_id)
+        # NOTE: persist_message_to_storage is NOT called here for the user
+        # message. The EventProcessor's append_message_to_session() handles
+        # both DB persistence and in-memory append when it receives the
+        # UserMessageInsertedEvent from _route_message(). Calling
+        # persist_message_to_storage here would write to storage twice,
+        # causing duplicate 0-parts user messages in the TUI.
+        # This matches the send_message_async pattern (see line ~1017).
 
         ctx = await _route_message_locked(
             session_id, request, state, user_msg_id, user_msg_with_parts
@@ -492,6 +491,7 @@ async def _route_message_locked(  # noqa: PLR0915
     # --- Extract user prompt ---
     user_prompt = await extract_user_prompt_from_parts(
         request.parts,
+        session_id,
         fs=state.fs,
         agent=state.agent,
     )
@@ -562,13 +562,13 @@ async def _route_message_locked(  # noqa: PLR0915
     # Uses SessionPool's get_or_create_session_agent to create per-session
     # agent instances.  Each delegate agent name gets a unique sub-session
     # ID derived from the main session ID, ensuring per-agent isolation.
-    if state.pool is not None and agent_name in state.pool.manifest.agents:
+    if state.pool_or_none is not None and agent_name in state.pool_or_none.manifest.agents:
         # Only delegate to a different agent from the pool — if the request
         # names the same agent as the session's default, the per-session
         # instance is already the right one.
         current_agent_name = getattr(state.agent, "name", None)
         if agent_name != current_agent_name:
-            session_pool = state.pool.session_pool
+            session_pool = state.pool_or_none.session_pool
             if session_pool is not None:
                 await session_pool.sessions.get_or_create_session_agent(
                     f"{session_id}-agent-{agent_name}", agent_name
@@ -628,25 +628,29 @@ async def _route_message_locked(  # noqa: PLR0915
         logger.info("Model selection requested", provider=provider_id, model_id=model_id)
 
         try:
-            available_models = await session_agent.get_available_models()
             is_valid = False
 
             # Check 1: Is model_id a variant name in manifest?
-            if state.pool and model_id in state.pool.manifest.model_variants:
+            # Check this FIRST to avoid slow tokonomics network fetch when
+            # the model is already configured locally.
+            if state.pool_or_none and model_id in state.pool_or_none.manifest.model_variants:
                 is_valid = True
                 logger.info("Model found as manifest variant", model_id=model_id)
-            # Check 2: Is it in tokonomics models?
-            elif available_models:
-                valid_ids = [m.id_override if m.id_override else m.id for m in available_models]
-                # Try both "provider:model" format and just model_id
-                full_id = f"{provider_id}:{model_id}"
-                if full_id in valid_ids:
-                    is_valid = True
-                    requested_model = full_id
-                    logger.info("Model found in available models", model_id=full_id)
-                elif model_id in valid_ids:
-                    is_valid = True
-                    logger.info("Model found in available models", model_id=model_id)
+            # Check 2: Is it in tokonomics models? (network fetch — only if
+            # not found in manifest variants)
+            else:
+                available_models = await session_agent.get_available_models()
+                if available_models:
+                    valid_ids = [m.id_override if m.id_override else m.id for m in available_models]
+                    # Try both "provider:model" format and just model_id
+                    full_id = f"{provider_id}:{model_id}"
+                    if full_id in valid_ids:
+                        is_valid = True
+                        requested_model = full_id
+                        logger.info("Model found in available models", model_id=full_id)
+                    elif model_id in valid_ids:
+                        is_valid = True
+                        logger.info("Model found in available models", model_id=model_id)
 
             if is_valid:
                 logger.info(
@@ -661,10 +665,10 @@ async def _route_message_locked(  # noqa: PLR0915
                     model_id=model_id,
                     provider_id=provider_id,
                 )
-                if state.pool:
+                if state.pool_or_none:
                     logger.warning(
                         "Available manifest variants",
-                        variants=list(state.pool.manifest.model_variants.keys()),
+                        variants=list(state.pool_or_none.manifest.model_variants.keys()),
                     )
         except Exception as e:  # noqa: BLE001
             # Broad catch: agents differ on how they signal
@@ -782,7 +786,7 @@ async def _wait_and_finalize(  # noqa: PLR0915
             if ctx.event_stream is not None:
                 try:
                     await session_pool.event_bus.unsubscribe(session_id, ctx.event_stream)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.warning(
                         "Failed to unsubscribe from event bus during cleanup",
                         session_id=session_id,
@@ -1035,6 +1039,7 @@ async def send_message_async(session_id: str, request: MessageRequest, state: St
 
             user_prompt = await extract_user_prompt_from_parts(
                 request.parts,
+                session_id,
                 fs=state.fs,
                 agent=state.agent,
             )

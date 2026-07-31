@@ -26,7 +26,7 @@ from agentpool.observability.spans import safe_span
 
 
 if TYPE_CHECKING:
-    from agentpool.capabilities.agent_context import AgentContext
+    from agentpool.capabilities.agent_context import AgentContextDeps
 
 
 class SubagentCapability(AbstractCapability[AgentDepsT]):
@@ -42,7 +42,7 @@ class SubagentCapability(AbstractCapability[AgentDepsT]):
       to ``ctx.deps.delegation.get_available_agents()`` (deprecated).
 
     The capability holds no ``AgentPool`` reference — all delegation
-    goes through the ``AgentContext`` at runtime.
+    goes through the ``AgentContextDeps`` at runtime.
     """
 
     def __init__(self, *, toolset_id: str = "subagent") -> None:
@@ -75,9 +75,9 @@ class SubagentCapability(AbstractCapability[AgentDepsT]):
     def get_toolset(self) -> AgentToolset[AgentDepsT] | None:
         """Return a ``FunctionToolset`` with delegation tools.
 
-        The tools resolve the per-turn capability ``AgentContext`` from
-        ``ctx.deps``. Native agent runs wrap that context in their tool-facing
-        ``AgentContext.data`` field.
+        The tools access ``ctx.deps`` at runtime, which must be an
+        ``AgentContextDeps`` with a ``delegation`` field implementing
+        ``DelegationService``.
         """
         return FunctionToolset(
             [self.spawn_subagent, self.get_available_agents],
@@ -150,32 +150,25 @@ class SubagentCapability(AbstractCapability[AgentDepsT]):
         return agent_ctx.agent_registry.list_names()
 
 
-def _resolve_agent_context(ctx: RunContext[AgentDepsT]) -> AgentContext:
-    """Extract the capability ``AgentContext`` from runtime dependencies.
+def _resolve_agent_context(ctx: RunContext[AgentDepsT]) -> AgentContextDeps:
+    """Extract the ``AgentContextDeps`` from the run context deps.
+
+    Delegates to the shared ``resolve_agent_context_from_deps`` utility
+    which handles both the production path (``RuntimeAgentContext.data``)
+    and the test path (direct ``AgentContextDeps``).
 
     Args:
         ctx: The pydantic-ai run context.
 
     Returns:
-        The per-turn capability ``AgentContext``.
+        The ``AgentContextDeps`` instance from ``ctx.deps`` (or ``ctx.deps.data``).
 
     Raises:
-        RuntimeError: If the capability context was not injected.
+        RuntimeError: If deps is None or AgentContextDeps is not found.
     """
-    from agentpool.capabilities.agent_context import AgentContext
+    from agentpool.capabilities.agent_context import resolve_agent_context_from_deps
 
-    deps = ctx.deps
-    if isinstance(deps, AgentContext):
-        return deps
-    nested_context = getattr(deps, "data", None)
-    if isinstance(nested_context, AgentContext):
-        return nested_context
-    msg = (
-        "SubagentCapability requires an injected capability AgentContext "
-        "in RunContext.deps or RunContext.deps.data. "
-        f"Got: {type(deps).__name__}"
-    )
-    raise RuntimeError(msg)
+    return resolve_agent_context_from_deps(ctx.deps, capability_name="SubagentCapability")
 
 
 # Kept for backward compatibility — callers that import

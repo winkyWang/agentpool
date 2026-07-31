@@ -1,6 +1,6 @@
-"""Tests for AgentContext, RunScope, and DelegationService protocol.
+"""Tests for AgentContextDeps, RunScope, and DelegationService protocol.
 
-Covers M3 Wave 1 task group 10: RunScope stub, AgentContext dataclass,
+Covers M3 Wave 1 task group 10: RunScope stub, AgentContextDeps dataclass,
 and DelegationService Protocol definition.
 """
 
@@ -16,7 +16,7 @@ import pytest
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-from agentpool.capabilities.agent_context import AgentContext
+from agentpool.capabilities.agent_context import AgentContextDeps
 from agentpool.capabilities.delegation import AgentNotFoundError, DelegationService
 from agentpool.host.context import HostContext, RunScope
 
@@ -31,6 +31,16 @@ pytestmark = pytest.mark.unit
 
 class _StubDelegationService:
     """Minimal implementation of DelegationService protocol for testing."""
+
+    async def create_child_session(
+        self,
+        agent_name: str,
+        *,
+        parent_session_id: str | None = None,
+        description: str = "",
+        **metadata: Any,
+    ) -> str:
+        return "child_session_001"
 
     async def spawn_subagent(self, name: str, prompt: str) -> AsyncIterator[Any]:
         if name == "missing":
@@ -75,7 +85,7 @@ def _make_session_state() -> Any:
     """Build a SessionState-like object for testing.
 
     Uses a simple stand-in since SessionState from orchestrator requires
-    many runtime dependencies. AgentContext only needs the reference.
+    many runtime dependencies. AgentContextDeps only needs the reference.
     """
     return MagicMock()
 
@@ -87,9 +97,9 @@ def _make_agent_registry() -> Any:
     return AgentRegistry()
 
 
-def _make_agent_context() -> AgentContext:
-    """Build an AgentContext with test doubles."""
-    return AgentContext(
+def _make_agent_context() -> AgentContextDeps:
+    """Build an AgentContextDeps with test doubles."""
+    return AgentContextDeps(
         agent_registry=_make_agent_registry(),
         delegation=_StubDelegationService(),
         session=_make_session_state(),
@@ -135,19 +145,19 @@ def test_run_scope_custom_values() -> None:
 
 
 # =============================================================================
-# AgentContext tests
+# AgentContextDeps tests
 # =============================================================================
 
 
 def test_agent_context_frozen() -> None:
-    """AgentContext is immutable."""
+    """AgentContextDeps is immutable."""
     ctx = _make_agent_context()
     with pytest.raises(FrozenInstanceError):
         ctx.extension_registry = MagicMock()  # type: ignore[misc]
 
 
 def test_agent_context_all_fields_accessible() -> None:
-    """All six fields of AgentContext are accessible."""
+    """All six fields of AgentContextDeps are accessible."""
     ctx = _make_agent_context()
     assert ctx.agent_registry is not None
     assert ctx.delegation is not None
@@ -158,7 +168,7 @@ def test_agent_context_all_fields_accessible() -> None:
 
 
 def test_agent_context_extension_registry_defaults_none() -> None:
-    """AgentContext.extension_registry defaults to None."""
+    """AgentContextDeps.extension_registry defaults to None."""
     ctx = _make_agent_context()
     assert ctx.extension_registry is None
 
@@ -205,3 +215,94 @@ def test_agent_not_found_error_message() -> None:
     """AgentNotFoundError includes agent name in message."""
     err = AgentNotFoundError("nonexistent")
     assert "nonexistent" in str(err)
+
+
+# =============================================================================
+# TeamModeConfig integration tests
+# =============================================================================
+
+
+@pytest.mark.unit
+def test_agent_context_team_mode_config_defaults_none() -> None:
+    """AgentContextDeps.team_mode_config defaults to None when not provided."""
+    ctx = _make_agent_context()
+    assert ctx.team_mode_config is None
+
+
+@pytest.mark.unit
+def test_agent_context_team_mode_config_accepts_instance() -> None:
+    """AgentContextDeps accepts a TeamModeConfig instance."""
+    from agentpool_config.team_mode import TeamModeConfig
+
+    config = TeamModeConfig(enabled=True, member_eligible=["translator"])
+    ctx = AgentContextDeps(
+        agent_registry=_make_agent_registry(),
+        delegation=_StubDelegationService(),
+        session=_make_session_state(),
+        scope=RunScope(),
+        host=_make_host_context(),
+        extension_registry=None,
+        team_mode_config=config,
+    )
+    assert ctx.team_mode_config is not None
+    assert ctx.team_mode_config.enabled is True
+    assert "translator" in ctx.team_mode_config.member_eligible
+
+
+# =============================================================================
+# resolve_agent_context_from_deps utility tests
+# =============================================================================
+
+
+def test_resolve_agent_context_from_deps_direct() -> None:
+    """resolve_agent_context_from_deps returns deps when it is directly an AgentContextDeps."""
+    from agentpool.capabilities.agent_context import resolve_agent_context_from_deps
+
+    agent_ctx = _make_agent_context()
+    result = resolve_agent_context_from_deps(agent_ctx)
+    assert result is agent_ctx
+
+
+def test_resolve_agent_context_from_deps_runtime_context() -> None:
+    """resolve_agent_context_from_deps unwraps .data from RuntimeAgentContext."""
+    from agentpool.agents.context import AgentContext as RuntimeAgentContext
+    from agentpool.capabilities.agent_context import resolve_agent_context_from_deps
+
+    agent_ctx = _make_agent_context()
+    runtime_ctx = RuntimeAgentContext(node=MagicMock())
+    runtime_ctx.data = agent_ctx
+
+    result = resolve_agent_context_from_deps(runtime_ctx)
+    assert result is agent_ctx
+
+
+def test_resolve_agent_context_from_deps_none() -> None:
+    """resolve_agent_context_from_deps raises RuntimeError when deps is None."""
+    from agentpool.capabilities.agent_context import resolve_agent_context_from_deps
+
+    with pytest.raises(
+        RuntimeError, match=r"TestCap requires AgentContextDeps as deps\. Got: None"
+    ):
+        resolve_agent_context_from_deps(None, capability_name="TestCap")
+
+
+def test_resolve_agent_context_from_deps_runtime_ctx_none_data() -> None:
+    """resolve_agent_context_from_deps raises RuntimeError when .data is None."""
+    from agentpool.agents.context import AgentContext as RuntimeAgentContext
+    from agentpool.capabilities.agent_context import resolve_agent_context_from_deps
+
+    runtime_ctx = RuntimeAgentContext(node=MagicMock())
+    runtime_ctx.data = None
+
+    with pytest.raises(
+        RuntimeError, match=r"TestCap requires AgentContextDeps at deps\.data\. Got: None"
+    ):
+        resolve_agent_context_from_deps(runtime_ctx, capability_name="TestCap")
+
+
+def test_resolve_agent_context_from_deps_neither_type() -> None:
+    """resolve_agent_context_from_deps raises RuntimeError for unknown deps type."""
+    from agentpool.capabilities.agent_context import resolve_agent_context_from_deps
+
+    with pytest.raises(RuntimeError, match=r"TestCap requires AgentContextDeps as deps\. Got: str"):
+        resolve_agent_context_from_deps("not a context", capability_name="TestCap")

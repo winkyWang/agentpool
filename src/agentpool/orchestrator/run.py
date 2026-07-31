@@ -40,10 +40,22 @@ if TYPE_CHECKING:
     from agentpool.agents.events.events import RichAgentStreamEvent
     from agentpool.host.context import HostContext
     from agentpool.host.registry import AgentRegistry
+    from agentpool.lifecycle.protocols import CommChannel
     from agentpool.orchestrator.core import EventBus, SessionState
 
 
 logger = get_logger(__name__)
+
+# Check if EnqueuedMessagesEvent is available in the installed pydantic-ai version.
+# When available, the stream itself emits display events for enqueued messages,
+# making the manual _schedule_user_message_emission() call redundant for
+# steer/followup when an active_agent_run exists.
+try:
+    from pydantic_ai.messages import EnqueuedMessagesEvent  # noqa: F401
+
+    ENQUEUED_MESSAGES_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    ENQUEUED_MESSAGES_AVAILABLE = False
 
 
 def _has_invalid_json_args(part: Any) -> bool:
@@ -232,9 +244,9 @@ class RunHandle:
     # HostContext injection (M3 task group 15) — now sourced from SessionState
     # ------------------------------------------------------------------
     _host_context: HostContext | None = None
-    """HostContext for constructing per-turn AgentContext.
+    """HostContext for constructing per-turn AgentContextDeps.
 
-    When set, ``start()`` constructs an ``AgentContext`` per turn and
+    When set, ``start()`` constructs an ``AgentContextDeps`` per turn and
     injects it into ``run_ctx.deps`` so capabilities like
     ``SubagentCapability`` can access the delegation service.
     """
@@ -244,6 +256,24 @@ class RunHandle:
     """Deferred tool results from checkpoint, forwarded to ``agent.create_turn()``
     via ``**pydantic_ai_kwargs`` during resume. Only set by
     ``_create_run_handle()`` when resuming from a checkpoint."""
+    _run_span: Any = None
+    """Per-run root OTel span (``run.message``). Created in ``_start_run_handle``
+    as a new trace root (not inheriting the caller's context). Stored here so
+    ``_consume_run`` can end it when the run completes."""
+    _run_context: Any = None
+    """OTel Context containing ``_run_span``. Attached in ``_consume_run`` so
+    all spans within the run (turn.native, tools, notifications) are children
+    of ``run.message`` and share the same trace_id."""
+    _enqueued_messages_available: bool = field(default=False)
+    """Whether ``EnqueuedMessagesEvent`` is available in the installed
+    pydantic-ai version. When ``True`` and ``active_agent_run`` is not
+    ``None``, steer/followup skip ``_schedule_user_message_emission()``
+    because the stream itself emits the display event via
+    ``EnqueuedMessagesEvent``."""
+
+    def __post_init__(self) -> None:
+        """Initialize computed fields after dataclass construction."""
+        self._enqueued_messages_available = ENQUEUED_MESSAGES_AVAILABLE
 
     @property
     def is_running(self) -> bool:
@@ -265,10 +295,10 @@ class RunHandle:
         return self.active_agent_run
 
     def _inject_agent_context(self) -> None:
-        """Construct and inject AgentContext into run_ctx.deps.
+        """Construct and inject AgentContextDeps into run_ctx.deps.
 
-        Builds a fresh ``AgentContext`` per turn using the host context,
-        agent registry, and resource source. The AgentContext is set as
+        Builds a fresh ``AgentContextDeps`` per turn using the host context,
+        agent registry, and resource source. The AgentContextDeps is set as
         ``run_ctx.deps`` so pydantic-ai's ``RunContext.deps`` carries it
         into tool calls. Capabilities like ``SubagentCapability`` access
         it via ``ctx.deps``.
@@ -278,7 +308,7 @@ class RunHandle:
         """
         if self._host_context is None:
             return
-        from agentpool.capabilities.agent_context import AgentContext
+        from agentpool.capabilities.agent_context import AgentContextDeps
         from agentpool.capabilities.runloop_delegation import RunLoopDelegationService
         from agentpool.host.context import RunScope
 
@@ -296,7 +326,7 @@ class RunHandle:
             host=self._host_context,
             session_id=self.session_id,
         )
-        ctx = AgentContext(
+        ctx = AgentContextDeps(
             agent_registry=registry,
             delegation=delegation,
             session=self.session,  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
@@ -305,6 +335,7 @@ class RunHandle:
             extension_registry=(
                 self._host_context.extension_registry if self._host_context is not None else None
             ),
+            agent_name=self.agent.name if self.agent is not None else self.agent_type,
         )
         self.run_ctx.deps = ctx
 
@@ -347,17 +378,21 @@ class RunHandle:
 
         # Drain any steer messages that arrived while the session was idle.
         # These were enqueued to SessionState.feedback_queue by
-        # SessionPool.steer_from_background_task() when no RunHandle was active.
-        # self.steer() will queue them to queued_steer_messages (since
-        # active_agent_run is not yet set), and _execute_turn() will
-        # pick them up when the turn starts.
+        # SessionPool.steer_from_background_task() when no RunHandle was active,
+        # or by steer() fallback during a race window.
+        # We write directly to queued_steer_messages (NOT via self.steer())
+        # because steer() would re-enqueue to feedback_queue when
+        # active_agent_run is not yet set, creating an infinite loop.
+        # NativeTurn.execute() will drain queued_steer_messages into
+        # agent_run via drain_queued_steer_messages() after setting
+        # active_agent_run.
         while not session.feedback_queue.empty():
             try:
                 fb = session.feedback_queue.get_nowait()
-                content: str | list[Any] = (
-                    fb.content_blocks if fb.content_blocks is not None else fb.content
-                )
-                self.steer(content, message_id=fb.message_id, emit_user_message=False)
+                if fb.content_blocks is not None:
+                    self.run_ctx.queued_steer_messages.append(fb.content_blocks)
+                else:
+                    self.run_ctx.queued_steer_messages.append(fb.content)
             except asyncio.QueueEmpty:
                 break
 
@@ -381,9 +416,14 @@ class RunHandle:
                     current_prompts: list[str | list[Any]] = (
                         [initial_prompt] if initial_prompt else []
                     )
-                    if not current_prompts:
-                        # No prompt — nothing to do, terminate immediately.
+                    if not current_prompts and (agent is None or not agent.staged_content):
+                        # No prompt and no staged_content — nothing to do.
+                        # (issue #284: staged_content may have been injected
+                        # by skill commands even when the prompt is empty)
                         return
+                    # If we reach here with empty current_prompts but
+                    # staged_content has content, execute a turn so
+                    # NativeTurn.execute() can consume staged_content.
 
                     try:
                         async with contextlib.aclosing(
@@ -409,6 +449,35 @@ class RunHandle:
                 # Do NOT call agent.__aexit__() — that's session-level.
                 self.complete_event.set()
 
+    async def _safe_publish(
+        self,
+        comm: CommChannel,
+        event: RichAgentStreamEvent[Any],
+    ) -> None:
+        """Publish an event to the CommChannel, suppressing errors if closed.
+
+        During session shutdown (e.g. team member removal), the ProtocolChannel
+        may be closed before the RunHandle finishes publishing events. In that
+        case, ``comm.publish()`` raises ``RuntimeError("ProtocolChannel is
+        closed; cannot publish.")``. This is a benign race — the session is
+        already shutting down and no consumer remains to receive the event.
+
+        Args:
+            comm: The CommChannel to publish on.
+            event: The event to publish.
+        """
+        try:
+            await comm.publish(event)
+        except RuntimeError as e:
+            if "ProtocolChannel is closed" in str(e):
+                logger.debug(
+                    "ProtocolChannel closed during publish — session likely "
+                    "shutting down. Event type: %s",
+                    type(event).__name__,
+                )
+            else:
+                raise
+
     async def _publish_cancelled_event(self, event_bus: EventBus | None) -> None:
         """Publish a RunFailedEvent for cancelled turns.
 
@@ -425,7 +494,7 @@ class RunHandle:
         if comm is not None and event_bus is not None and not comm.publishes_to_event_bus:
             await event_bus.publish(self.session_id, cancelled_event)
         if comm is not None:
-            await comm.publish(cancelled_event)
+            await self._safe_publish(comm, cancelled_event)
         elif comm is None and event_bus is not None:
             await event_bus.publish(self.session_id, cancelled_event)
 
@@ -457,7 +526,7 @@ class RunHandle:
         # Reset per-turn state.
         if self.run_ctx.cancelled:
             self.run_ctx.cancelled = False
-        # Construct per-turn AgentContext and inject as deps so
+        # Construct per-turn AgentContextDeps and inject as deps so
         # capabilities (SubagentCapability, etc.) can access the
         # delegation service, resource sources, and host.
         self._inject_agent_context()
@@ -483,7 +552,7 @@ class RunHandle:
         )
         if event_bus is not None and not comm.publishes_to_event_bus:
             await event_bus.publish(self.session_id, run_started)
-        await comm.publish(run_started)
+        await self._safe_publish(comm, run_started)
         # Set _current_input_provider ContextVar so MCP elicitation can
         # access it during turn execution.
         if session.input_provider is not None:
@@ -493,20 +562,24 @@ class RunHandle:
         # Save user prompt to agent conversation before execution.
         # This ensures user messages are preserved even if the turn
         # fails or is cancelled.
-        from agentpool.agents.native_agent.helpers import _summarize_content_block
+        # Skip when current_prompts is empty — the real content comes from
+        # staged_content (consumed by NativeTurn), and saving an empty user
+        # message would pollute conversation history (issue #284).
+        if current_prompts:
+            from agentpool.agents.native_agent.helpers import _summarize_content_block
 
-        prompt_text = "\n".join(
-            p if isinstance(p, str) else " ".join(_summarize_content_block(b) for b in p)
-            for p in current_prompts
-        )
-        agent.conversation.add_chat_messages([
-            ChatMessage(
-                content=prompt_text,
-                role="user",
-                name=agent.name,
-                session_id=self.session_id,
-            ),
-        ])
+            prompt_text = "\n".join(
+                p if isinstance(p, str) else " ".join(_summarize_content_block(b) for b in p)
+                for p in current_prompts
+            )
+            agent.conversation.add_chat_messages([
+                ChatMessage(
+                    content=prompt_text,
+                    role="user",
+                    name=agent.name,
+                    session_id=self.session_id,
+                ),
+            ])
         # Store turn state for downstream sub-methods.
         self._current_turn = turn
         self._current_turn_failed = False
@@ -522,7 +595,7 @@ class RunHandle:
                     async for event in event_gen:
                         if event_bus is not None and not comm.publishes_to_event_bus:
                             await event_bus.publish(self.session_id, event)
-                        await comm.publish(event)
+                        await self._safe_publish(comm, event)
                         # Save assistant final message to conversation BEFORE
                         # yielding. The _consume_run caller closes the generator
                         # immediately after receiving StreamCompleteEvent, which
@@ -556,7 +629,7 @@ class RunHandle:
                 )
                 if event_bus is not None and not comm.publishes_to_event_bus:
                     await event_bus.publish(self.session_id, error_event)
-                await comm.publish(error_event)
+                await self._safe_publish(comm, error_event)
                 yield error_event
             finally:
                 self._current_turn_failed = turn_failed
@@ -592,7 +665,9 @@ class RunHandle:
         Called by ``SessionState`` when a RunHandle is active. Directly
         calls ``agent_run.enqueue()`` to inject the message into
         PydanticAI's pending message drain. If no ``agent_run`` is
-        active, queues the message on ``run_ctx.queued_steer_messages``.
+        active, re-enqueues the message to ``session.feedback_queue``
+        so it survives across RunHandle boundaries and is drained by
+        the next RunHandle's ``start()``.
 
         Args:
             message: The steer message (plain text or structured content
@@ -631,21 +706,70 @@ class RunHandle:
 
         agent_run = self.active_agent_run
         if agent_run is not None:
+            # Append message_id to FIFO queue BEFORE enqueue so
+            # handle_enqueued_messages() can reuse the same ID.
+            self.run_ctx._pending_enqueue_message_ids.append(fb.message_id)
             if fb.content_blocks is not None:
                 agent_run.enqueue(*fb.content_blocks, priority="asap")
             else:
                 agent_run.enqueue(fb.content, priority="asap")
+        elif self.session is not None:
+            # No active agent_run — re-enqueue to session.feedback_queue so
+            # the message survives across RunHandle boundaries. The next
+            # RunHandle's start() will drain feedback_queue into
+            # queued_steer_messages, and NativeTurn.execute() will drain
+            # those into agent_run via drain_queued_steer_messages().
+            self.session.feedback_queue.put_nowait(fb)
         elif fb.content_blocks is not None:
-            # No active agent_run — queue for this turn's steer messages.
+            # No session (standalone execution) — fallback to queued list.
             self.run_ctx.queued_steer_messages.append(fb.content_blocks)
         else:
+            # No session (standalone execution) — fallback to queued list.
             self.run_ctx.queued_steer_messages.append(fb.content)
 
         # Fire-and-forget UserMessageInsertedEvent publication.
-        if emit_user_message:
+        # When EnqueuedMessagesEvent is available AND there is an active
+        # agent_run, skip the fire-and-forget emission — the display event
+        # will come from handle_enqueued_messages() with source="processed".
+        # Otherwise, emit with source="accepted" as a fallback display.
+        if emit_user_message and not (
+            self._enqueued_messages_available and self.active_agent_run is not None
+        ):
             self._schedule_user_message_emission(message, "steer", message_id=fb.message_id)
 
         return fb.message_id
+
+    def drain_queued_steer_messages(self) -> None:
+        """Drain ``queued_steer_messages`` into the active ``agent_run``.
+
+        Called by ``NativeTurn.execute()`` immediately after setting
+        ``active_agent_run``. Delivers any steer messages that arrived
+        before ``active_agent_run`` was set (e.g., during ``start()``
+        ``feedback_queue`` drain or during the race window between
+        turn end and RunHandle cleanup).
+
+        Each message is enqueued to ``agent_run`` with ``priority="asap"``
+        so PydanticAI's ``PendingMessageDrainCapability`` injects it
+        into the current model request.
+
+        After draining, ``queued_steer_messages`` is cleared.
+
+        !!! note "No-op when inactive"
+            If ``active_agent_run`` is ``None``, this method is a no-op.
+            Messages remain in ``queued_steer_messages`` for a later drain.
+        """
+        agent_run = self.active_agent_run
+        if agent_run is None:
+            return
+        queued = self.run_ctx.queued_steer_messages
+        if not queued:
+            return
+        self.run_ctx.queued_steer_messages = []
+        for msg in queued:
+            if isinstance(msg, list):
+                agent_run.enqueue(*msg, priority="asap")
+            else:
+                agent_run.enqueue(msg, priority="asap")
 
     def followup(
         self,
@@ -679,10 +803,32 @@ class RunHandle:
         session = self.session
         if session is None:
             return None
-        session.prompt_queue.put_nowait(message)
+        agent_run = self.active_agent_run
+        if agent_run is not None:
+            # Enqueue directly to the active agent_run so
+            # PendingMessageDrainCapability fires EnqueuedMessagesEvent
+            # for display. The prompt will be drained as a "when_idle"
+            # message after the current node finishes.
+            # Append message_id to FIFO queue BEFORE enqueue so
+            # handle_enqueued_messages() can reuse the same ID.
+            self.run_ctx._pending_enqueue_message_ids.append(message_id)
+            if isinstance(message, list):
+                agent_run.enqueue(*message, priority="when_idle")
+            else:
+                agent_run.enqueue(message, priority="when_idle")
+        else:
+            # No active agent_run — fall back to session.prompt_queue.
+            # The next RunHandle's _consume_run() will drain this queue.
+            session.prompt_queue.put_nowait(message)
 
         # Fire-and-forget UserMessageInsertedEvent publication.
-        if emit_user_message:
+        # When EnqueuedMessagesEvent is available AND there is an active
+        # agent_run, skip the fire-and-forget emission — the display event
+        # will come from handle_enqueued_messages() with source="processed".
+        # Otherwise, emit with source="accepted" as a fallback display.
+        if emit_user_message and not (
+            self._enqueued_messages_available and self.active_agent_run is not None
+        ):
             self._schedule_user_message_emission(message, "followup", message_id=message_id)
 
         return message_id
@@ -714,7 +860,7 @@ class RunHandle:
             # steer/followup operation itself has already completed.
             return
         task = loop.create_task(
-            self._emit_user_message_inserted(content, delivery, "internal", message_id=message_id),
+            self._emit_user_message_inserted(content, delivery, "accepted", message_id=message_id),
         )
         # Store reference to prevent GC of the fire-and-forget task.
         self._emission_tasks.add(task)
@@ -724,7 +870,7 @@ class RunHandle:
         self,
         content: str | list[Any],
         delivery: Literal["initial", "steer", "followup"],
-        source: Literal["protocol", "background_task", "internal"],
+        source: Literal["accepted"],
         *,
         message_id: str | None = None,
     ) -> None:
@@ -738,8 +884,8 @@ class RunHandle:
             content: The message content that was inserted.
             delivery: Delivery mode — ``"initial"``, ``"steer"``, or
                 ``"followup"``.
-            source: Originator — ``"protocol"``, ``"background_task"``,
-                or ``"internal"``.
+            source: Originator — ``"accepted"`` for fire-and-forget
+                fallback display events.
             message_id: Optional message ID for dedup correlation. If
                 ``None``, a new UUID is generated.
         """
@@ -759,7 +905,7 @@ class RunHandle:
                 )
                 if self.event_bus is not None:
                     await self.event_bus.publish(self.session_id, event)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning(
                     "Failed to emit UserMessageInsertedEvent",
                     exc_info=True,

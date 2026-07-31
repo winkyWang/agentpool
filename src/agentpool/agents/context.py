@@ -21,6 +21,7 @@ from agentpool.agents.prompt_injection import PromptInjectionManager
 from agentpool.log import get_logger
 from agentpool.messaging.context import NodeContext
 from agentpool.tools import CallDeferred
+from agentpool.ui.elicitation import normalize_elicit_content
 
 
 if TYPE_CHECKING:
@@ -170,7 +171,13 @@ class AgentRunContext:
     """Per-child-session done events for tracking subagent completion."""
 
     queued_steer_messages: list[str | list[Any]] = field(default_factory=list)
-    """Steer messages queued during post-iteration wait window."""
+    """Steer messages queued during ``start()`` ``feedback_queue`` drain.
+
+    Populated by ``RunHandle.start()`` when draining ``session.feedback_queue``
+    (before ``active_agent_run`` is set). Drained by
+    ``RunHandle.drain_queued_steer_messages()`` which is called by
+    ``NativeTurn.execute()`` after setting ``active_agent_run``.
+    """
 
     turn_id: str | None = None
     """Unique identifier for the current Turn, set by RunHandle.start().
@@ -189,6 +196,20 @@ class AgentRunContext:
     as fallback) as the ``message_id`` for file change tracking. Without
     this, file rollback would silently fail because ``turn_id`` (UUID)
     and the OpenCode message ID are different ID spaces.
+    """
+
+    _pending_enqueue_message_ids: list[str] = field(default_factory=list)
+    """FIFO queue of message_ids from ``steer()``/``followup()`` calls.
+
+    When ``steer()`` or ``followup()`` enqueues a message to
+    ``agent_run``, the ``message_id`` is appended here BEFORE the
+    ``enqueue()`` call. When ``EnqueuedMessagesEvent`` fires and
+    ``EventMapper.handle_enqueued_messages()`` runs, it pops from this
+    queue to reuse the same ``message_id`` instead of generating a new
+    UUID. This ensures the fire-and-forget ``UserMessageInsertedEvent``
+    (emitted by ``_schedule_user_message_emission()``) and the
+    ``EnqueuedMessagesEvent``-derived event share the same
+    ``message_id``, enabling converter-level dedup.
     """
 
     async def complete_background_task(self, child_session_id: str, message: str) -> None:
@@ -289,10 +310,18 @@ class AgentContext[TDeps = Any](NodeContext[TDeps]):
             and self.tool_call_id is not None
             and self.tool_call_id in self.run_ctx.cached_elicitation_responses
         ):
+            logger.info(
+                "handle_elicitation: Path 1 (crash recovery cached response)",
+                tool_call_id=self.tool_call_id,
+            )
             return self.run_ctx.cached_elicitation_responses[self.tool_call_id]
 
         provider = self.get_input_provider()
         if not provider.supports_durable_elicitation:
+            logger.info(
+                "handle_elicitation: non-durable path (provider.get_elicitation)",
+                tool_call_id=self.tool_call_id,
+            )
             return await provider.get_elicitation(params)
 
         # Build elicitation params dict (used in both MCP and local paths).
@@ -318,6 +347,11 @@ class AgentContext[TDeps = Any](NodeContext[TDeps]):
 
         # Path 2: MCP tools — raise CallDeferred (FastMCP can't await).
         if self.in_mcp_callback:
+            logger.info(
+                "handle_elicitation: Path 2 (MCP CallDeferred)",
+                tool_call_id=self.tool_call_id,
+                tool_name=self.tool_name,
+            )
             raise CallDeferred(
                 metadata={
                     "elicitation": elicitation_params,
@@ -328,6 +362,11 @@ class AgentContext[TDeps = Any](NodeContext[TDeps]):
         # Path 3: Local tools — checkpoint, emit event, await future.
         # The agent run suspends here without ending. When the future
         # resolves, handle_elicitation() returns and the tool continues.
+        logger.info(
+            "handle_elicitation: Path 3 (local tool, await future)",
+            tool_call_id=self.tool_call_id,
+            tool_name=self.tool_name,
+        )
         run_ctx = self.run_ctx
         if run_ctx is None:
             # No run context — fall back to synchronous path.
@@ -401,13 +440,13 @@ class AgentContext[TDeps = Any](NodeContext[TDeps]):
                                 )
                                 data.touch()
                                 await store.save_session(data)
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             logger.debug(
                                 "Failed to update session status to checkpointed",
                                 session_id=run_ctx.session_id,
                                 exc_info=True,
                             )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 # Checkpoint failed — the in-process future await still
                 # works, but crash recovery won't be available for this
                 # elicitation. Log prominently so operators know durability
@@ -428,7 +467,7 @@ class AgentContext[TDeps = Any](NodeContext[TDeps]):
         # question and the future times out.
         try:
             await provider.broadcast_elicitation_question(handle, params, shared_future=future)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 "Failed to broadcast elicitation question",
                 session_id=run_ctx.session_id,
@@ -531,7 +570,10 @@ class AgentContext[TDeps = Any](NodeContext[TDeps]):
         # ElicitationResumePayload path.
         match payload.action:
             case "accept":
-                return MCPElicitResult(action="accept", content=payload.content)
+                return MCPElicitResult(
+                    action="accept",
+                    content=normalize_elicit_content(payload.content),
+                )
             case "decline":
                 return MCPElicitResult(action="decline")
             case "cancel":
@@ -726,12 +768,24 @@ class AgentContext[TDeps = Any](NodeContext[TDeps]):
             event_spawn_mechanism: Literal["task", "spawn"] = (
                 "task" if spawn_mechanism == "task" else "spawn"
             )
+            # Resolve display_name from manifest config when available.
+            child_display_name: str | None = None
+            if pool is not None:
+                child_config = pool.manifest.agents.get(agent_name)
+                if child_config is not None and child_config.display_name is not None:
+                    child_display_name = (
+                        child_config.display_name
+                        if child_config.display_name != agent_name
+                        else None
+                    )
+
             spawn_event = SpawnSessionStart(
                 child_session_id=child_sid,
                 parent_session_id=self.run_ctx.session_id,
                 tool_call_id=tool_call_id or self.tool_call_id,
                 spawn_mechanism=event_spawn_mechanism,
                 source_name=agent_name,
+                display_name=child_display_name,
                 source_type="agent",
                 depth=child_depth,
                 description=description,

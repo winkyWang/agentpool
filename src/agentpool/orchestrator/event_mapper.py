@@ -10,6 +10,7 @@ Mapping rules:
     - ``FunctionToolResultEvent`` → :class:`ToolCallCompleteEvent`
     - pydantic-ai ``PartDeltaEvent`` → AgentPool :class:`PartDeltaEvent` subclass
     - pydantic-ai ``PartStartEvent`` (non-tool) → AgentPool :class:`PartStartEvent` subclass
+    - ``EnqueuedMessagesEvent`` → :class:`UserMessageInsertedEvent`
     - Already-mapped :class:`RichAgentStreamEvent` instances pass through.
     - Unknown objects return ``None``.
 """
@@ -17,7 +18,10 @@ Mapping rules:
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, cast
+from datetime import UTC, datetime
+import json
+import logging
+from typing import Any, Literal, cast
 
 from pydantic_ai import (
     BaseToolCallPart,
@@ -28,7 +32,18 @@ from pydantic_ai import (
     PartStartEvent as PyAIPartStartEvent,
     RetryPromptPart,
 )
-from pydantic_ai.messages import ThinkingPart, ThinkingPartDelta
+from pydantic_ai.messages import (
+    ModelRequest,
+    ThinkingPart,
+    ThinkingPartDelta,
+    UserPromptPart,
+)
+
+
+try:
+    from pydantic_ai.messages import EnqueuedMessagesEvent
+except ImportError:
+    EnqueuedMessagesEvent = None  # type: ignore[assignment,misc]
 
 from agentpool.agents.events.events import (
     PartDeltaEvent,
@@ -37,9 +52,13 @@ from agentpool.agents.events.events import (
     ToolCallCompleteEvent,
     ToolCallProgressEvent,
     ToolCallStartEvent,
+    UserMessageInsertedEvent,
 )
 from agentpool.tools.base import ToolKind
 from agentpool.utils.pydantic_ai_helpers import safe_args_as_dict
+
+
+ENQUEUED_MESSAGES_AVAILABLE = EnqueuedMessagesEvent is not None
 
 
 class EventMapper:
@@ -55,49 +74,199 @@ class EventMapper:
             empty, in which case all tools receive ``"other"``.
     """
 
-    def __init__(self, agent_name: str, message_id: str) -> None:
+    def __init__(
+        self,
+        agent_name: str,
+        message_id: str,
+        *,
+        _enqueue_message_ids: list[str] | None = None,
+    ) -> None:
         self._agent_name = agent_name
         self._message_id = message_id
         self._pending_tool_calls: dict[str, str] = {}
         self._pending_tool_inputs: dict[str, dict[str, Any]] = {}
         self.tool_kind_map: dict[str, str] = {}
+        self._enqueue_message_ids = _enqueue_message_ids if _enqueue_message_ids is not None else []
 
-    def map_event(self, event: Any) -> RichAgentStreamEvent[Any] | None:
+    def map_event(  # noqa: PLR0911
+        self,
+        event: Any,
+        *,
+        current_node_type: str = "unknown",
+    ) -> RichAgentStreamEvent[Any] | None:
         """Map a stream event to a RichAgentStreamEvent.
+
+        Dispatches to per-event-type ``handle_*`` methods, borrowed from
+        pydantic-ai's UIEventStream pattern.  Pre-mapped
+        :class:`RichAgentStreamEvent` instances pass through unchanged.
 
         Args:
             event: A PydanticAI stream event or an AgentPool event.
+            current_node_type: The pydantic-graph node type currently
+                executing (e.g. ``"ModelRequestNode"``,
+                ``"CallToolsNode"``).  Used by
+                :meth:`handle_enqueued_messages` to infer delivery mode.
 
         Returns:
             Mapped event, the original event if it is already a
             RichAgentStreamEvent, or ``None`` if the event is unrecognized.
         """
-        match event:
-            case FunctionToolCallEvent(part=tool_part) if isinstance(tool_part, BaseToolCallPart):
-                return self._emit_tool_call_start(tool_part)
-            case PyAIPartStartEvent(part=tool_part) if isinstance(tool_part, BaseToolCallPart):
-                return self._emit_tool_call_start(tool_part)
-            case FunctionToolResultEvent(part=tool_return):
-                return self._emit_tool_call_complete(tool_return)
-            case _:
-                # Convert pydantic-ai events to AgentPool subclasses so
-                # downstream isinstance checks (e.g. EventBus coalescing)
-                # work correctly.  Without this, pydantic-ai's base
-                # PartDeltaEvent / PartStartEvent bypass coalescing because
-                # ``isinstance(base, subclass)`` is False.
-                if isinstance(event, PyAIPartDeltaEvent) and not isinstance(event, PartDeltaEvent):
-                    return _normalize_thinking_event(
-                        PartDeltaEvent(
-                            index=event.index, delta=event.delta, message_id=self._message_id
-                        )
-                    )
-                if isinstance(event, PyAIPartStartEvent) and not isinstance(event, PartStartEvent):
-                    return _normalize_thinking_event(
-                        PartStartEvent(
-                            index=event.index, part=event.part, message_id=self._message_id
-                        )
-                    )
-                return event if self._is_rich_event(event) else None
+        if isinstance(event, FunctionToolCallEvent):
+            return self.handle_tool_call(event)
+        if isinstance(event, PyAIPartStartEvent):
+            return self.handle_part_start(event)
+        if isinstance(event, FunctionToolResultEvent):
+            return self.handle_tool_result(event)
+        if isinstance(event, PyAIPartDeltaEvent):
+            return self.handle_part_delta(event)
+        if EnqueuedMessagesEvent is not None and isinstance(event, EnqueuedMessagesEvent):
+            return self.handle_enqueued_messages(event, current_node_type=current_node_type)
+
+        # Pre-mapped RichAgentStreamEvent instances pass through unchanged.
+        if self._is_rich_event(event):
+            return event  # type: ignore[no-any-return]
+
+        return None
+
+    def handle_tool_call(
+        self,
+        event: FunctionToolCallEvent,
+    ) -> RichAgentStreamEvent[Any] | None:
+        """Handle a ``FunctionToolCallEvent``.
+
+        Delegates to :meth:`_emit_tool_call_start` which deduplicates
+        by ``tool_call_id`` and emits a :class:`ToolCallStartEvent`
+        (or :class:`ToolCallProgressEvent` for updated args).
+        """
+        tool_part = event.part
+        if isinstance(tool_part, BaseToolCallPart):
+            return self._emit_tool_call_start(tool_part)
+        return None
+
+    def handle_tool_result(
+        self,
+        event: FunctionToolResultEvent,
+    ) -> RichAgentStreamEvent[Any] | None:
+        """Handle a ``FunctionToolResultEvent``.
+
+        Delegates to :meth:`_emit_tool_call_complete` which correlates
+        with the originating tool call start by ``tool_call_id``.
+        """
+        return self._emit_tool_call_complete(event.part)
+
+    def handle_part_start(
+        self,
+        event: PyAIPartStartEvent,
+    ) -> RichAgentStreamEvent[Any] | None:
+        """Handle a pydantic-ai ``PartStartEvent``.
+
+        If the part is a ``BaseToolCallPart``, emits a
+        :class:`ToolCallStartEvent` (via :meth:`_emit_tool_call_start`).
+        Otherwise, converts the pydantic-ai ``PartStartEvent`` to the
+        AgentPool :class:`PartStartEvent` subclass so downstream
+        isinstance checks work correctly.
+        """
+        tool_part = event.part
+        if isinstance(tool_part, BaseToolCallPart):
+            return self._emit_tool_call_start(tool_part)
+        if isinstance(event, PartStartEvent):
+            return event
+        return _normalize_thinking_event(
+            PartStartEvent(
+                index=event.index,
+                part=event.part,
+                message_id=self._message_id,
+            )
+        )
+
+    def handle_part_delta(
+        self,
+        event: PyAIPartDeltaEvent,
+    ) -> RichAgentStreamEvent[Any] | None:
+        """Handle a pydantic-ai ``PartDeltaEvent``.
+
+        Converts the pydantic-ai ``PartDeltaEvent`` to the AgentPool
+        :class:`PartDeltaEvent` subclass so downstream isinstance checks
+        (e.g. EventBus coalescing) work correctly.
+        """
+        if isinstance(event, PartDeltaEvent):
+            return event
+        return _normalize_thinking_event(
+            PartDeltaEvent(
+                index=event.index,
+                delta=event.delta,
+                message_id=self._message_id,
+            )
+        )
+
+    def handle_enqueued_messages(
+        self,
+        event: Any,
+        *,
+        current_node_type: str,
+    ) -> RichAgentStreamEvent[Any] | None:
+        """Handle an ``EnqueuedMessagesEvent`` from pydantic-ai.
+
+        Maps to :class:`UserMessageInsertedEvent` with delivery inference
+        based on the current node type:
+
+        - ``"ModelRequestNode"`` → ``delivery="steer"`` (mid-model-request)
+        - ``"CallToolsNode"`` or ``"End"`` → ``delivery="followup"`` (between turns)
+        - Unknown node types default to ``"steer"``
+
+        Extracts text content from ``ModelRequest`` objects containing
+        ``UserPromptPart`` instances in ``event.messages``.
+
+        Returns ``None`` if no ``UserPromptPart`` is found.
+        """
+        messages: tuple[Any, ...] = event.messages
+        if not messages:
+            return None
+
+        content: str | list[Any] | None = None
+        for msg in messages:
+            if not isinstance(msg, ModelRequest):
+                continue
+            for part in msg.parts:
+                if isinstance(part, UserPromptPart):
+                    content = cast(str | list[Any], part.content)
+                    break
+            if content is not None:
+                break
+
+        if content is None:
+            return None
+
+        if current_node_type == "ModelRequestNode":
+            delivery: Literal["initial", "steer", "followup"] = "steer"
+        elif current_node_type in ("CallToolsNode", "End"):
+            delivery = "followup"
+        else:
+            delivery = "steer"
+
+        # Reuse message_id from the FIFO queue (set by steer()/followup()
+        # before calling agent_run.enqueue()). This ensures the
+        # UserMessageInsertedEvent from EnqueuedMessagesEvent shares the
+        # same message_id as the fire-and-forget emission, enabling
+        # converter-level dedup.
+        if self._enqueue_message_ids:
+            message_id = self._enqueue_message_ids.pop(0)
+        else:
+            # FIFO queue is empty — this EnqueuedMessagesEvent came from
+            # pydantic-ai's internal flow (e.g. model retries, tool result
+            # processing), not from our steer()/followup(). Drop it to avoid
+            # spurious display events with random UUID message IDs.
+            return None
+
+        return UserMessageInsertedEvent(
+            session_id="",
+            message_id=message_id,
+            content=content,
+            delivery=delivery,
+            source="processed",
+            timestamp=datetime.now(UTC).timestamp(),
+            meta=None,
+        )
 
     def _emit_tool_call_start(
         self,
@@ -342,3 +511,119 @@ def normalize_thinking_parts_in_messages(
             new_parts[i] = dataclasses.replace(part, content=text)
         if new_parts is not None:
             messages[idx] = dataclasses.replace(msg, parts=new_parts)
+
+
+_logger = logging.getLogger(__name__)
+
+
+def _extract_first_json_object(s: str) -> str | None:
+    """Extract the first valid JSON object from a string that may contain concatenated JSONs.
+
+    Uses a brace-depth scanner to find the boundary of the first top-level ``{...}``
+    object, then validates it parses cleanly.  Returns ``None`` if the string is
+    already valid JSON or if no valid first object can be extracted.
+    """
+    s = s.strip()
+    if not s or s[0] != "{":
+        return None
+
+    # Fast path: already valid JSON — no repair needed.
+    try:
+        json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    else:
+        return None
+
+    # Scan for the first complete top-level JSON object using brace depth.
+    depth = 0
+    in_string = False
+    escape = False
+    for i, ch in enumerate(s):
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = s[: i + 1]
+                try:
+                    json.loads(candidate)
+                except json.JSONDecodeError:
+                    return None
+                else:
+                    return candidate
+    return None
+
+
+def sanitize_tool_call_args_in_messages(
+    messages: list[Any],
+) -> None:
+    """Repair duplicated tool call arguments in message history in-place.
+
+    Some inference backends (vLLM with the ``glm47`` parser, SGLang with GLM
+    detectors) have a known streaming bug where tool call arguments are emitted
+    twice, producing concatenated JSON like::
+
+        {"path": "/foo"}{"path": "/foo"}
+
+    This corrupts downstream model requests (HTTP 400 "Extra data") and tool
+    execution.  This function walks every ``ModelResponse`` in the list, checks
+    each ``BaseToolCallPart`` whose ``args`` is a ``str``, and — when the string
+    contains concatenated JSON objects — replaces it with just the first valid
+    object.
+
+    This is idempotent: parts with valid JSON args, ``dict`` args, or ``None``
+    args are left unchanged.
+
+    See: vllm-project/vllm#47504, vllm-project/vllm#44098,
+    sgl-project/sglang#23071, sgl-project/sglang#16371.
+
+    Args:
+        messages: A list of pydantic-ai messages (e.g. from
+            ``agent_run.all_messages()``).  Only ``ModelResponse`` messages
+            with ``BaseToolCallPart`` instances whose ``args`` is a corrupted
+            JSON string are affected; other messages pass through untouched.
+    """
+    from pydantic_ai.messages import ModelResponse
+
+    for msg in messages:
+        if not isinstance(msg, ModelResponse):
+            continue
+        needs_repair = False
+        new_parts = list(msg.parts)
+        for i, part in enumerate(new_parts):
+            if not isinstance(part, BaseToolCallPart):
+                continue
+            if not isinstance(part.args, str):
+                continue
+            repaired = _extract_first_json_object(part.args)
+            if repaired is None:
+                continue
+            _logger.warning(
+                "Repaired duplicated tool call arguments",
+                extra={
+                    "tool_name": part.tool_name,
+                    "tool_call_id": part.tool_call_id,
+                    "original_len": len(part.args),
+                    "repaired_len": len(repaired),
+                },
+            )
+            needs_repair = True
+            new_parts[i] = dataclasses.replace(part, args=repaired)
+        if needs_repair:
+            # Assign the full list so the mutation is visible to any reference
+            # holding the same ModelResponse (e.g. a CallToolsNode's
+            # ``model_response`` attribute).  ModelResponse is a non-frozen
+            # dataclass, so attribute assignment is safe.
+            msg.parts = new_parts

@@ -15,6 +15,7 @@ from slashed import CommandContext
 from agentpool.log import get_logger
 from agentpool.repomap import RepoMap, find_src_files
 from agentpool.utils import identifiers as identifier
+from agentpool.utils.identifiers import extract_timestamp_ms
 from agentpool.utils.time_utils import now_ms
 from agentpool_server.opencode_server.command_validation import validate_command
 from agentpool_server.opencode_server.converters import (
@@ -288,7 +289,9 @@ async def _execute_slashed_command(  # noqa: PLR0915
                 "请使用已加载的 skill context 来回答用户的请求。"
             )
 
-            session_pool = state.pool.session_pool if state.pool is not None else None
+            session_pool = (
+                state.pool_or_none.session_pool if state.pool_or_none is not None else None
+            )
             if session_pool is not None:
                 input_provider = state.ensure_input_provider(session_id)
                 iterator = session_pool.run_stream(
@@ -470,7 +473,7 @@ async def _execute_skill_command(  # noqa: PLR0915
                 working_dir=state.working_dir,
             )
 
-            session_pool = state.pool.session_pool if state.pool else None
+            session_pool = state.pool_or_none.session_pool if state.pool_or_none else None
             if session_pool is not None:
                 iterator = session_pool.run_stream(
                     session_id,
@@ -574,6 +577,7 @@ async def get_or_load_session(state: ServerState, session_id: str) -> Session | 
             existing_msgs = state.messages.get(session_id, [])
             if not existing_msgs:
                 default_model_id, default_provider_id = state.resolve_default_model_info()
+                model_variants = state.model_variants
                 await set_messages_for_session(
                     state,
                     session_id,
@@ -583,8 +587,9 @@ async def get_or_load_session(state: ServerState, session_id: str) -> Session | 
                             session_id=session_id,
                             working_dir=state.working_dir,
                             agent_name=agent.name,
-                            model_id=chat_msg.model_name or default_model_id,
-                            provider_id=chat_msg.provider_name or default_provider_id,
+                            model_id=default_model_id,
+                            provider_id=default_provider_id,
+                            model_variants=model_variants,
                         )
                         for chat_msg in agent.conversation.chat_messages
                     ],
@@ -628,6 +633,7 @@ async def get_or_load_session(state: ServerState, session_id: str) -> Session | 
         all_existing_msgs = state.messages.get(session_id, [])
         if not all_existing_msgs:
             default_model_id, default_provider_id = state.resolve_default_model_info()
+            model_variants = state.model_variants
             await set_messages_for_session(
                 state,
                 session_id,
@@ -637,8 +643,9 @@ async def get_or_load_session(state: ServerState, session_id: str) -> Session | 
                         session_id=session_id,
                         working_dir=state.working_dir,
                         agent_name=agent.name,
-                        model_id=chat_msg.model_name or default_model_id,
-                        provider_id=chat_msg.provider_name or default_provider_id,
+                        model_id=default_model_id,
+                        provider_id=default_provider_id,
+                        model_variants=model_variants,
                     )
                     for chat_msg in agent.conversation.chat_messages
                 ],
@@ -753,7 +760,7 @@ async def list_sessions(  # noqa: PLR0915
                         sessions_by_id[session_id] = cached
 
                 sessions = list(sessions_by_id.values())
-            except Exception:  # noqa: BLE001
+            except Exception:
                 # D7: Store query failure — degrade to in-memory only
                 logger.warning(
                     "Failed to query store for sessions, falling back to in-memory only",
@@ -802,8 +809,8 @@ async def list_sessions(  # noqa: PLR0915
 @router.post("")
 async def create_session(state: StateDep, request: SessionCreateRequest | None = None) -> Session:
     """Create a new session and persist to storage."""
-    now = now_ms()
-    session_id = identifier.ascending("session")
+    session_id = identifier.descending("session")
+    now = extract_timestamp_ms(session_id) or now_ms()
     base_path = state.base_path
     project_id = helpers.compute_project_id(base_path)
     agent_name = _resolve_session_create_agent(state, request.agent if request else None)
@@ -907,20 +914,6 @@ async def get_session_messages(
     Returns:
         List of messages with their parts
     """
-    # Clear EventBus replay buffer so that events published before this sync()
-    # call are not re-delivered to reconnecting SSE subscribers.  Without this,
-    # the TUI would receive duplicate message.part.updated events from the
-    # replay buffer AND from the sync() response, causing the first user
-    # message to render twice.
-    if state.event_bridge is not None:
-        event_bus = state.event_bridge._event_bus
-        if event_bus is not None:
-            logger.info(
-                "Clearing replay buffer for session %s on sync()",
-                session_id,
-            )
-            event_bus.clear_replay_buffer(session_id)
-
     # Fast path for subagent/child sessions already in memory:
     # Skip get_or_load_session (which may load from storage) because the
     # parent agent is streaming and subagent parts are in memory.
@@ -946,6 +939,26 @@ async def get_session_messages(
         ids=[m.info.id for m in messages],
     )
     return messages
+
+
+@router.get("/{session_id}/sync")
+async def sync_session_messages(
+    session_id: str,
+    state: StateDep,
+    limit: int | None = None,
+) -> list[MessageWithParts]:
+    """Alias for ``GET /{session_id}/message``.
+
+    The OpenCode TUI (v1.18+) requests ``/session/{id}/sync`` to load
+    conversation history.  Without this route, the request falls through
+    to the catch-all web-UI proxy (which forwards to ``app.opencode.ai``)
+    and the TUI receives empty cloud data instead of local session
+    history.
+
+    This route simply delegates to :func:`get_session_messages` so both
+    ``/message`` and ``/sync`` return identical data.
+    """
+    return await get_session_messages(session_id, state, limit)
 
 
 @router.get("/{session_id}/children")
@@ -981,6 +994,10 @@ async def get_session_children(
     except Exception:  # noqa: BLE001
         # Graceful fallback if store doesn't support list_sessions or query fails
         pass
+
+    # Sort by creation time (ascending) so left/right navigation in the
+    # OpenCode UI shows child sessions in creation order.
+    children.sort(key=lambda s: s.time.created)
 
     return children
 
@@ -1071,7 +1088,7 @@ async def abort_session(session_id: str, state: StateDep) -> bool:
                     await session_agent.interrupt()
                     # Give a moment for the cancellation to propagate
                     await asyncio.sleep(0.1)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.warning(
                         "interrupt() failed for session %s during abort",
                         session_id,
@@ -1153,8 +1170,8 @@ async def fork_session(  # noqa: D417
         messages_to_copy = list(original_messages)
 
     # Create the new forked session
-    now = now_ms()
-    new_session_id = identifier.ascending("session")
+    new_session_id = identifier.descending("session")
+    now = extract_timestamp_ms(new_session_id) or now_ms()
     # Use provided directory or inherit from original session
     fork_directory = directory if directory else original_session.directory
     forked_session = Session(
@@ -1286,16 +1303,20 @@ async def init_session(  # noqa: D417,PLR0915
         "1. Build/lint/test commands - especially for running a single test",
         "2. Code style guidelines (imports, formatting, types, naming conventions, error handling)",
         "",
-        "The file will be given to AI coding agents working in this repository. "
-        "Keep it around 150 lines.",
+        (
+            "The file will be given to AI coding agents working in this repository. "
+            "Keep it around 150 lines."
+        ),
         "",
-        "If there are existing rules (.cursor/rules/, .cursorrules, "
-        ".github/copilot-instructions.md), incorporate them.",
+        (
+            "If there are existing rules (.cursor/rules/, .cursorrules, "
+            ".github/copilot-instructions.md), incorporate them."
+        ),
     ])
 
     init_prompt = "\n".join(prompt_parts)
 
-    session_pool = state.pool.session_pool if state.pool is not None else None
+    session_pool = state.pool_or_none.session_pool if state.pool_or_none is not None else None
     if session_pool is not None:
         # Get or create agent and optionally set model before fire-and-forget
         agent = state.agent
@@ -1850,7 +1871,7 @@ async def _ensure_session_idle(state: ServerState, session_id: str) -> None:
         try:
             session_pool.cancel_run(run_id)
             cancel_succeeded = True
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 "cancel_run(%s) failed for session %s — force-clearing current_run_id",
                 run_id,
@@ -1873,7 +1894,7 @@ async def _ensure_session_idle(state: ServerState, session_id: str) -> None:
                 session_id,
                 _IDLE_WAIT_TIMEOUT,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 "wait_for_completion(%s) raised for session %s — force-clearing current_run_id",
                 run_id,
@@ -2211,7 +2232,9 @@ async def execute_command(  # noqa: PLR0915
                                     prompt_texts.append(item)
                 prompt_text = "\n".join(prompt_texts)
 
-                session_pool = state.pool.session_pool if state.pool is not None else None
+                session_pool = (
+                    state.pool_or_none.session_pool if state.pool_or_none is not None else None
+                )
                 if session_pool is not None:
                     input_provider = state.ensure_input_provider(session_id)
                     message_id = await session_pool.send_message(

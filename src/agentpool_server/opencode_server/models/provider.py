@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Self
 
 from pydantic import Field, model_validator
@@ -12,6 +13,10 @@ from agentpool_server.opencode_server.models.common import ModelRef  # noqa: TC0
 
 if TYPE_CHECKING:
     from tokonomics.model_discovery.model_info import ModelInfo as TokoModelInfo
+
+    from agentpool_config.model_capabilities import ModelCapabilities
+
+logger = logging.getLogger(__name__)
 
 
 class CostCache(OpenCodeBaseModel):
@@ -98,8 +103,21 @@ class Model(OpenCodeBaseModel):
     """
 
     @classmethod
-    def from_tokonomics(cls, model: TokoModelInfo) -> Self:
-        """Convert a tokonomics ModelInfo to an OpenCode Model."""
+    def from_tokonomics(
+        cls,
+        model: TokoModelInfo,
+        *,
+        capabilities_override: ModelCapabilities | None = None,
+    ) -> Self:
+        """Convert a tokonomics ModelInfo to an OpenCode Model.
+
+        Args:
+            model: The tokonomics ModelInfo to convert.
+            capabilities_override: Optional config-driven capabilities that
+                override tokonomics-derived modality values. Each field set
+                to ``True`` or ``False`` takes precedence; ``None`` fields
+                defer to tokonomics runtime discovery.
+        """
         from tokonomics.model_discovery.model_info import ModelPricing
 
         pricing = model.pricing or ModelPricing()
@@ -117,8 +135,29 @@ class Model(OpenCodeBaseModel):
         # Build modalities from tokonomics data (convert to boolean flags)
         input_mods = [str(m) for m in model.input_modalities] if model.input_modalities else []
         output_mods = [str(m) for m in model.output_modalities] if model.output_modalities else []
+        # Start with tokonomics-derived values
+        input_image = "image" in input_mods
+        input_audio = "audio" in input_mods
+        input_video = "video" in input_mods
+        input_pdf = "pdf" in input_mods or "file" in input_mods
+        output_image = "image" in output_mods
+        output_audio = "audio" in output_mods
+        output_video = "video" in output_mods
+        output_pdf = "pdf" in output_mods or "file" in output_mods
+        # Apply overrides from ModelCapabilities (only when explicitly set)
+        if capabilities_override is not None:
+            if capabilities_override.image_input is not None:
+                input_image = capabilities_override.image_input
+            if capabilities_override.audio_input is not None:
+                input_audio = capabilities_override.audio_input
+            if capabilities_override.video_input is not None:
+                input_video = capabilities_override.video_input
+            if capabilities_override.document_input is not None:
+                input_pdf = capabilities_override.document_input
+            if capabilities_override.image_output is not None:
+                output_image = capabilities_override.image_output
         # Use id_override if available (e.g., "opus" for Claude Code SDK)
-        return cls(
+        instance = cls(
             id=model.id_override or model.id,
             name=model.name,
             capabilities=ProviderCapabilities(
@@ -127,23 +166,34 @@ class Model(OpenCodeBaseModel):
                 temperature=True,
                 input=ProviderModalities(
                     text=True,
-                    audio="audio" in input_mods,
-                    image="image" in input_mods,
-                    video="video" in input_mods,
-                    pdf="pdf" in input_mods,
+                    audio=input_audio,
+                    image=input_image,
+                    video=input_video,
+                    pdf=input_pdf,
                 ),
                 output=ProviderModalities(
                     text=True,
-                    audio="audio" in output_mods,
-                    image="image" in output_mods,
-                    video="video" in output_mods,
-                    pdf="pdf" in output_mods,
+                    audio=output_audio,
+                    image=output_image,
+                    video=output_video,
+                    pdf=output_pdf,
                 ),
             ),
             cost=cost,
             limit=ModelLimit(context=context, output=output),
             release_date=model.created_at.strftime("%Y-%m-%d") if model.created_at else "",
         )
+
+        # Passively populate the CapabilityCache from this ModelInfo.
+        # Zero additional network requests — data is already available.
+        try:
+            from agentpool.host.stubs import _get_default_cache
+
+            _get_default_cache().populate_cache_from_model_info(model)
+        except Exception:  # noqa: BLE001
+            logger.debug("populate_cache_failed: %s", model.id)
+
+        return instance
 
 
 class Provider(OpenCodeBaseModel):

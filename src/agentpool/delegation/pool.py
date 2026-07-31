@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from asyncio import Lock
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 import os
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 from anyenv import ProcessManager
 import anyio
+import logfire
 from upathtools import to_upath
 
 from agentpool.capabilities.combined_toolset import CombinedToolsetCapability, _NamedCapability
@@ -187,6 +189,8 @@ class AgentPool[TPoolDeps = None]:
             self._skill_capabilities: list[Any] = []  # SkillManagerCap instances
             # Pool-level ExtensionRegistry for global capability scoping.
             self._extension_registry: ExtensionRegistry = ExtensionRegistry()
+            # ResourceCapability instance — created in _setup_resource_capability()
+            self._resource_capability: Any = None
             skill_scopes = getattr(self.manifest, "model_extra", None) or {}
             raw_skill_scopes = skill_scopes.get("_skill_scopes", {})
             self._default_skill_scope = str(raw_skill_scopes.get("default_scope", "host"))
@@ -226,6 +230,7 @@ class AgentPool[TPoolDeps = None]:
             # Graph topology attributes preserved for future re-implementation
             self._graph: Any | None = None
             self._graph_config: Any | None = None
+            self._team_cleanup_task: asyncio.Task[None] | None = None
 
     def get_context(self) -> HostContext:
         """Return cached HostContext, creating it on first call.
@@ -288,6 +293,15 @@ class AgentPool[TPoolDeps = None]:
                 # Command discovery is handled by ExtensionRegistry.get_command_resources().
                 # Create pool-scoped capabilities for all discovered skills
                 await self._rebuild_skill_capabilities()
+                # Create the unified ResourceCapability (not registered in registry).
+                await self._setup_resource_capability()
+                # Register config-defined capabilities (e.g. Viking, MCP, code
+                # mode) at AGENT scope so they are available in the
+                # ExtensionRegistry before any message handling occurs.
+                from agentpool.host.factory import AgentFactory
+
+                factory = AgentFactory(self)
+                factory.register_config_capabilities(self.manifest, self.get_context())
                 # Initialize storage and sessions sequentially (they share the same DB)
                 await self.exit_stack.enter_async_context(self.storage)
                 # Use the StorageManager's already-initialized provider as session store.
@@ -313,6 +327,18 @@ class AgentPool[TPoolDeps = None]:
                 self._session_pool.event_bus._max_queue_size = cfg.max_queue_size
                 await self._session_pool.start()
 
+                # Start team cleanup background task if team mode is enabled
+                team_mode = self.manifest.team_mode
+                if team_mode is not None and team_mode.enabled:
+                    from agentpool.capabilities.file_team_state import (
+                        start_team_cleanup_task,
+                    )
+
+                    self._team_cleanup_task = await start_team_cleanup_task(
+                        base_dir=team_mode.effective_base_dir,
+                        ttl_hours=team_mode.ttl_hours,
+                    )
+
             except Exception as e:
                 await self.cleanup()
                 msg = "Failed to initialize agent pool"
@@ -333,6 +359,10 @@ class AgentPool[TPoolDeps = None]:
         async with self._enter_lock:
             self._running_count -= 1
             if self._running_count == 0:
+                # Cancel team cleanup background task
+                if self._team_cleanup_task is not None:
+                    self._team_cleanup_task.cancel()
+                    self._team_cleanup_task = None
                 # Stop all protocol server event consumers first
                 await self._stop_all_consumers()
                 # Stop AgentFactory hot-swap listeners (M3 Todo 11)
@@ -654,7 +684,7 @@ class AgentPool[TPoolDeps = None]:
                 # Close child McpServerCap instances to release MCP connections.
                 try:
                     await existing_cap.__aexit__(None, None, None)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.warning("Error closing old SkillManagerCap", exc_info=True)
 
         # Create a single SkillManagerCap holding all local skills + MCP children.
@@ -683,6 +713,42 @@ class AgentPool[TPoolDeps = None]:
         dynamic skill registration/unregistration.
         """
         return self._skill_capabilities
+
+    @property
+    def resource_capability(self) -> Any:
+        """Get the pool-scoped ``ResourceCapability`` instance.
+
+        Created during ``__aenter__`` via ``_setup_resource_capability()``.
+        Returns ``None`` if not yet initialized.
+        """
+        return self._resource_capability
+
+    @logfire.instrument("pool.setup_resource_capability")
+    async def _setup_resource_capability(self) -> None:
+        """Create the ``ResourceCapability`` instance.
+
+        The capability provides 5 agent-facing tools (``list_resources``,
+        ``read_resource``, ``resource_exists``, ``list_resource_templates``,
+        ``complete_resource_template``) that aggregate resource access
+        across all visible providers in the ``ExtensionRegistry``.
+
+        The capability is stateless — it reads ``AgentContext`` at runtime
+        to resolve providers. Per-agent opt-out is handled in
+        ``get_agentlet()`` by checking ``agent_config.resources.enabled``.
+
+        Note: The capability is NOT registered in the ExtensionRegistry.
+        It is a tool wrapper/router, not a ``ResourceAccess`` data provider.
+        Its tool methods have ``RunContext`` as first arg, which is
+        incompatible with the ``ResourceAccess`` protocol signature.
+        Registering it would cause ``get_resource_access()`` to return it
+        via ``@runtime_checkable`` false-positive, leading to ``TypeError``
+        in ``resolve_resource_content()``.
+        """
+        from agentpool.capabilities.resource_capability import ResourceCapability
+
+        cap = ResourceCapability()
+        self._resource_capability = cap
+        logger.debug("Created ResourceCapability (not registered in ExtensionRegistry)")
 
     async def _on_skills_changed(self, event: Any) -> None:
         """Handle skills changed events from the skill provider.

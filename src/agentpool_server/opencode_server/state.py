@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
     from agentpool.agents.base_agent import BaseAgent
     from agentpool.delegation import AgentPool
+    from agentpool.models.model_configs import AnyModelConfig
     from agentpool.orchestrator.core import SessionController
     from agentpool.storage import StorageManager
     from agentpool_server.opencode_server.input_provider import OpenCodeInputProvider
@@ -94,20 +95,6 @@ class ServerState:
     session_controller: SessionController | None = field(default=None)
     event_bridge: Any = field(default=None, repr=False)
     _shell_env: Any = field(default=None, repr=False)
-    _sse_event_counter: int = field(default=0, repr=False)
-
-    def get_next_event_id(self) -> int:
-        """Get the next monotonic SSE event ID.
-
-        Increments a global counter shared across all SSE connections.
-        This ensures event IDs are monotonically increasing even across
-        reconnects, allowing proper deduplication via ``last_event_id``.
-
-        Returns:
-            The next event ID (starts at 1).
-        """
-        self._sse_event_counter += 1
-        return self._sse_event_counter
 
     @staticmethod
     def parse_model_info(model_name: str | None) -> tuple[str, str]:
@@ -129,18 +116,46 @@ class ServerState:
             return model, provider
         return "default", "agentpool"
 
+    @property
+    def model_variants(self) -> dict[str, AnyModelConfig]:
+        """Return configured model variants from the pool manifest.
+
+        Returns an empty dict when the pool or manifest is not available.
+        """
+        if self._pool is not None and self._pool.manifest is not None:
+            return self._pool.manifest.model_variants
+        return {}
+
     def resolve_default_model_info(self) -> tuple[str, str]:
         """Resolve default (model_id, provider_id) from the configured agent.
 
-        Parses ``self.agent.model_name`` (e.g. ``"openai:gpt-4o"``) by
-        splitting on the first colon. Falls back to ``("default",
-        "agentpool")`` when the model name is ``None`` or missing a
-        provider prefix.
+        Priority:
+        1. If agent's resolved model matches a configured variant → use variant
+           name as model_id and configured provider as provider_id.
+        2. Parses ``self.agent.model_name`` (e.g. ``"openai:gpt-4o"``) by
+           splitting on the first colon.
+        3. Falls back to ``("default", "agentpool")``.
 
         Returns:
             Tuple of ``(model_id, provider_id)``.
         """
-        return self.parse_model_info(self.agent.model_name)
+        agent_model = self.agent.model_name
+        # Try variant-aware resolution first
+        if agent_model and self._pool is not None:
+            manifest = self._pool.manifest
+            if manifest and manifest.model_variants:
+                from agentpool_server.shared.model_utils import (
+                    _extract_provider,
+                    _find_variant_name,
+                )
+
+                matched = _find_variant_name(manifest.model_variants, agent_model)
+                if matched:
+                    config = manifest.model_variants[matched]
+                    provider = _extract_provider(config)
+                    return matched, provider
+
+        return self.parse_model_info(agent_model)
 
     def __post_init__(self) -> None:
         """Initialize derived state."""
@@ -250,10 +265,24 @@ class ServerState:
         Returns the cached pool reference that was resolved from
         ``self.agent.host_context`` during ``__post_init__``.  This avoids
         depending on the shared agent for non-session-scoped access.
+
+        Raises:
+            AttributeError: If the pool was not set during ``__post_init__``
+                (e.g. in test environments without a real AgentPool).
         """
         if self._pool is None:
-            msg = "Agent has no agent_pool set"
-            raise RuntimeError(msg)
+            msg = "ServerState has no agent_pool set"
+            raise AttributeError(msg)
+        return self._pool
+
+    @property
+    def pool_or_none(self) -> AgentPool[Any] | None:
+        """Get the agent pool, or ``None`` if not set.
+
+        Use this in code paths that must gracefully handle the absence of
+        a pool (e.g. test fixtures, optional features).  Production route
+        handlers should use :attr:`pool` instead.
+        """
         return self._pool
 
     def get_session_lock(self, session_id: str) -> asyncio.Lock:
@@ -341,21 +370,19 @@ class ServerState:
         self.background_tasks.clear()
 
     async def broadcast_event(self, event: Event) -> None:
-        """Broadcast an event via the EventBus bridge and SSE subscribers.
+        """Broadcast an event via the EventBus bridge.
 
         When :attr:`event_bridge` is present, delegates to the bridge which
-        publishes the event to the SessionPool EventBus and SSE subscribers.
-        Otherwise, pushes directly to SSE subscribers for backward compatibility.
+        publishes the event to the SessionPool EventBus. Otherwise, the
+        event is silently dropped (no event delivery path available).
         """
         if self.event_bridge is not None:
             await self.event_bridge.publish(event)
         else:
-            # Legacy path: push to SSE subscribers directly
-            for subscriber in self.event_subscribers:
-                try:
-                    subscriber.put_nowait(event)
-                except asyncio.QueueFull:
-                    logger.debug("SSE subscriber queue full, dropping event")
+            logger.debug(
+                "broadcast_event: no event_bridge, skipping event",
+                event_type=getattr(event, "type", "unknown"),
+            )
 
     async def mark_session_idle(self, session_id: str) -> None:
         """Mark a session idle and broadcast the matching status events."""
