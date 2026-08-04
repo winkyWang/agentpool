@@ -827,6 +827,13 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
         # Construct full model ID with provider prefix (e.g., "anthropic:claude-haiku-4-5")
         return f"{self._model.system}:{self._model.model_name}" if self._model else None
 
+    @property
+    def model_context_window_tokens(self) -> int | None:
+        """Return the active model configuration's declared context window."""
+        if self._resolved_model_config is None:
+            return None
+        return self._resolved_model_config.context_length
+
     def to_tool(
         self,
         *,
@@ -1494,6 +1501,7 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
         else:
             # Direct Model instance assignment (no signal emission)
             self._model = model
+            self._resolved_model_config = None
 
     def create_turn(
         self,
@@ -1966,6 +1974,10 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
             # Set the model using variant name (preserves model_settings)
             old_model = self._model
             self._model, settings = self._resolve_model_string(variant_name)
+            if ctx and variant_name in ctx.manifest.model_variants:
+                self._resolved_model_config = ctx.manifest.model_variants[variant_name]
+            else:
+                self._resolved_model_config = None
             if settings:
                 self.model_settings = settings
             self.log.info("Model changed from %s to %s", old_model, self._model)

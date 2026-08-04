@@ -511,6 +511,38 @@ def test_get_declared_capabilities_falls_back_to_config_model() -> None:
     assert caps.image_input is True
 
 
+def test_model_context_window_comes_from_resolved_model_config() -> None:
+    """DCP reads the context window declared for the active model variant."""
+    variant_config = StringModelConfig(
+        identifier="openai:gpt-4o",
+        context_length=128_000,
+    )
+    agent = Agent(
+        name="test",
+        model="test",
+        resolved_model_config=variant_config,
+    )
+
+    assert agent.model_context_window_tokens == 128_000
+
+
+async def test_direct_model_switch_clears_stale_context_window() -> None:
+    """A direct model object cannot retain the previous variant's budget."""
+    variant_config = StringModelConfig(
+        identifier="openai:gpt-4o",
+        context_length=128_000,
+    )
+    agent = Agent(
+        name="test",
+        model="test",
+        resolved_model_config=variant_config,
+    )
+
+    await agent.set_model(TestModel())
+
+    assert agent.model_context_window_tokens is None
+
+
 # ---------------------------------------------------------------------------
 # _apply_image_output_profile with text-only defaults
 # ---------------------------------------------------------------------------

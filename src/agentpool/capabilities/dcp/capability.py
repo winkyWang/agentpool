@@ -332,6 +332,27 @@ class DynamicContextPruningCapability(AbstractCapability[Any]):
             return "default"
         return session_data.session_id if hasattr(session_data, "session_id") else "default"
 
+    def _effective_config(self, ctx: RunContext[AgentContext]) -> DCPConfig:
+        """Bind context pressure to the active model's declared window."""
+        model_context_tokens = ctx.deps.native_agent.model_context_window_tokens
+        if (
+            isinstance(model_context_tokens, int)
+            and not isinstance(model_context_tokens, bool)
+            and model_context_tokens > 0
+        ):
+            if model_context_tokens != self._config.max_context_tokens:
+                logger.debug(
+                    "DynamicContextPruning model-aware budget: model=%s tokens=%d "
+                    "configured_programmatic_budget=%d",
+                    ctx.deps.model_name,
+                    model_context_tokens,
+                    self._config.max_context_tokens,
+                )
+            return self._config.model_copy(
+                update={"max_context_tokens": model_context_tokens},
+            )
+        return self._config
+
     # ---- Static configuration ----
 
     def get_instructions(self) -> AgentInstructions[Any] | None:
@@ -356,6 +377,7 @@ class DynamicContextPruningCapability(AbstractCapability[Any]):
                 Tool(
                     self._prune_tool_handler,
                     name="prune",
+                    max_retries=2,
                     description=(
                         "Use this tool to remove tool outputs from context entirely. "
                         "No preservation - pure deletion.\n\n"
@@ -542,6 +564,8 @@ class DynamicContextPruningCapability(AbstractCapability[Any]):
         if not self._config.enabled:
             return request_context
 
+        effective_config = self._effective_config(ctx)
+        max_context_tokens = effective_config.max_context_tokens
         state = self._get_dcp_state(ctx)
         session_id = self._get_session_id(ctx)
         messages = list(request_context.messages)
@@ -580,7 +604,7 @@ class DynamicContextPruningCapability(AbstractCapability[Any]):
 
         level = self._watermark.update_with_tokens(
             total_tokens,
-            self._config.max_context_tokens,
+            max_context_tokens,
         )
         state.watermark_level = level
         state.current_tokens = total_tokens
@@ -591,10 +615,10 @@ class DynamicContextPruningCapability(AbstractCapability[Any]):
             state.current_turn,
             original_msg_count,
             total_tokens,
-            self._config.max_context_tokens,
+            max_context_tokens,
             (
-                (total_tokens / self._config.max_context_tokens * 100)
-                if self._config.max_context_tokens > 0
+                (total_tokens / max_context_tokens * 100)
+                if max_context_tokens > 0
                 else 0.0
             ),
             level.name,
@@ -611,7 +635,7 @@ class DynamicContextPruningCapability(AbstractCapability[Any]):
         messages = self._auto_prune_meta_tools(messages, state)
 
         # Build tool_id_list always; inject <prunable-tools> list (INFO-gated).
-        prunable_text = build_prunable_list(messages, state, self._config)
+        prunable_text = build_prunable_list(messages, state, effective_config)
         if level >= WatermarkLevel.INFO and prunable_text:
             messages = inject_prunable_list(messages, prunable_text, self._config.inject_role)
             logger.debug(
@@ -736,7 +760,7 @@ class DynamicContextPruningCapability(AbstractCapability[Any]):
             and state.nudge_step_counter >= self._config.nudge_step_frequency
         )
         if turn_trigger or step_trigger:
-            nudge_text = build_nudge_text(state, self._config)
+            nudge_text = build_nudge_text(state, effective_config)
             session_id = self._get_session_id(ctx)
             steer_id: str | None = None
             host_ctx = ctx.deps.node.host_context
@@ -759,7 +783,7 @@ class DynamicContextPruningCapability(AbstractCapability[Any]):
                     steer_id,
                     state.current_turn,
                     state.current_tokens,
-                    self._config.max_context_tokens,
+                    max_context_tokens,
                 )
             elif hasattr(ctx, "enqueue"):
                 # Fallback: standalone execution without SessionPool.
@@ -782,7 +806,7 @@ class DynamicContextPruningCapability(AbstractCapability[Any]):
                     steer_id,
                     state.current_turn,
                     state.current_tokens,
-                    self._config.max_context_tokens,
+                    max_context_tokens,
                 )
             else:
                 logger.debug(
@@ -791,7 +815,7 @@ class DynamicContextPruningCapability(AbstractCapability[Any]):
                     "(turn=%d tokens=%d/%d)",
                     state.current_turn,
                     state.current_tokens,
-                    self._config.max_context_tokens,
+                    max_context_tokens,
                 )
         else:
             logger.debug(
@@ -816,10 +840,10 @@ class DynamicContextPruningCapability(AbstractCapability[Any]):
             len(messages),
             state.watermark_level.name,
             state.current_tokens,
-            self._config.max_context_tokens,
+            max_context_tokens,
             (
-                (state.current_tokens / self._config.max_context_tokens * 100)
-                if self._config.max_context_tokens > 0
+                (state.current_tokens / max_context_tokens * 100)
+                if max_context_tokens > 0
                 else 0.0
             ),
             pending_count,
