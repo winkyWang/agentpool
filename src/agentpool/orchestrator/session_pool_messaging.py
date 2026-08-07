@@ -51,6 +51,16 @@ class SessionPoolMessagingMixin:
     _message_cache: OrderedDict[str, list[ChatMessage[Any]]]
     _message_cache_maxsize: int
 
+    async def _wait_for_subagent_event(self, bus_queue: asyncio.Queue[Any]) -> Any:
+        """Wait according to the deployment-level delegated-event inactivity timeout."""
+        timeout_seconds = self._subagent_inactivity_timeout_seconds
+        if timeout_seconds is None:
+            return await bus_queue.get()
+        return await asyncio.wait_for(
+            bus_queue.get(),
+            timeout=timeout_seconds,
+        )
+
     if TYPE_CHECKING:
 
         def _create_run_handle(
@@ -317,14 +327,19 @@ class SessionPoolMessagingMixin:
             # Drain events from the EventBus until we capture the
             # StreamCompleteEvent or RunErrorEvent.
             while True:
+                timeout_seconds = self._subagent_inactivity_timeout_seconds
                 try:
-                    envelope = await asyncio.wait_for(bus_queue.get(), timeout=120.0)
+                    envelope = await self._wait_for_subagent_event(bus_queue)
                 except TimeoutError:
                     logger.warning(
-                        "Agent execution timed out after 120 seconds in run_agent",
+                        "Agent stopped emitting events in run_agent",
                         session_id=session_id,
+                        timeout_seconds=timeout_seconds,
                     )
-                    msg = f"Agent execution timed out after 120 seconds for session {session_id}"
+                    msg = (
+                        "Agent emitted no events for "
+                        f"{timeout_seconds:g} seconds for session {session_id}"
+                    )
                     raise TimeoutError(msg) from None
                 event = envelope.event
                 if isinstance(event, StreamCompleteEvent):

@@ -9,7 +9,14 @@ from pydantic import BaseModel, Field
 from agentpool_server.opencode_server.models.base import OpenCodeBaseModel
 
 
-DEFAULT_IGNORE = ["node_modules/**", "__pycache__/**", ".venv/**", "*.pyc", ".mypy_cache/**"]
+DEFAULT_IGNORE = [
+    "node_modules/**",
+    "__pycache__/**",
+    ".venv/**",
+    "*.pyc",
+    ".mypy_cache/**",
+    "logs/**",
+]
 
 
 class Keybinds(BaseModel):

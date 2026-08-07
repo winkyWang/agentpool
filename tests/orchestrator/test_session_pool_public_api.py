@@ -6,6 +6,7 @@ Tests send_message, run_agent, revoke_message, wait_for_completion
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -43,6 +44,36 @@ def session_pool(mock_pool: AgentPool) -> SessionPool:
     """Return a SessionPool backed by the real pool."""
     assert mock_pool.session_pool is not None
     return mock_pool.session_pool
+
+
+@pytest.mark.anyio
+async def test_subagent_event_wait_uses_configured_timeout(
+    session_pool: SessionPool,
+) -> None:
+    """Delegated runs use the configured deadline instead of a fixed 120 seconds."""
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    original_timeout = session_pool._subagent_inactivity_timeout_seconds
+    session_pool._subagent_inactivity_timeout_seconds = 0.001
+    try:
+        with pytest.raises(TimeoutError):
+            await session_pool._wait_for_subagent_event(queue)
+    finally:
+        session_pool._subagent_inactivity_timeout_seconds = original_timeout
+
+
+@pytest.mark.anyio
+async def test_subagent_event_wait_can_disable_session_pool_deadline(
+    session_pool: SessionPool,
+) -> None:
+    """A deployment may rely on explicit cancellation instead of a fixed deadline."""
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    await queue.put("done")
+    original_timeout = session_pool._subagent_inactivity_timeout_seconds
+    session_pool._subagent_inactivity_timeout_seconds = None
+    try:
+        assert await session_pool._wait_for_subagent_event(queue) == "done"
+    finally:
+        session_pool._subagent_inactivity_timeout_seconds = original_timeout
 
 
 # ---------------------------------------------------------------------------

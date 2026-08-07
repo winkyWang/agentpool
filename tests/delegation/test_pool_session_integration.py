@@ -98,6 +98,7 @@ class TestSessionPoolConfiguration:
         assert cfg.max_auto_resume == 10
         assert cfg.max_queue_size == 1000
         assert cfg.mcp_max_processes == 100
+        assert cfg.subagent_inactivity_timeout_seconds == 120.0
 
     @pytest.mark.integration
     async def test_custom_session_pool_config(self) -> None:
@@ -109,6 +110,7 @@ class TestSessionPoolConfiguration:
             max_auto_resume=5,
             max_queue_size=500,
             mcp_max_processes=50,
+            subagent_inactivity_timeout_seconds=600.0,
         )
         manifest = AgentsManifest(
             agents={
@@ -129,6 +131,7 @@ class TestSessionPoolConfiguration:
             assert sp.sessions._session_ttl_seconds == 1800.0
             assert sp.sessions._mcp_max_processes == 50
             assert sp.event_bus._max_queue_size == 500
+            assert sp._subagent_inactivity_timeout_seconds == 600.0
 
     @pytest.mark.integration
     async def test_explicit_config_overrides_manifest(

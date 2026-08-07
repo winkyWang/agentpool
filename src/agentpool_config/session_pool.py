@@ -33,6 +33,13 @@ class SessionPoolConfig(Schema):
     mcp_max_processes: int = Field(default=100, ge=1, title="MCP max processes")
     """Maximum number of MCP processes for per-session agents."""
 
+    subagent_inactivity_timeout_seconds: float | None = Field(
+        default=120.0,
+        gt=0,
+        title="Subagent inactivity timeout seconds",
+    )
+    """Maximum silence between delegated Agent events; ``None`` disables this timeout."""
+
     checkpoint: CheckpointConfig | None = Field(
         default=None,
         title="Checkpoint configuration",
