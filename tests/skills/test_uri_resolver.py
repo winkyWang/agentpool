@@ -10,9 +10,11 @@ This module provides comprehensive tests for:
 
 from __future__ import annotations
 
+from pathlib import Path, PurePosixPath
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from upathtools import UPath
 
 from agentpool.capabilities.resource_protocols import SkillEntry, SkillResource
 from agentpool.skills.exceptions import SecurityError, SkillNotFoundError
@@ -391,6 +393,48 @@ async def test_resolver_resolve_by_flat_uri() -> None:
     result = await resolver.resolve("skill://my-skill")
 
     assert result.name == "my-skill"
+
+
+@pytest.mark.asyncio
+async def test_resolver_preserves_local_path_and_remote_virtual_identity(
+    tmp_path: Path,
+) -> None:
+    """Resolved entries retain the resource identity declared by their owner."""
+    resolver = SkillURIResolver()
+    local_path = UPath(tmp_path / "local-skill")
+    local_entry = SkillEntry(
+        name="local-skill",
+        description="local",
+        uri="skill://local-skill",
+        source="local",
+        skill_path=local_path,
+    )
+    remote_entry = SkillEntry(
+        name="remote-skill",
+        description="remote",
+        uri="skill://remote-skill",
+        source="remote",
+    )
+    resolver.register_provider(
+        "local",
+        _make_skill_resource(entries=[local_entry], content="local instructions"),
+    )
+    resolver.register_provider(
+        "remote",
+        _make_skill_resource(entries=[remote_entry], content="remote instructions"),
+    )
+
+    local = await resolver.resolve(
+        "skill://local-skill/references/guide.md",
+    )
+    remote = await resolver.resolve(
+        "skill://remote-skill/references/guide.md",
+    )
+
+    assert local.skill_path == local_path
+    assert isinstance(local.skill_path, UPath)
+    assert type(remote.skill_path) is PurePosixPath
+    assert remote.skill_path == PurePosixPath("skill://remote-skill")
 
 
 @pytest.mark.asyncio

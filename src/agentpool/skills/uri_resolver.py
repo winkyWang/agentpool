@@ -350,7 +350,11 @@ class SkillURIResolver:
         skill = Skill(
             name=entry.name,
             description=entry.description or f"Skill {entry.name}",
-            skill_path=PurePosixPath(entry.uri),
+            skill_path=(
+                entry.skill_path
+                if entry.skill_path is not None
+                else PurePosixPath(entry.uri)
+            ),
             instructions=content,
         )
         if ref_path is not None:

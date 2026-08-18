@@ -115,7 +115,8 @@ async def test_scoped_view_filters_metadata_resources_and_matcher_candidates() -
 
     ctx = SimpleNamespace(messages=[], deps=None)
     content = await instructions[1](ctx)  # type: ignore[arg-type]
-    assert content is not None and "alpha body" in content
+    assert content is not None
+    assert "alpha body" in content
     assert "beta body" not in content
     assert received_candidates == ["alpha"]
     assert [entry.name for entry in await view.list_skills()] == ["alpha"]
@@ -129,8 +130,13 @@ async def test_pool_node_visibility_applies_to_load_and_resource_registry(tmp_pa
     for name in ("shared", "review"):
         skill_dir = tmp_path / name
         skill_dir.mkdir()
+        (skill_dir / "references").mkdir()
         (skill_dir / "SKILL.md").write_text(
             f"---\nname: {name}\ndescription: {name} skill\n---\n\n{name} instructions",
+            encoding="utf-8",
+        )
+        (skill_dir / "references" / "guide.md").write_text(
+            f"{name} reference",
             encoding="utf-8",
         )
 
@@ -188,9 +194,22 @@ async def test_pool_node_visibility_applies_to_load_and_resource_registry(tmp_pa
         assert run_ctx.activated_skills == {"shared"}
         assert run_ctx.skill_trace_records[-1].source == "explicit"
 
+        reference = await load_skill(
+            reviewer_ctx,
+            "skill://shared/references/guide.md",
+        )
+        assert "shared reference" in reference
+        assert run_ctx.activated_skills == {"shared"}
+
         hidden = await load_skill(reviewer_ctx, "review")
         assert "not found" in hidden
         assert "review instructions" not in hidden
+        hidden_reference = await load_skill(
+            reviewer_ctx,
+            "skill://review/references/guide.md",
+        )
+        assert "not found" in hidden_reference
+        assert "review reference" not in hidden_reference
 
 
 @pytest.mark.integration
@@ -198,19 +217,16 @@ async def test_pool_node_visibility_applies_to_load_and_resource_registry(tmp_pa
 async def test_unknown_visibility_skill_fails_pool_initialization(tmp_path: Path) -> None:
     config_path = tmp_path / "agentpool.yaml"
     config_path.write_text(
-        "\n".join(
-            [
-                "skills:",
-                "  include_default: false",
-                "  paths: []",
-                "  node_visibility:",
-                "    root: [missing-skill]",
-                "agents:",
-                "  root:",
-                "    type: native",
-                "    model: test",
-            ]
-        ),
+        """skills:
+  include_default: false
+  paths: []
+  node_visibility:
+    root: [missing-skill]
+agents:
+  root:
+    type: native
+    model: test
+""",
         encoding="utf-8",
     )
 
