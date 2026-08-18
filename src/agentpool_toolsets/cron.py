@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Self
 
 from agentpool.capabilities.function_toolset import FunctionToolsetCapability
 from agentpool.log import get_logger
+from agentpool.tools.base import ToolResult
 from agentpool.utils.time_utils import datetime_to_ms
 
 
@@ -76,7 +77,7 @@ class CronTools(FunctionToolsetCapability):
         cron_expr: str | None = None,
         tz: str | None = None,
         at: str | None = None,
-    ) -> str:
+    ) -> str | ToolResult:
         """Schedule a new cron job.
 
         Exactly one of ``every_seconds``, ``cron_expr``, or ``at`` must be
@@ -96,14 +97,14 @@ class CronTools(FunctionToolsetCapability):
         from agentpool_bot.cron.cron_types import CronSchedule
 
         if tz and not cron_expr:
-            return "Error: tz can only be used with cron_expr"
+            return ToolResult(content="tz can only be used with cron_expr", is_error=True)
         if tz:
             from zoneinfo import ZoneInfo
 
             try:
                 ZoneInfo(tz)
             except (KeyError, ValueError):
-                return f"Error: unknown timezone {tz!r}"
+                return ToolResult(content=f"Unknown timezone {tz!r}", is_error=True)
 
         schedule: CronSchedule
         delete_after = False
@@ -116,11 +117,14 @@ class CronTools(FunctionToolsetCapability):
             try:
                 dt = datetime.fromisoformat(at)
             except ValueError:
-                return f"Error: invalid ISO datetime {at!r}"
+                return ToolResult(content=f"Invalid ISO datetime {at!r}", is_error=True)
             schedule = CronSchedule(kind="at", at_ms=datetime_to_ms(dt))
             delete_after = True
         else:
-            return "Error: provide one of every_seconds, cron_expr, or at"
+            return ToolResult(
+                content="Provide one of every_seconds, cron_expr, or at",
+                is_error=True,
+            )
 
         job = self.service.add_job(
             name=name or message[:30],

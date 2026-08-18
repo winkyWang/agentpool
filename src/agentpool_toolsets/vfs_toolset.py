@@ -6,6 +6,7 @@ from fnmatch import fnmatch
 
 from agentpool.agents.context import AgentContext  # noqa: TC001
 from agentpool.capabilities.function_toolset import FunctionToolsetCapability
+from agentpool.tools.base import ToolResult
 
 
 async def vfs_list(  # noqa: D417
@@ -17,7 +18,7 @@ async def vfs_list(  # noqa: D417
     include_dirs: bool = False,
     exclude: list[str] | None = None,
     max_depth: int | None = None,
-) -> str:
+) -> str | ToolResult:
     """List contents of a filesystem path.
 
     Lists files from the agent's unified filesystem, which includes:
@@ -74,9 +75,9 @@ async def vfs_list(  # noqa: D417
         lines.extend(sorted(results))
         return "\n".join(lines)
     except FileNotFoundError:
-        return f"Path not found: {path}"
+        return ToolResult(content=f"Path not found: {path}", is_error=True)
     except (OSError, ValueError) as e:
-        return f"Error listing {path}: {e}"
+        return ToolResult(content=f"Error listing {path}: {e}", is_error=True)
 
 
 async def vfs_read(  # noqa: D417
@@ -87,7 +88,7 @@ async def vfs_read(  # noqa: D417
     recursive: bool = True,
     exclude: list[str] | None = None,
     max_depth: int | None = None,
-) -> str:
+) -> str | ToolResult:
     """Read content from a filesystem path.
 
     Reads from the agent's unified filesystem, which includes:
@@ -146,9 +147,9 @@ async def vfs_read(  # noqa: D417
         content_bytes = await fs._cat_file(norm_path)
         return content_bytes.decode(encoding)
     except FileNotFoundError:
-        return f"Path not found: {path}"
+        return ToolResult(content=f"Path not found: {path}", is_error=True)
     except (OSError, ValueError) as e:
-        return f"Error reading {path}: {e}"
+        return ToolResult(content=f"Error reading {path}: {e}", is_error=True)
 
 
 async def vfs_info(ctx: AgentContext) -> str:

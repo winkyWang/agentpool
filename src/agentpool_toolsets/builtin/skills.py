@@ -353,6 +353,22 @@ async def _load_skill(  # noqa: PLR0911, PLR0915
     # Apply argument substitution
     instructions = _substitute_arguments(instructions, arguments)
 
+    effective_ref_path = skill.resolved_reference_path or (
+        resolved.reference_path if is_uri else None
+    )
+    is_reference_load = is_uri and effective_ref_path is not None
+    if not is_reference_load:
+        from agentpool.skills.activation import activate_skills
+
+        visible_names = ctx.pool.visible_skill_names_for_node(requested_node_name)
+        await activate_skills(
+            ctx,
+            requested_skills={skill.name},
+            visible_skills=visible_names,
+            max_skills=ctx.pool.manifest.skills.instruction.max_skills,
+            source="explicit",
+        )
+
     # Activate MCP servers and tools declared in the skill
     mcp_lines: list[str] = []
     tool_lines: list[str] = []
@@ -373,11 +389,6 @@ async def _load_skill(  # noqa: PLR0911, PLR0915
     # Determine if this is a reference-only load
     # Priority: _resolved_reference_path first (resolver's fallback correction
     # for provider-less URIs), then parsed path.
-    effective_ref_path = skill.resolved_reference_path or (
-        resolved.reference_path if is_uri else None
-    )
-    is_reference_load = is_uri and effective_ref_path is not None
-
     # Build the response
     if is_reference_load:
         # Reference-only: minimal header indicating source skill and reference file
@@ -564,20 +575,13 @@ class SkillsTools(FunctionToolsetCapability):
     available commands.
     """
 
-    def __init__(
-        self,
-        name: str = "skills",
-        *,
-        max_skills: int | None = None,
-    ) -> None:
+    def __init__(self, name: str = "skills") -> None:
         """Initialize the SkillsTools provider.
 
         Args:
             name: Provider name for resource identification
-            max_skills: Maximum number of skills to inject. Defaults to None (no limit)
         """
         super().__init__(name=name)
-        self.max_skills = max_skills
         self._tools = [
             self.create_tool(load_skill, category="read", read_only=True, idempotent=True),
             self.create_tool(list_skills, category="read", read_only=True, idempotent=True),

@@ -325,27 +325,11 @@ class SkillsToolsetConfig(BaseToolsetConfig):
     )
     """Optional tool filter to enable/disable specific tools."""
 
-    max_skills: int | None = Field(
-        default=None,
-        ge=1,
-        le=100,
-        title="Maximum skills",
-        examples=[10, 20, 50],
-    )
-    """Maximum number of skills to inject.
-
-    If set, overrides the global SkillsInstructionConfig.max_skills for this toolset.
-    Limits the number of skills included in prompts to prevent excessive token usage.
-    """
-
     def get_provider(self) -> AbstractCapability:
         """Create skills tools provider."""
         from agentpool_toolsets.builtin import SkillsTools
 
-        provider = SkillsTools(
-            name="skills",
-            max_skills=self.max_skills,
-        )
+        provider = SkillsTools(name="skills")
         if self.tools is not None:
             from agentpool.capabilities.filtered_toolset import FilteredToolsetCapability
 

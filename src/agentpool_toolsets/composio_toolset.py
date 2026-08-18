@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from agentpool.capabilities.function_toolset import FunctionToolsetCapability
 from agentpool.log import get_logger
+from agentpool.tools.base import ToolResult
 
 
 if TYPE_CHECKING:
@@ -45,7 +46,10 @@ class ComposioTools(FunctionToolsetCapability):
                 )
             except Exception:
                 logger.exception("Error executing tool", name=tool_slug)
-                return {"error": f"Failed to execute tool {tool_slug}"}
+                return ToolResult(
+                    content=f"Failed to execute tool {tool_slug}",
+                    is_error=True,
+                )
 
         handle_tool_call.__name__ = tool_slug
         return handle_tool_call

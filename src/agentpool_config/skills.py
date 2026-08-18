@@ -23,18 +23,7 @@ DEFAULT_SKILLS_PATHS = [
 
 
 class SkillsInstructionConfig(Schema):
-    """Configuration for dynamic skills injection via AbstractCapability.
-
-    Controls how skills are dynamically injected into agent prompts as
-    instructions. This enables agents to discover and use skills without
-    explicit tool calls, making skill usage more natural and context-aware.
-
-    Modes:
-    - "off": No dynamic skill injection (default, backward compatible)
-    - "metadata": Inject only skill metadata (name, description, triggers)
-    - "full": Inject complete skill content including prompts and examples
-      for maximum capability at the cost of more tokens
-    """
+    """Configuration for metadata exposure and per-run Skill activation."""
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -50,11 +39,10 @@ class SkillsInstructionConfig(Schema):
         title="Maximum skills",
         examples=[10, 20, 50],
     )
-    """Maximum number of skills to inject.
+    """Maximum distinct Skill bodies activated during one run.
 
-    Limits the number of skills included in prompts to prevent
-    excessive token usage. Skills are ranked by relevance when
-    this limit is exceeded.
+    The limit is shared by matcher, always-active, and explicit loading.
+    Requests that exceed it fail explicitly and are never truncated.
     """
 
 
@@ -112,6 +100,14 @@ class SkillsConfig(Schema):
 
     instruction: SkillsInstructionConfig = Field(default_factory=SkillsInstructionConfig)
     """Configuration for dynamic skills injection via AbstractCapability."""
+
+    node_visibility: dict[str, list[str]] = Field(default_factory=dict)
+    """Explicit node-to-Skill visibility allow-lists.
+
+    When this mapping is non-empty, each listed node can discover and activate
+    only the named Skills. Nodes omitted from the mapping see no Skills. The
+    same Skill name may appear in multiple node lists.
+    """
 
     def get_effective_paths(self, config_file_path: UPath | None = None) -> list[UPath]:
         """Get the effective list of paths for skill discovery.

@@ -12,7 +12,7 @@ import anyio
 
 from agentpool.agents.context import AgentContext  # noqa: TC001
 from agentpool.log import get_logger
-from agentpool.tools.base import Tool
+from agentpool.tools.base import Tool, ToolResult
 
 
 if TYPE_CHECKING:
@@ -26,7 +26,7 @@ logger = get_logger(__name__)
 
 
 @dataclass
-class DownloadFileTool(Tool[dict[str, Any]]):
+class DownloadFileTool(Tool[dict[str, Any] | ToolResult]):
     """Download files from URLs to the filesystem.
 
     A standalone tool for downloading files with:
@@ -52,7 +52,7 @@ class DownloadFileTool(Tool[dict[str, Any]]):
     timeout: float = 30.0
     """Request timeout in seconds."""
 
-    def get_callable(self) -> Callable[..., Awaitable[dict[str, Any]]]:
+    def get_callable(self) -> Callable[..., Awaitable[dict[str, Any] | ToolResult]]:
         """Return the download_file method as the callable."""
         return self._download_file
 
@@ -84,7 +84,7 @@ class DownloadFileTool(Tool[dict[str, Any]]):
         url: str,
         target_dir: str = "downloads",
         chunk_size: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | ToolResult:
         """Download a file from URL to the filesystem.
 
         Args:
@@ -161,16 +161,16 @@ class DownloadFileTool(Tool[dict[str, Any]]):
         except httpx.ConnectError as e:
             error_msg = f"Connection error downloading {url}: {e}"
             await ctx.events.file_operation("read", path=url, success=False, error=error_msg)
-            return {"error": error_msg}
+            return ToolResult(content=error_msg, is_error=True)
         except httpx.TimeoutException:
             error_msg = f"Timeout downloading {url}"
             await ctx.events.file_operation("read", path=url, success=False, error=error_msg)
-            return {"error": error_msg}
+            return ToolResult(content=error_msg, is_error=True)
         except httpx.HTTPStatusError as e:
             error_msg = f"HTTP error {e.response.status_code} downloading {url}"
             await ctx.events.file_operation("read", path=url, success=False, error=error_msg)
-            return {"error": error_msg}
+            return ToolResult(content=error_msg, is_error=True)
         except Exception as e:  # noqa: BLE001
             error_msg = f"Error downloading {url}: {e!s}"
             await ctx.events.file_operation("read", path=url, success=False, error=error_msg)
-            return {"error": error_msg}
+            return ToolResult(content=error_msg, is_error=True)

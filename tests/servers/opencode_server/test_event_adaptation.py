@@ -393,9 +393,10 @@ class TestToolCallCompleteEventConversion:
             tool_name="bash",
             tool_call_id="call-004",
             tool_input={"command": "false"},
-            tool_result={"error": "Command failed with exit code 1"},
+            tool_result="Command failed with exit code 1",
             agent_name="test-agent",
             message_id="msg-001",
+            is_error=True,
         )
         events = await _collect_events(adapter.convert_event(complete_event))
 
@@ -405,6 +406,42 @@ class TestToolCallCompleteEventConversion:
         assert isinstance(tool_part, ToolPart)
         assert isinstance(tool_part.state, ToolStateError)
         assert tool_part.state.error == "Command failed with exit code 1"
+
+    @pytest.mark.asyncio
+    async def test_error_shaped_business_result_remains_success(
+        self,
+        adapter_context: EventProcessorContext,
+    ) -> None:
+        """JSON field names cannot redefine the execution failure contract."""
+        adapter = OpenCodeEventAdapter(context=adapter_context)
+        await _collect_events(
+            adapter.convert_event(
+                ToolCallStartEvent(
+                    tool_call_id="call-business-negative",
+                    tool_name="lookup",
+                    title="Lookup",
+                    raw_input={"id": "missing"},
+                )
+            )
+        )
+
+        events = await _collect_events(
+            adapter.convert_event(
+                ToolCallCompleteEvent(
+                    tool_name="lookup",
+                    tool_call_id="call-business-negative",
+                    tool_input={"id": "missing"},
+                    tool_result={"error": "record not found"},
+                    agent_name="test-agent",
+                    message_id="msg-001",
+                )
+            )
+        )
+
+        tool_part = next(
+            event.properties.part for event in events if isinstance(event, PartUpdatedEvent)
+        )
+        assert isinstance(tool_part.state, ToolStateCompleted)
 
 
 # =============================================================================
@@ -1095,9 +1132,10 @@ class TestToolCallCompleteEventConversionV2:
             tool_name="bash",
             tool_call_id="call-004",
             tool_input={"command": "false"},
-            tool_result={"error": "Command failed with exit code 1"},
+            tool_result="Command failed with exit code 1",
             agent_name="test-agent",
             message_id="msg-001",
+            is_error=True,
         )
         events = await _collect_events_v2(adapter.convert_event(complete_event))
 

@@ -35,7 +35,7 @@ from agentpool.tool_impls.download_file import create_download_file_tool
 from agentpool.tool_impls.grep import create_grep_tool
 from agentpool.tool_impls.list_directory import create_list_directory_tool
 from agentpool.tool_impls.read import create_read_tool
-from agentpool.tools.base import ToolResult  # noqa: TC001
+from agentpool.tools.base import ToolResult
 from agentpool.utils.diffs import get_changed_line_numbers
 from agentpool_toolsets.fsspec_toolset.diagnostics import (
     DiagnosticsConfig,
@@ -528,7 +528,6 @@ class FSSpecTools(FunctionToolsetCapability):
             Success message or ToolResult with metadata
         """
         from agentpool.agents.events import DiffContentItem
-        from agentpool.tools.base import ToolResult
 
         path = self._resolve_path(path, agent_ctx)
         msg = f"Writing file: {path}"
@@ -538,7 +537,7 @@ class FSSpecTools(FunctionToolsetCapability):
             if mode not in ("w", "a"):
                 msg = f"Invalid mode '{mode}'. Use 'w' (write) or 'a' (append)"
                 await agent_ctx.events.file_operation("write", path=path, success=False, error=msg)
-                return f"Error: {msg}"
+                return ToolResult(content=f"Error: {msg}", is_error=True)
 
             # Check size limit
             if content_bytes > self.max_file_size:
@@ -547,7 +546,7 @@ class FSSpecTools(FunctionToolsetCapability):
                     f"({self.max_file_size} bytes)"
                 )
                 await agent_ctx.events.file_operation("write", path=path, success=False, error=msg)
-                return f"Error: {msg}"
+                return ToolResult(content=f"Error: {msg}", is_error=True)
 
             # Check if file exists and overwrite protection
             fs = self._get_fs(agent_ctx)
@@ -559,7 +558,7 @@ class FSSpecTools(FunctionToolsetCapability):
                     f"This is a safety measure to prevent accidental data loss."
                 )
                 await agent_ctx.events.file_operation("write", path=path, success=False, error=msg)
-                return f"Error: {msg}"
+                return ToolResult(content=f"Error: {msg}", is_error=True)
 
             # Handle append mode: read existing content and prepend it
             if mode == "a" and file_exists:
@@ -586,7 +585,7 @@ class FSSpecTools(FunctionToolsetCapability):
             return ToolResult(content=success_msg, metadata=meta)  # Agent sees content
         except Exception as e:  # noqa: BLE001
             await agent_ctx.events.file_operation("write", path=path, success=False, error=str(e))
-            return f"Error: Failed to write file {path}: {e}"
+            return ToolResult(content=f"Error: Failed to write file {path}: {e}", is_error=True)
 
     async def delete_path(  # noqa: D417
         self, agent_ctx: AgentContext, path: str, recursive: bool = False
@@ -728,18 +727,19 @@ class FSSpecTools(FunctionToolsetCapability):
                 ("old_name()", "new_name()"),  # Update call sites
             ]
         """
-        from agentpool.tools.base import ToolResult
-
         path = self._resolve_path(path, agent_ctx)
         msg = f"Editing file: {path} ({description})"
         await agent_ctx.events.tool_call_start(title=msg, kind="edit", locations=[path])
 
         if not replacements:
-            return "Error: replacements list cannot be empty"
+            return ToolResult(content="Error: replacements list cannot be empty", is_error=True)
 
         for old_str, new_str in replacements:
             if old_str == new_str:
-                return f"Error: old_string and new_string must be different: {old_str!r}"
+                return ToolResult(
+                    content=f"Error: old_string and new_string must be different: {old_str!r}",
+                    is_error=True,
+                )
 
         try:  # Read current file content
             original_content = await self._read(agent_ctx, path)
@@ -758,7 +758,7 @@ class FSSpecTools(FunctionToolsetCapability):
                     await agent_ctx.events.file_operation(
                         "edit", path=path, success=False, error=error_msg
                     )
-                    return error_msg
+                    return ToolResult(content=error_msg, is_error=True)
 
             await self._write(agent_ctx, path, new_content)
             success_msg = f"Successfully edited {Path(path).name}: {description}"
@@ -779,7 +779,7 @@ class FSSpecTools(FunctionToolsetCapability):
         except Exception as e:  # noqa: BLE001
             error_msg = f"Error editing file: {e}"
             await agent_ctx.events.file_operation("edit", path=path, success=False, error=error_msg)
-            return error_msg
+            return ToolResult(content=error_msg, is_error=True)
         else:
             # Ensure content ends with newline for proper diff formatting
             meta = to_opencode_edit_metadata(original_content, new_content, path)
@@ -795,7 +795,7 @@ class FSSpecTools(FunctionToolsetCapability):
         replacement: str,
         *,
         count: int = 0,
-    ) -> str:
+    ) -> str | ToolResult:
         r"""Apply regex replacement to a line range specified by line numbers or text markers.
 
         Useful for systematic edits:
@@ -898,7 +898,7 @@ class FSSpecTools(FunctionToolsetCapability):
         except Exception as e:  # noqa: BLE001
             error_msg = f"Error applying regex to file: {e}"
             await agent_ctx.events.file_operation("edit", path=path, success=False, error=error_msg)
-            return error_msg
+            return ToolResult(content=error_msg, is_error=True)
         else:
             return success_msg
 
@@ -1165,7 +1165,7 @@ class FSSpecTools(FunctionToolsetCapability):
         display_description: str,
         mode: Literal["edit", "create", "overwrite"] = "edit",
         matcher: Literal["zed", "default"] = "default",
-    ) -> str:
+    ) -> str | ToolResult:
         r"""Edit or create a file with streaming support.
 
         Use this tool for file modifications. Describe what changes you want
@@ -1282,7 +1282,7 @@ class FSSpecTools(FunctionToolsetCapability):
         except Exception as e:  # noqa: BLE001
             error_msg = f"Error during agentic edit: {e}"
             await agent_ctx.events.file_operation("edit", path=path, success=False, error=error_msg)
-            return error_msg
+            return ToolResult(content=error_msg, is_error=True)
         else:
             return success_msg
 

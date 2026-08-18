@@ -1,157 +1,85 @@
 ---
 title: Skills Configuration
-description: Configure automatic skills injection into agent prompts
+description: Configure Skill discovery, node visibility, and activation
 order: 10
 icon: material/lightning-bolt
 ---
 
-Skills provide specialized instructions and techniques that agents can follow. AgentPool supports automatic injection of skills into agent system prompts using structured XML formatting.
+Skills provide specialized instructions and supporting resources. AgentPool exposes
+visible Skill metadata by default and loads a Skill body only when the Skill is
+explicitly requested, selected by a configured matcher, or marked always-active.
 
-## Overview
-
-Skills injection allows you to:
-
-- Automatically include relevant skill instructions in agent prompts
-- Configure global defaults for all agents
-- Override per-agent using skills tool configuration
-- Limit the number of skills included to manage token count
-
-## Configuration Structure
-
-### Global Skills Configuration
+## Configuration
 
 ```yaml
 skills:
-  # Skill discovery paths
   paths:
     - ~/.config/agentpool/skills
     - ./skills
-  
-  # Include default AgentPool skills (default: true)
   include_default: true
-  
-  # Instruction injection configuration
   instruction:
-    # Injection mode: off, metadata, or full
-    mode: metadata
-    # Maximum number of skills to inject (default: 20)
+    # One per-run budget shared by automatic and explicit activation.
     max_skills: 20
+  node_visibility:
+    planner:
+      - planning
+      - code-review
+    implementer:
+      - coding
+      - code-review
 ```
 
-### Injection Modes
+`instruction.max_skills` is the single activation limit. It counts distinct Skill
+bodies across matcher, always-active, and `load_skill` activation during one run.
+AgentPool raises a structured activation error when a request would exceed the
+limit; it never silently truncates the requested Skills.
 
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| `off` | No skill injection (default) | Disable automatic injection |
-| `metadata` | Skill names and descriptions only | Quick reference without full content |
-| `full` | Complete skill instructions | When skills contain critical instructions |
+When `node_visibility` is present, each key is an exact node allow-list. A Skill may
+be visible to multiple nodes. Nodes omitted from the mapping see no Skills. The same
+visibility rule applies to prompt metadata, Skill listing, URI/bare-name loading,
+matcher candidates, and native capability injection.
 
-## Agent-Specific Overrides
+When `node_visibility` is omitted, AgentPool derives visibility from Skill package
+scope where available; otherwise all discovered Skills are visible.
 
-Override global settings for specific agents using the skills toolset:
+## Runtime contract
 
-```yaml
-agents:
-  expert_coder:
-    model: openai:gpt-4o
-    system_prompt: "You are an expert developer"
-    tools:
-      - type: skills
-        # Override global injection mode for this agent
-        injection_mode: full
-        max_skills: 10
-```
-
-## XML Output Format
-
-When skills injection is enabled, agents receive structured XML in their system prompt:
+Visible agents receive metadata rather than complete bodies:
 
 ```xml
 <available-skills>
-  <skill id="python-style-guide" name="Python Style Guide" description="PEP 8 coding conventions">
-    <instructions>
-      ## Python Style Guide
-      
-      Follow PEP 8 conventions:
-      - Use 4 spaces for indentation
-      - Maximum line length of 88 characters
-      - Use snake_case for functions and variables
-      - Use PascalCase for classes
-    </instructions>
-    <base_directory>/home/user/.config/agentpool/skills/python-style-guide/</base_directory>
-  </skill>
-  <skill id="refactoring" name="Code Refactoring" description="Safe refactoring techniques">
-    <instructions>
-      ## Code Refactoring
-      
-      Always follow these steps:
-      1. Understand the existing code
-      2. Run tests before changes
-      3. Make small, focused changes
-      4. Run tests after each change
-      5. Commit incrementally
-    </instructions>
-    <base_directory>/home/user/.config/agentpool/skills/refactoring/</base_directory>
-  </skill>
+  <skill name="code-review" description="Review code changes" />
 </available-skills>
 ```
 
-## Complete Example
+The body is activated through one of these routes:
+
+- `load_skill("code-review")` or a `skill://` URI;
+- a configured semantic matcher selecting the Skill;
+- an explicit always-active declaration.
+
+Reference files loaded through a Skill URI are progressive-disclosure resources and
+do not activate another Skill body. Each exposure or activation is recorded as a
+structured per-run trace with node, run, session, visible Skills, activated Skills,
+and activation source.
+
+## Agent tools
+
+The Skill toolset controls which Skill tools are callable; it does not define a
+second activation budget.
 
 ```yaml
-# Global skills configuration
-skills:
-  paths:
-    - ~/.config/agentpool/skills
-    - ./project-skills
-  include_default: true
-  
-  # Default: metadata-only injection for all agents
-  instruction:
-    mode: metadata
-    max_skills: 20
-
 agents:
-  # Appends /skills to tool names (default: false)
-  append_tools_namespace: true
-
-  # Standard agent - uses global metadata injection
   assistant:
     model: openai:gpt-4o-mini
-    system_prompt: "You are a helpful assistant"
     tools:
       - type: skills
-  
-  # Expert agent - uses full skill content
-  expert:
-    model: openai:gpt-4o
-    system_prompt: "You are an expert developer"
-    tools:
-      - type: skills
-        injection_mode: full
-        max_skills: 10
-  
-  # Minimal agent - no skills injection
-  minimal:
-    model: openai:gpt-4o-mini
-    system_prompt: "Keep responses brief"
-    tools: []  # No skills tool
+        tools:
+          load_skill: true
+          get_skill_reference: true
 ```
 
-## Backward Compatibility
+## See also
 
-By default, skills injection is **disabled** (`mode: off`). This ensures:
-
-- Existing configurations continue to work unchanged
-- Agents without explicit configuration see no skill injection
-- Opt-in required to enable automatic injection
-
-## Related Configuration
-
-- [Toolsets](./node-types/index.md) - Configure agent tools including skills tool
-- [Agent Pool](../../reference/core-concepts/agent-pool.md) - Global pool configuration
-
-## See Also
-
-- [RFC-0008: Dynamic Skills Injection](../../rfcs/implemented/RFC-0008-dynamic-skills-injection.md) - Implementation details
-- [Skills Toolset](../../reference/core-concepts/toolsets.md) - Skills toolset reference
+- [Skill URI usage](./skill-uri-usage.md)
+- [RFC-0008: Dynamic Skills Injection](../../rfcs/implemented/RFC-0008-dynamic-skills-injection.md)

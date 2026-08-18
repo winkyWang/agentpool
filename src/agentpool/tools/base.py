@@ -89,6 +89,7 @@ class ToolResult:
         content: What the LLM sees - can be string or list of content blocks
         structured_content: Machine-readable JSON data (optional)
         metadata: UI/application data that is NOT sent to the LLM
+        is_error: Whether execution failed at the tool boundary
     """
 
     content: str | list[UserContent]
@@ -99,6 +100,9 @@ class ToolResult:
 
     metadata: dict[str, Any] | None = None
     """Metadata for UI/app use - NOT sent to LLM (diffs, diagnostics, etc.)."""
+
+    is_error: bool = False
+    """True only for execution failures, not ordinary negative business results."""
 
 
 @dataclass

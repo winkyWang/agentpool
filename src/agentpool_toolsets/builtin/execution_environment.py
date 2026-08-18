@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from agentpool import log
 from agentpool.agents.context import AgentContext  # noqa: TC001
 from agentpool.capabilities.function_toolset import FunctionToolsetCapability
+from agentpool.tools.base import ToolResult
 
 
 if TYPE_CHECKING:
@@ -22,12 +23,9 @@ logger = log.get_logger(__name__)
 
 
 def filter_lines_regex(pattern_str: str, text: str) -> str:
-    try:
-        pattern = re.compile(pattern_str)
-        filtered_lines = [line for line in text.splitlines(keepends=True) if pattern.search(line)]
-        return "".join(filtered_lines)
-    except re.error as regex_err:
-        return f"Invalid filter regex: {regex_err}"
+    pattern = re.compile(pattern_str)
+    filtered_lines = [line for line in text.splitlines(keepends=True) if pattern.search(line)]
+    return "".join(filtered_lines)
 
 
 class ProcessManagementTools(FunctionToolsetCapability):
@@ -83,7 +81,7 @@ class ProcessManagementTools(FunctionToolsetCapability):
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         output_limit: int | None = None,
-    ) -> str:
+    ) -> str | ToolResult:
         """Start a command in the background and return process ID.
 
         This is the preferred tool  for long-running processes that should run in the background
@@ -109,7 +107,7 @@ class ProcessManagementTools(FunctionToolsetCapability):
 
         except Exception as e:  # noqa: BLE001
             await agent_ctx.events.process_started("", command, success=False, error=str(e))
-            return f"Failed to start process: {e}"
+            return ToolResult(content=f"Failed to start process: {e}", is_error=True)
         else:
             full_cmd = f"{command} {' '.join(args)}" if args else command
             return f"Started background process {process_id}\nCommand: {full_cmd}"
@@ -119,7 +117,7 @@ class ProcessManagementTools(FunctionToolsetCapability):
         agent_ctx: AgentContext,
         process_id: str,
         filter_lines: str | None = None,
-    ) -> str:
+    ) -> str | ToolResult:
         """Get current output from a background process.
 
         Args:
@@ -149,16 +147,16 @@ class ProcessManagementTools(FunctionToolsetCapability):
                 else " | ".join(suffix_parts)
             )
         except ValueError as e:
-            return f"Error: {e}"
+            return ToolResult(content=f"Error: {e}", is_error=True)
         except Exception as e:  # noqa: BLE001
-            return f"Error getting process output: {e}"
+            return ToolResult(content=f"Error getting process output: {e}", is_error=True)
 
     async def wait_for_process(  # noqa: D417
         self,
         agent_ctx: AgentContext,
         process_id: str,
         filter_lines: str | None = None,
-    ) -> str:
+    ) -> str | ToolResult:
         """Wait for background process to complete and return final output.
 
         Args:
@@ -172,9 +170,9 @@ class ProcessManagementTools(FunctionToolsetCapability):
             output = await manager.get_output(process_id)
             await agent_ctx.events.process_exit(process_id, exit_code, final_output=output.combined)
         except ValueError as e:
-            return f"Error: {e}"
+            return ToolResult(content=f"Error: {e}", is_error=True)
         except Exception as e:  # noqa: BLE001
-            return f"Error waiting for process: {e}"
+            return ToolResult(content=f"Error waiting for process: {e}", is_error=True)
         else:
             combined = output.combined or ""
             if filter_lines and combined:  # Apply regex filter if specified
@@ -190,7 +188,7 @@ class ProcessManagementTools(FunctionToolsetCapability):
                 return f"{combined}\n\n{' | '.join(suffix_parts)}"
             return combined
 
-    async def kill_process(self, agent_ctx: AgentContext, process_id: str) -> str:  # noqa: D417
+    async def kill_process(self, agent_ctx: AgentContext, process_id: str) -> str | ToolResult:  # noqa: D417
         """Terminate a background process.
 
         Args:
@@ -201,14 +199,14 @@ class ProcessManagementTools(FunctionToolsetCapability):
             await agent_ctx.events.process_killed(process_id=process_id, success=True)
         except ValueError as e:
             await agent_ctx.events.process_killed(process_id, success=False, error=str(e))
-            return f"Error: {e}"
+            return ToolResult(content=f"Error: {e}", is_error=True)
         except Exception as e:  # noqa: BLE001
             await agent_ctx.events.process_killed(process_id, success=False, error=str(e))
-            return f"Error killing process: {e}"
+            return ToolResult(content=f"Error killing process: {e}", is_error=True)
         else:
             return f"Process {process_id} has been terminated"
 
-    async def release_process(self, agent_ctx: AgentContext, process_id: str) -> str:  # noqa: D417
+    async def release_process(self, agent_ctx: AgentContext, process_id: str) -> str | ToolResult:  # noqa: D417
         """Release resources for a background process.
 
         Args:
@@ -219,14 +217,14 @@ class ProcessManagementTools(FunctionToolsetCapability):
             await agent_ctx.events.process_released(process_id=process_id, success=True)
         except ValueError as e:
             await agent_ctx.events.process_released(process_id, success=False, error=str(e))
-            return f"Error: {e}"
+            return ToolResult(content=f"Error: {e}", is_error=True)
         except Exception as e:  # noqa: BLE001
             await agent_ctx.events.process_released(process_id, success=False, error=str(e))
-            return f"Error releasing process: {e}"
+            return ToolResult(content=f"Error releasing process: {e}", is_error=True)
         else:
             return f"Process {process_id} resources have been released"
 
-    async def list_processes(self, agent_ctx: AgentContext) -> str:
+    async def list_processes(self, agent_ctx: AgentContext) -> str | ToolResult:
         """List all active background processes."""
         env = self.get_env(agent_ctx)
         try:
@@ -252,4 +250,4 @@ class ProcessManagementTools(FunctionToolsetCapability):
 
             return "\n".join(lines)
         except Exception as e:  # noqa: BLE001
-            return f"Error listing processes: {e}"
+            return ToolResult(content=f"Error listing processes: {e}", is_error=True)

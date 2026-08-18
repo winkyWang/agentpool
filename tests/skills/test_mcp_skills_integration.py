@@ -30,6 +30,12 @@ def mock_agent_context():
     """Create a mock agent context with pool that has MCP-based skills."""
     ctx = MagicMock()
     ctx.pool = MagicMock()
+    ctx.run_ctx = None
+    ctx.pool.manifest.skills.instruction.max_skills = 20
+    ctx.pool.visible_skill_names_for_node.return_value = {
+        "systematic-troubleshooting",
+        "equipment-operation-assistant",
+    }
 
     # Mock local skills (empty - simulating no local skills)
     ctx.pool.skills.list_skills.return_value = []

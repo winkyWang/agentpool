@@ -645,6 +645,8 @@ class ToolCallCompleteEvent:
     """The message ID associated with this tool call."""
     metadata: dict[str, Any] | None = None
     """Optional metadata for UI/client use (diffs, diagnostics, etc.)."""
+    is_error: bool = False
+    """Whether the tool execution failed at the tool boundary."""
     session_id: str = ""
     """ID of the session that emitted this event."""
     event_kind: Literal["tool_call_complete"] = "tool_call_complete"

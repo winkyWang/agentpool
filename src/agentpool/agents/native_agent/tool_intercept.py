@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic_ai import ModelRetry
 from pydantic_ai.capabilities.abstract import AbstractCapability
-from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ToolRetryError
+from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ToolFailed, ToolRetryError
 
 from agentpool.log import get_logger
 
@@ -113,12 +113,10 @@ class ToolInterceptCapability(AbstractCapability[Any]):
     ) -> Any:
         """Wrap tool execution with error handling.
 
-        Catches exceptions and returns annotated ``ToolReturn`` with failure
-        details, enabling the model to recover or try alternatives.
+        Converts declared failures and ordinary exceptions into pydantic-ai's
+        first-class ``ToolFailed`` signal.
         """
         from time import perf_counter
-
-        from pydantic_ai.messages import ToolReturn
 
         from agentpool.tools.base import ToolResult
 
@@ -138,6 +136,7 @@ class ToolInterceptCapability(AbstractCapability[Any]):
             # _run_execute_hooks and the framework's retry/defer/approval logic.
             CallDeferred,
             ApprovalRequired,
+            ToolFailed,
             ToolRetryError,
             ModelRetry,
             # AgentPool control-flow exceptions — must propagate to
@@ -146,20 +145,21 @@ class ToolInterceptCapability(AbstractCapability[Any]):
             ToolSkippedError,
         ):
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "Tool execution failed",
                 tool_name=call.tool_name,
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
-            return ToolReturn(
-                return_value=f"Error: {exc}",
-                content=f"Tool '{call.tool_name}' failed: {exc}",
-            )
+            raise ToolFailed(f"Tool '{call.tool_name}' failed: {exc}") from exc
 
         # Convert AgentPool ToolResult to pydantic-ai ToolReturn
         if isinstance(result, ToolResult):
+            if result.is_error:
+                raise ToolFailed(str(result.content))
+            from pydantic_ai.messages import ToolReturn
+
             val = result.structured_content or result.content
             result = ToolReturn(
                 return_value=val,

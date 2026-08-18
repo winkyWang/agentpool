@@ -27,6 +27,7 @@ from agentpool.mcp_server.registries.official_registry_client import (
     MCPRegistryClient,
     MCPRegistryError,
 )
+from agentpool.tools.base import ToolResult
 
 
 if TYPE_CHECKING:
@@ -245,7 +246,7 @@ class MCPDiscoveryToolset(FunctionToolsetCapability):
         agent_ctx: AgentContext,
         query: str,
         max_results: int = 10,
-    ) -> str:
+    ) -> str | ToolResult:
         """Search the MCP registry for servers matching a query.
 
         Uses semantic search over 1000+ indexed MCP servers. The search understands
@@ -307,16 +308,16 @@ class MCPDiscoveryToolset(FunctionToolsetCapability):
             return "\n".join(lines)
 
         except FileNotFoundError as e:
-            return f"Error: {e}"
+            return ToolResult(content=str(e), is_error=True)
         except Exception as e:
             logger.exception("Error searching MCP servers")
-            return f"Error searching MCP servers: {e}"
+            return ToolResult(content=f"Error searching MCP servers: {e}", is_error=True)
 
     async def list_mcp_tools(  # noqa: D417
         self,
         agent_ctx: AgentContext,
         server_name: str,
-    ) -> str:
+    ) -> str | ToolResult:
         """List all tools available on a specific MCP server.
 
         This connects to the server (if not already connected) and retrieves
@@ -334,7 +335,7 @@ class MCPDiscoveryToolset(FunctionToolsetCapability):
         )
 
         if not self._is_server_allowed(server_name):
-            return f"Error: Server '{server_name}' is not allowed"
+            return ToolResult(content=f"Server '{server_name}' is not allowed", is_error=True)
 
         try:
             # Check tools cache first
@@ -387,10 +388,13 @@ class MCPDiscoveryToolset(FunctionToolsetCapability):
             return "\n".join(lines)
 
         except MCPRegistryError as e:
-            return f"Error: {e}"
+            return ToolResult(content=str(e), is_error=True)
         except Exception as e:
             logger.exception("Error listing MCP tools", server=server_name)
-            return f"Error listing tools from '{server_name}': {e}"
+            return ToolResult(
+                content=f"Error listing tools from '{server_name}': {e}",
+                is_error=True,
+            )
 
     async def call_mcp_tool(  # noqa: D417
         self,
@@ -422,7 +426,7 @@ class MCPDiscoveryToolset(FunctionToolsetCapability):
         )
 
         if not self._is_server_allowed(server_name):
-            return f"Error: Server '{server_name}' is not allowed"
+            return ToolResult(content=f"Server '{server_name}' is not allowed", is_error=True)
 
         try:
             client = await self._get_connection(server_name)
@@ -438,10 +442,13 @@ class MCPDiscoveryToolset(FunctionToolsetCapability):
             # Result is already processed by MCPClient (ToolReturn, str, or structured data)
 
         except MCPRegistryError as e:
-            return f"Error: {e}"
+            return ToolResult(content=str(e), is_error=True)
         except Exception as e:
             logger.exception("Error calling MCP tool", server=server_name, tool=tool_name)
-            return f"Error calling '{tool_name}' on '{server_name}': {e}"
+            return ToolResult(
+                content=f"Error calling '{tool_name}' on '{server_name}': {e}",
+                is_error=True,
+            )
 
     async def cleanup(self) -> None:
         """Clean up resources."""

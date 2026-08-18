@@ -12,6 +12,7 @@ from upathtools import is_directory
 from agentpool.agents.context import AgentContext  # noqa: TC001
 from agentpool.capabilities.function_toolset import FunctionToolsetCapability
 from agentpool.log import get_logger
+from agentpool.tools.base import ToolResult
 from agentpool_toolsets.fsspec_toolset.diagnostics import (
     DiagnosticsManager,
     format_diagnostics_table,
@@ -216,7 +217,7 @@ class CodeTools(FunctionToolsetCapability):
         rule: dict[str, Any],
         fix: str | None = None,
         dry_run: bool = True,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | ToolResult:
         """Search or transform code in a file using AST patterns.
 
         Uses ast-grep for structural code search and rewriting based on abstract
@@ -278,14 +279,14 @@ class CodeTools(FunctionToolsetCapability):
         # Detect language from extension
         language = _detect_language(path)
         if not language:
-            return {"error": f"Cannot detect language for: {path}"}
+            return ToolResult(content=f"Cannot detect language for: {path}", is_error=True)
 
         # Read file
         try:
             content = await fs._cat_file(resolved)
             code = content.decode("utf-8") if isinstance(content, bytes) else content
         except FileNotFoundError:
-            return {"error": f"File not found: {path}"}
+            return ToolResult(content=f"File not found: {path}", is_error=True)
 
         root = SgRoot(code, language)
         node = root.root()
@@ -320,7 +321,7 @@ class CodeTools(FunctionToolsetCapability):
 
         return result
 
-    async def run_diagnostics(self, agent_ctx: AgentContext, path: str) -> str:  # noqa: D417
+    async def run_diagnostics(self, agent_ctx: AgentContext, path: str) -> str | ToolResult:  # noqa: D417
         """Run LSP diagnostics (type checking, linting) on files.
 
         Uses available CLI diagnostic tools (pyright, mypy, ty, oxlint, biome, etc.)
@@ -374,7 +375,7 @@ class CodeTools(FunctionToolsetCapability):
                     if not await is_directory(fs, p, entry_type=info["type"])
                 ]
             except Exception as e:  # noqa: BLE001
-                return f"Error scanning directory: {e}"
+                return ToolResult(content=f"Error scanning directory: {e}", is_error=True)
 
             if not file_paths:
                 return f"No files found in: {path}"
@@ -385,9 +386,9 @@ class CodeTools(FunctionToolsetCapability):
             try:
                 result = await manager.run_for_file(resolved, progress=progress_callback)
             except FileNotFoundError:
-                return f"File not found: {path}"
+                return ToolResult(content=f"File not found: {path}", is_error=True)
             except Exception as e:  # noqa: BLE001
-                return f"Error running diagnostics: {e}"
+                return ToolResult(content=f"Error running diagnostics: {e}", is_error=True)
 
         # Format output
         if not result.diagnostics:

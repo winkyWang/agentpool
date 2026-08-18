@@ -197,8 +197,8 @@ async def test_partial_failure_mcp_fails_skill_still_works() -> None:
 # ---- Test 4: get_instructions returns [metadata, callable] with dynamic content ----
 
 
-async def test_get_instructions_dynamic_callable_produces_skill_content() -> None:
-    """get_instructions returns [metadata, callable]; callable produces <skill_content>."""
+async def test_get_instructions_without_matcher_is_metadata_only() -> None:
+    """The dynamic callable does not inject a Skill body without activation."""
     local_skill = Skill(
         name="injected-skill",
         description="Skill to inject",
@@ -223,7 +223,7 @@ async def test_get_instructions_dynamic_callable_produces_skill_content() -> Non
     assert "<available-skills>" in metadata
     assert 'name="injected-skill"' in metadata
 
-    # Dynamic callable — no matcher, so all skills are injected (backward compat)
+    # Dynamic callable — no matcher means metadata-only progressive disclosure.
     dynamic_fn = result[1]
     assert callable(dynamic_fn)
 
@@ -232,9 +232,7 @@ async def test_get_instructions_dynamic_callable_produces_skill_content() -> Non
     ctx.messages = []
 
     content = await dynamic_fn(ctx)
-    assert content is not None
-    assert "Injected instructions content." in content
-    assert '<skill_content name="injected-skill">' in content
+    assert content is None
 
 
 async def test_get_instructions_with_matcher_fn() -> None:

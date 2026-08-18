@@ -1133,14 +1133,11 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
         # 5. Skill capabilities — from pool-scoped instances created during __aenter__.
         #    Each SkillManagerCap provides tools and MCP servers.
         pool = self._agent_pool
+        skill_capability = None
         if pool is not None:
-            pool_capabilities = pool.skill_capabilities
-            if pool_capabilities:
-                from agentpool.capabilities.skill_manager_cap import SkillManagerCap
-
-                tool_capabilities.extend(
-                    cap for cap in pool_capabilities if isinstance(cap, SkillManagerCap)
-                )
+            skill_capability = pool.skill_capability_for_node(self.name)
+            if skill_capability is not None:
+                tool_capabilities.append(skill_capability)
             # 6. ResourceCapability — unified resource access tools.
             #    Per-agent opt-out via ``resources.enabled: false`` in YAML.
             if self.config is not None and self.config.resources.enabled:
@@ -1168,16 +1165,6 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
                     session_scope = Scope(level=ScopeLevel.SESSION, session_id=session_id)
                     for cap in mcp_capabilities:
                         registry.register(cap, session_scope)
-                    if pool is not None:
-                        pool_caps = pool.skill_capabilities
-                        if pool_caps:
-                            from agentpool.capabilities.skill_manager_cap import (
-                                SkillManagerCap,
-                            )
-
-                            for cap in pool_caps:
-                                if isinstance(cap, SkillManagerCap):
-                                    registry.register(cap, session_scope)
                     self._registered_session_ids.add(session_id)
 
         # Collect pydantic-ai compatible instructions from SystemPrompts and providers

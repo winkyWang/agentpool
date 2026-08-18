@@ -290,16 +290,19 @@ Available skills:
 
 ## Configuration Reference
 
-Enable skill loading in your agent configuration:
+Configure the shared activation budget globally and enable Skill loading on the
+agent:
 
 ```yaml
+skills:
+  instruction:
+    max_skills: 20
+
 agents:
   my_agent:
     model: openai:gpt-4o
     tools:
       - type: skills
-        # Optional: limit number of skills shown in listings
-        max_skills: 20
 ```
 
 See [Skills Configuration](./skills.md) for detailed configuration options.

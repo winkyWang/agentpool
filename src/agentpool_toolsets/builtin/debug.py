@@ -15,6 +15,7 @@ from pydantic_ai import RunContext  # noqa: TC002
 from agentpool.agents.context import AgentContext  # noqa: TC001
 from agentpool.capabilities.function_toolset import FunctionToolsetCapability
 from agentpool.log import get_logger
+from agentpool.tools.base import ToolResult
 
 
 logger = get_logger(__name__)
@@ -261,7 +262,7 @@ class DebugTools(FunctionToolsetCapability):
 
     async def execute_introspection(  # noqa: D417
         self, ctx: AgentContext, run_ctx: RunContext[Any], code: str, title: str
-    ) -> str:
+    ) -> str | ToolResult:
         """Execute Python code with access to your own runtime context.
 
         This is a debugging/development tool that gives you full access to
@@ -287,13 +288,16 @@ class DebugTools(FunctionToolsetCapability):
         try:
             tree = ast.parse(code)
         except SyntaxError as e:
-            return f"Syntax Error: {e}"
+            return ToolResult(content=f"Syntax Error: {e}", is_error=True)
 
         # Check for dangerous constructs
         for node in ast.walk(tree):
             # Disallow imports
             if isinstance(node, (ast.Import, ast.ImportFrom)):
-                return "Error: Import statements are not allowed in introspection code"
+                return ToolResult(
+                    content="Import statements are not allowed in introspection code",
+                    is_error=True,
+                )
             # Disallow function calls that aren't attribute accesses on safe objects
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 # Basic builtins that are safe for introspection
@@ -334,7 +338,10 @@ class DebugTools(FunctionToolsetCapability):
                     "slice",
                 }
                 if node.func.id not in safe_builtins:
-                    return f"Error: Function call to {node.func.id} is not allowed"
+                    return ToolResult(
+                        content=f"Function call to {node.func.id} is not allowed",
+                        is_error=True,
+                    )
 
         # Emit progress with code being executed
         await ctx.events.tool_call_progress(
@@ -393,7 +400,10 @@ class DebugTools(FunctionToolsetCapability):
         try:
             exec(code, namespace)
             if "main" not in namespace:
-                return "Error: Code must define an async main() function"
+                return ToolResult(
+                    content="Code must define an async main() function",
+                    is_error=True,
+                )
             result = await namespace["main"]()
             result_str = (
                 str(result)
@@ -428,4 +438,6 @@ class DebugTools(FunctionToolsetCapability):
             metadata_path = f"debug/scripts/{timestamp}_{title}.json"
             ctx.internal_fs.pipe(metadata_path, anyenv.dump_json(metadata, indent=True).encode())
         assert result_str
+        if error_msg:
+            return ToolResult(content=result_str, is_error=True)
         return result_str

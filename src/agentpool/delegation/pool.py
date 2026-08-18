@@ -180,13 +180,13 @@ class AgentPool[TPoolDeps = None]:
             )
             from agentpool_toolsets.builtin.skills import SkillsTools
 
-            self.skills_tools_provider = SkillsTools(
-                max_skills=self.manifest.skills.instruction.max_skills,
-            )
+            self.skills_tools_provider = SkillsTools()
             self._tasks = TaskRegistry()
             self._skill_resolver: SkillURIResolver | None = None
             self._skill_provider: CombinedToolsetCapability | None = None
             self._skill_capabilities: list[Any] = []  # SkillManagerCap instances
+            self._node_skill_capabilities: dict[str, Any] = {}
+            self._all_skill_names: frozenset[str] = frozenset()
             # Pool-level ExtensionRegistry for global capability scoping.
             self._extension_registry: ExtensionRegistry = ExtensionRegistry()
             # ResourceCapability instance — created in _setup_resource_capability()
@@ -320,9 +320,7 @@ class AgentPool[TPoolDeps = None]:
                     enable_auto_resume=cfg.enable_auto_resume,
                     enable_event_bus=cfg.enable_event_bus,
                     max_auto_resume=cfg.max_auto_resume,
-                    subagent_inactivity_timeout_seconds=(
-                        cfg.subagent_inactivity_timeout_seconds
-                    ),
+                    subagent_inactivity_timeout_seconds=(cfg.subagent_inactivity_timeout_seconds),
                 )
                 # Configure additional SessionPool settings
                 self._session_pool.sessions._session_ttl_seconds = cfg.session_ttl_seconds
@@ -577,8 +575,30 @@ class AgentPool[TPoolDeps = None]:
         return self._default_skill_scope
 
     def is_skill_visible_to_node(self, skill: Any, node_name: str | None) -> bool:
-        """Return whether a skill is visible to a node's package scope."""
-        return self.skill_scope_for_skill(skill) == self.skill_scope_for_node(node_name)
+        """Return whether a Skill is visible under the resolved node policy."""
+        skill_name = str(getattr(skill, "name", ""))
+        return skill_name in self.visible_skill_names_for_node(node_name)
+
+    def visible_skill_names_for_node(self, node_name: str | None) -> frozenset[str]:
+        """Return the authoritative visible Skill names for a node."""
+        configured = self.manifest.skills.node_visibility
+        if configured:
+            if node_name is None:
+                return frozenset()
+            return frozenset(configured.get(node_name, ()))
+
+        if self._node_skill_scopes or self._skill_scope_paths:
+            return frozenset(
+                skill.name
+                for skill in self.skills.list_skills()
+                if self.skill_scope_for_skill(skill) == self.skill_scope_for_node(node_name)
+            )
+
+        return self._all_skill_names
+
+    def skill_capability_for_node(self, node_name: str) -> Any | None:
+        """Return the prebuilt node-specific Skill capability view."""
+        return self._node_skill_capabilities.get(node_name)
 
     async def get_skill_instructions_for_node(self, skill_name: str, node_name: str) -> str:
         """Load skill instructions using a target node's package scope."""
@@ -650,9 +670,8 @@ class AgentPool[TPoolDeps = None]:
         that implement ``SkillResource`` into the ``SkillManagerCap`` so
         remote skills are accessible (Phase 3, task 3.4).
 
-        Registers the ``SkillManagerCap`` with ``ExtensionRegistry`` at
-        ``ScopeLevel.POOL`` so that ``skill://`` URI resolution works
-        end-to-end.
+        Keeps one internal catalog for URI resolution and registers exact
+        node-scoped views with ``ExtensionRegistry`` at ``ScopeLevel.AGENT``.
 
         Skills with ``disable_model_invocation=True`` are skipped.
 
@@ -679,12 +698,14 @@ class AgentPool[TPoolDeps = None]:
         # Create a SkillToolManager for importing Python tools from skill frontmatter.
         tool_manager = SkillToolManager()
 
-        # Unregister and close old SkillManagerCap from ExtensionRegistry if present.
-        pool_scope = Scope(level=ScopeLevel.POOL)
+        # Remove old node views before rebuilding the catalog.
+        for node_name, existing_cap in self._node_skill_capabilities.items():
+            agent_scope = Scope(level=ScopeLevel.AGENT, agent_name=node_name)
+            self._extension_registry.unregister(existing_cap, agent_scope)
+        self._node_skill_capabilities.clear()
+
         for existing_cap in list(self._skill_capabilities):
             if isinstance(existing_cap, SkillManagerCap):
-                self._extension_registry.unregister(existing_cap, pool_scope)
-                # Close child McpServerCap instances to release MCP connections.
                 try:
                     await existing_cap.__aexit__(None, None, None)
                 except Exception:
@@ -694,18 +715,49 @@ class AgentPool[TPoolDeps = None]:
         cap = SkillManagerCap(
             local_skills=local_skills,
             children=mcp_children,
+            max_skills=self.manifest.skills.instruction.max_skills,
             name="pool-skills",
             tool_manager=tool_manager,
         )
         self._skill_capabilities = [cap]
 
-        # Register the new SkillManagerCap with ExtensionRegistry at POOL scope.
-        self._extension_registry.register(cap, pool_scope)
+        remote_names: set[str] = set()
+        for child in mcp_children:
+            try:
+                remote_names.update(entry.name for entry in await child.list_skills())
+            except Exception:
+                logger.warning("Failed to resolve remote Skill names", exc_info=True)
+        self._all_skill_names = frozenset(set(local_skills) | remote_names)
+
+        unknown_by_node = {
+            node_name: sorted(set(names) - self._all_skill_names)
+            for node_name, names in self.manifest.skills.node_visibility.items()
+            if set(names) - self._all_skill_names
+        }
+        if unknown_by_node:
+            details = "; ".join(
+                f"{node}: {', '.join(names)}" for node, names in sorted(unknown_by_node.items())
+            )
+            raise ValueError(f"Unknown Skills in node_visibility: {details}")
+
+        # The unfiltered catalog is internal-only. Node views are the sole
+        # SkillResource/CommandResource instances registered for agents.
+        if self._skill_resolver is not None:
+            self._skill_resolver.register_provider("local", cap)
+        for node_name in self.manifest.agents:
+            view = cap.scoped(set(self.visible_skill_names_for_node(node_name)))
+            self._node_skill_capabilities[node_name] = view
+            agent_scope = Scope(level=ScopeLevel.AGENT, agent_name=node_name)
+            self._extension_registry.register(view, agent_scope)
 
         logger.debug(
             "Rebuilt skill capabilities",
             count=len(self._skill_capabilities),
             skill_names=list(local_skills.keys()),
+            node_visibility={
+                name: sorted(self.visible_skill_names_for_node(name))
+                for name in self.manifest.agents
+            },
         )
 
     @property

@@ -9,6 +9,34 @@ class SkillError(AgentPoolError):
     """Base exception for all skill-related errors."""
 
 
+class SkillActivationLimitError(SkillError):
+    """Raised when a run requests more distinct Skill bodies than allowed."""
+
+    def __init__(
+        self,
+        *,
+        limit: int,
+        active_skills: set[str],
+        requested_skills: set[str],
+    ) -> None:
+        """Initialize a structured activation-limit diagnostic.
+
+        Args:
+            limit: Maximum number of distinct Skill bodies for the run.
+            active_skills: Skill names already activated in the run.
+            requested_skills: Skill names requested by the current operation.
+        """
+        self.limit = limit
+        self.active_skills = frozenset(active_skills)
+        self.requested_skills = frozenset(requested_skills)
+        combined = sorted(active_skills | requested_skills)
+        super().__init__(
+            f"Skill activation limit {limit} exceeded; "
+            f"active={sorted(active_skills)}, requested={sorted(requested_skills)}, "
+            f"combined={combined}"
+        )
+
+
 class SkillNotFoundError(SkillError):
     """Raised when a skill cannot be found.
 

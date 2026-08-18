@@ -10,12 +10,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from pydantic_ai.exceptions import ToolFailed
 from pydantic_ai.messages import ToolReturn
 from pydantic_ai.tools import RunContext
 import pytest
 
 from agentpool.agents.context import AgentContext, AgentRunContext
 from agentpool.tools import ApprovalRequired, CallDeferred, Tool
+from agentpool.tools.base import ToolResult
 
 
 if TYPE_CHECKING:
@@ -359,3 +361,12 @@ async def test_deferred_no_context_function_catches_call_deferred(
     mock_handler.assert_awaited_once()
     assert isinstance(result, ToolReturn)
     assert isinstance(mock_handler.call_args[0][0], CallDeferred)
+
+
+@pytest.mark.unit
+def test_direct_tool_result_failure_uses_pydantic_failure_signal() -> None:
+    """Direct tools cannot be converted into a successful ``ToolReturn`` first."""
+    from agentpool.agents.native_agent.tool_wrapping import _convert_result
+
+    with pytest.raises(ToolFailed, match="direct failure"):
+        _convert_result(ToolResult(content="direct failure", is_error=True))

@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 import warnings
 
+from agentpool.tools.base import ToolResult as ToolResult  # noqa: PLC0414, TC001 -- re-export
+
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence
@@ -65,19 +67,6 @@ class ToolEntry:
     name: str
     description: str = ""
     schema: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True, slots=True)
-class ToolResult:
-    """Result of an MCP tool call.
-
-    Attributes:
-        content: The tool output content as text.
-        is_error: Whether the tool returned an error.
-    """
-
-    content: str
-    is_error: bool = False
 
 
 @dataclass(frozen=True, slots=True)

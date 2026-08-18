@@ -14,6 +14,7 @@ from agentpool import Agent, AgentContext
 from agentpool.agents.context import AgentRunContext
 from agentpool.tool_impls.bash import BashTool
 from agentpool.tool_impls.execute_code import ExecuteCodeTool
+from agentpool.tools.base import ToolResult
 from agentpool_toolsets.builtin.execution_environment import ProcessManagementTools
 
 
@@ -212,9 +213,9 @@ class TestProcessLifecycle:
         tools = ProcessManagementTools(env=env)
 
         result = await tools.start_process(agent_ctx, command="nonexistent")
-        # Tools now return formatted strings
-        assert isinstance(result, str)
-        assert "Command not found" in result or "Failed" in result
+        assert isinstance(result, ToolResult)
+        assert result.is_error is True
+        assert "Command not found" in str(result.content)
 
     async def test_get_process_output_running(self, agent_ctx: AgentContext, test_agent: Agent):
         """Test getting output from running process."""
@@ -319,9 +320,9 @@ class TestProcessLifecycle:
         tools = ProcessManagementTools(env=env)
 
         result = await tools.kill_process(agent_ctx, "invalid")
-        # Tools now return formatted strings
-        assert isinstance(result, str)
-        assert "Error" in result or "not found" in result.lower()
+        assert isinstance(result, ToolResult)
+        assert result.is_error is True
+        assert "not found" in str(result.content).lower()
 
     async def test_release_process_success(self, agent_ctx: AgentContext, test_agent: Agent):
         """Test releasing process resources."""

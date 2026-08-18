@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from agentpool.agents.context import AgentContext  # noqa: TC001
 from agentpool.log import get_logger
-from agentpool.tools.base import Tool
+from agentpool.tools.base import Tool, ToolResult
 
 
 if TYPE_CHECKING:
@@ -22,7 +22,7 @@ logger = get_logger(__name__)
 
 
 @dataclass
-class DeletePathTool(Tool[dict[str, Any]]):
+class DeletePathTool(Tool[dict[str, Any] | ToolResult]):
     """Delete files or directories from the filesystem.
 
     A standalone tool for deleting paths with:
@@ -41,7 +41,7 @@ class DeletePathTool(Tool[dict[str, Any]]):
     cwd: str | None = None
     """Working directory for resolving relative paths."""
 
-    def get_callable(self) -> Callable[..., Awaitable[dict[str, Any]]]:
+    def get_callable(self) -> Callable[..., Awaitable[dict[str, Any] | ToolResult]]:
         """Return the delete_path method as the callable."""
         return self._delete_path
 
@@ -68,7 +68,7 @@ class DeletePathTool(Tool[dict[str, Any]]):
         ctx: AgentContext,
         path: str,
         recursive: bool = False,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | ToolResult:
         """Delete a file or directory.
 
         Args:
@@ -92,11 +92,11 @@ class DeletePathTool(Tool[dict[str, Any]]):
             except FileNotFoundError:
                 msg = f"Path does not exist: {path}"
                 await ctx.events.file_operation("delete", path=path, success=False, error=msg)
-                return {"error": msg}
+                return ToolResult(content=msg, is_error=True)
             except (OSError, ValueError) as e:
                 msg = f"Could not check path {path}: {e}"
                 await ctx.events.file_operation("delete", path=path, success=False, error=msg)
-                return {"error": msg}
+                return ToolResult(content=msg, is_error=True)
 
             if path_type == "directory":
                 if not recursive:
@@ -113,7 +113,7 @@ class DeletePathTool(Tool[dict[str, Any]]):
                                 "delete", path=path, success=False, error=error_msg
                             )
 
-                            return {"error": error_msg}
+                            return ToolResult(content=error_msg, is_error=True)
                     except (OSError, ValueError):
                         pass  # Continue with deletion attempt
 
@@ -123,7 +123,7 @@ class DeletePathTool(Tool[dict[str, Any]]):
 
         except Exception as e:  # noqa: BLE001
             await ctx.events.file_operation("delete", path=path, success=False, error=str(e))
-            return {"error": f"Failed to delete {path}: {e}"}
+            return ToolResult(content=f"Failed to delete {path}: {e}", is_error=True)
         else:
             result = {
                 "path": path,

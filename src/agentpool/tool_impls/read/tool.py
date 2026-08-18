@@ -246,7 +246,7 @@ class ReadTool(Tool[ToolResult]):
             await ctx.events.file_operation("read", path=path, success=False, error=str(e))
             error_msg = f"error: Failed to read file {path}: {e}"
             meta = {"preview": "", "truncated": False}
-            return ToolResult(content=error_msg, metadata=meta)
+            return ToolResult(content=error_msg, metadata=meta, is_error=True)
         else:
             # Emit file content for UI display (formatted at ACP layer)
             # Use non-negative line for display (negative lines are internal Python convention)

@@ -4,6 +4,7 @@ from pydantic_ai import ToolReturn
 import pytest
 
 from agentpool.mcp_server.tool_bridge import _convert_to_tool_result
+from agentpool.tools.base import ToolResult
 
 
 pytestmark = pytest.mark.unit
@@ -25,3 +26,11 @@ def test_bridge_preserves_pydantic_tool_return_content() -> None:
         "read_lines": 2,
     }
     assert converted.meta == {"file_path": "scratchpad://report.md", "read_lines": 2}
+
+
+def test_bridge_preserves_agentpool_failure_semantics() -> None:
+    """MCP exposes AgentPool's declared execution failure as ``isError``."""
+    converted = _convert_to_tool_result(ToolResult(content="boom", is_error=True))
+
+    assert converted.is_error is True
+    assert converted.content[0].text == "boom"

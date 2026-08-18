@@ -411,8 +411,10 @@ class SkillURIResolver:
                     skill_path=PurePosixPath(uri),
                     instructions=result if isinstance(result, str) else None,
                 )
-            msg = f"Skill {uri!r} not found via ExtensionRegistry"
-            raise SkillNotFoundError(msg)
+            # The pool catalog is intentionally not registered globally: only
+            # node-scoped views belong in ExtensionRegistry. Explicit Skill
+            # loading performs its own node visibility check after resolving
+            # from the internal catalog provider.
 
         resolved = ResolvedSkillURI.parse(uri)
         skill = await self._find_skill_with_alternatives(resolved.skill_name)

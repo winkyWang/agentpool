@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from agentpool.agents.native_agent.elicitation_bridge import ElicitationFutureRegistry
     from agentpool.orchestrator.core import EventBus
     from agentpool.orchestrator.run import RunHandle
+    from agentpool.skills.activation import SkillTraceRecord
     from agentpool.tools.base import Tool
 
 
@@ -211,6 +212,12 @@ class AgentRunContext:
     ``EnqueuedMessagesEvent``-derived event share the same
     ``message_id``, enabling converter-level dedup.
     """
+
+    activated_skills: set[str] = field(default_factory=set)
+    """Distinct Skill bodies activated during this run."""
+
+    skill_trace_records: list[SkillTraceRecord] = field(default_factory=list)
+    """Structured Skill exposure and activation records for this run."""
 
     async def complete_background_task(self, child_session_id: str, message: str) -> None:
         """Signal that a background child task has completed.
