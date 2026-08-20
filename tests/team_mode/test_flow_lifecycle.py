@@ -117,7 +117,7 @@ def _init_team(
             {"name": "reviewer_agent", "agent": "reviewer"},
         ]
     state = FileTeamState(base_dir)
-    state.init(team_id, team_name, members)
+    state.init(team_id, team_name, members, max_parallel_members=5)
     for m in members:
         state.register_member(team_id, m["name"], f"sess_{m['name']}")
 
@@ -125,14 +125,37 @@ def _init_team(
 def _make_mock_pool() -> MagicMock:
     """Create a mock SessionPool with async send_message and close_session."""
     pool = MagicMock()
-    pool.send_message = AsyncMock(return_value="msg_id_001")
-    pool.close_session = AsyncMock()
     # Mock create_child_session for _create_member_session path
     mock_child_state = MagicMock()
     mock_child_state.session_id = "child_session_001"
     pool.create_child_session = AsyncMock(return_value=mock_child_state)
     pool.sessions = MagicMock()
     pool.sessions.get_or_create_session_agent = AsyncMock()
+    runtime_sessions: dict[str, MagicMock] = {}
+
+    def get_session(session_id: str) -> MagicMock:
+        session = runtime_sessions.get(session_id)
+        if session is None:
+            session = MagicMock()
+            session.session_id = session_id
+            session.current_run_id = None
+            session.closing = False
+            session.is_closing = False
+            session.metadata = {"team_role": "member"}
+            runtime_sessions[session_id] = session
+        return session
+
+    async def send_message(session_id: str, *_args: Any, **_kwargs: Any) -> str:
+        get_session(session_id).current_run_id = f"run_{session_id}"
+        return "msg_id_001"
+
+    async def close_session(session_id: str) -> None:
+        runtime_sessions.pop(session_id, None)
+
+    pool.sessions.get_session.side_effect = get_session
+    pool.send_message = AsyncMock(side_effect=send_message)
+    pool.close_session = AsyncMock(side_effect=close_session)
+    pool.get_run.return_value = None
     pool.event_bus = None  # Skip SpawnSessionStart emission in unit tests
     return pool
 

@@ -53,12 +53,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 import datetime
 import json
 import tempfile
-from typing import TYPE_CHECKING, Annotated, Any, override
+from typing import TYPE_CHECKING, Annotated, Any, cast, override
 import uuid
 
+import logfire
 from pydantic.fields import Field
 from pydantic_ai.messages import ToolReturn
 from pydantic_ai.tools import RunContext  # noqa: TC002 - needed at runtime for get_type_hints()
@@ -68,14 +70,19 @@ from wolfharness.log import get_logger
 
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from pydantic_ai.run import AgentRunResult
     from pydantic_ai.tools import ToolDefinition
 
     from wolfharness.capabilities.agent_context import AgentContextDeps
-    from wolfharness.capabilities.file_team_state import FileTeamState
+    from wolfharness.capabilities.file_team_state import (
+        FileTeamState,
+        TeamMemberRuntime,
+        TeamRunSlotUsage,
+    )
     from wolfharness.lifecycle.types import DeliveryMode
+    from wolfharness.orchestrator.session_pool import SessionPool
     from wolfharness.tools.base import Tool
     from wolfharness_config.team_mode import TeamModeConfig
 
@@ -85,6 +92,17 @@ logger = get_logger(__name__)
 # Strong references to cleanup tasks so asyncio does not garbage-collect them
 # while they are awaiting ``RunHandle.complete_event``.
 _cleanup_tasks: set[asyncio.Task[Any]] = set()
+
+
+@dataclass(frozen=True, slots=True)
+class _TeamDeliveryResult:
+    """Outcome of one capacity-aware Team member delivery."""
+
+    delivered: bool
+    capacity_limited: bool = False
+    activation_in_progress: bool = False
+    active_count: int = 0
+    limit: int = 0
 
 
 class TeamCommCapability(FunctionToolsetCapability[Any]):
@@ -170,6 +188,216 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
         """
         return body
 
+    @staticmethod
+    def _team_member_runtime_resolver(
+        session_pool: SessionPool,
+    ) -> Callable[[str, str], TeamMemberRuntime | None]:
+        """Return a synchronous Session resolver for use under the state lock."""
+        from wolfharness.capabilities.file_team_state import TeamMemberRuntime
+
+        def resolve(_member_name: str, session_id: str) -> TeamMemberRuntime | None:
+            session = session_pool.sessions.get_session(session_id)
+            if session is None or session.closing or session.is_closing:
+                return None
+            if session.metadata.get("team_role") == "lead":
+                return None
+            return TeamMemberRuntime(
+                session_id=session_id,
+                run_id=session.current_run_id,
+            )
+
+        return resolve
+
+    def _reconcile_run_slot_usage(
+        self,
+        team_state: FileTeamState,
+        team_id: str,
+        session_pool: SessionPool,
+    ) -> TeamRunSlotUsage:
+        """Reconcile Team slots against SessionPool and emit cleanup telemetry."""
+        usage = team_state.reconcile_run_slots(
+            team_id,
+            self._team_member_runtime_resolver(session_pool),
+        )
+        if usage.removed_stale_count:
+            logfire.info(
+                "team.parallel_capacity.reconciled",
+                team_id=team_id,
+                removed_stale_count=usage.removed_stale_count,
+                active_count=usage.active_count,
+                limit=usage.limit,
+            )
+        return usage
+
+    async def _deliver_to_team_member(
+        self,
+        *,
+        team_state: FileTeamState,
+        team_id: str,
+        member_name: str,
+        session_pool: SessionPool,
+        content: str,
+        mode: DeliveryMode,
+        source: str,
+        meta: dict[str, str],
+        expected_target_session_id: str | None = None,
+    ) -> _TeamDeliveryResult:
+        """Deliver one message after atomically obtaining Team run capacity."""
+        from wolfharness.lifecycle.types import DeliveryMode
+
+        target_session_id = team_state.get_member_session_id(team_id, member_name)
+        if target_session_id is None:
+            return _TeamDeliveryResult(delivered=False)
+        if (
+            expected_target_session_id is not None
+            and target_session_id != expected_target_session_id
+        ):
+            return _TeamDeliveryResult(delivered=False)
+        target_session = session_pool.sessions.get_session(target_session_id)
+        if target_session is None or target_session.closing or target_session.is_closing:
+            self._reconcile_run_slot_usage(team_state, team_id, session_pool)
+            return _TeamDeliveryResult(delivered=False)
+
+        # The Lead is deliberately outside max_parallel_members.
+        if target_session.metadata.get("team_role") == "lead":
+            result = await session_pool.send_message(
+                target_session_id,
+                content,
+                mode=mode,
+                source=source,
+                meta=meta,
+            )
+            delivered = result is not None or mode is DeliveryMode.QUEUE
+            return _TeamDeliveryResult(delivered=delivered)
+
+        with logfire.span(
+            "team.parallel_capacity.reserve",
+            team_id=team_id,
+            member_name=member_name,
+            session_id=target_session_id,
+        ):
+            reservation = team_state.reserve_run_slot(
+                team_id,
+                member_name,
+                target_session_id,
+                self._team_member_runtime_resolver(session_pool),
+            )
+        if not reservation.accepted or reservation.reservation_id is None:
+            logfire.info(
+                "team.parallel_capacity.rejected",
+                team_id=team_id,
+                member_name=member_name,
+                active_count=reservation.active_count,
+                limit=reservation.limit,
+                activation_in_progress=reservation.activation_in_progress,
+            )
+            return _TeamDeliveryResult(
+                delivered=False,
+                capacity_limited=not reservation.activation_in_progress,
+                activation_in_progress=reservation.activation_in_progress,
+                active_count=reservation.active_count,
+                limit=reservation.limit,
+            )
+
+        delivered = False
+        observed_run_id: str | None = None
+        try:
+            result = await session_pool.send_message(
+                target_session_id,
+                content,
+                mode=mode,
+                source=source,
+                meta=meta,
+            )
+            current_session = session_pool.sessions.get_session(target_session_id)
+            if current_session is not None and not current_session.closing:
+                observed_run_id = current_session.current_run_id
+                delivered = result is not None or (
+                    mode is DeliveryMode.QUEUE and observed_run_id is not None
+                )
+            return _TeamDeliveryResult(delivered=delivered)
+        finally:
+            team_state.complete_run_slot_delivery(
+                team_id,
+                member_name,
+                reservation.reservation_id,
+                run_id=observed_run_id if delivered else None,
+            )
+            if delivered and observed_run_id is not None:
+                self._schedule_run_slot_reconciliation(
+                    session_pool,
+                    team_id,
+                    target_session_id,
+                    team_state,
+                )
+
+    def _schedule_run_slot_reconciliation(
+        self,
+        session_pool: SessionPool,
+        team_id: str,
+        member_session_id: str,
+        team_state: FileTeamState,
+    ) -> None:
+        """Release a member slot after its final chained Run becomes idle."""
+
+        async def _wait_for_idle() -> None:
+            with logfire.span(
+                "team.parallel_capacity.await_release",
+                team_id=team_id,
+                session_id=member_session_id,
+            ):
+                while True:
+                    session = session_pool.sessions.get_session(member_session_id)
+                    if session is None or session.closing or session.is_closing:
+                        break
+                    run_id = session.current_run_id
+                    if run_id is None:
+                        break
+                    run_handle = session_pool.get_run(run_id)
+                    if run_handle is None:
+                        # Session cleanup clears ``current_run_id`` just after
+                        # removing the RunHandle. Wait for that atomic handoff
+                        # instead of abandoning the only release listener.
+                        await asyncio.sleep(0.01)
+                        session = session_pool.sessions.get_session(member_session_id)
+                        if session is None:
+                            break
+                        continue
+                    await run_handle.complete_event.wait()
+                    # Run cleanup sets complete_event before clearing current_run_id
+                    # and may immediately chain another Run. Yield before rechecking.
+                    await asyncio.sleep(0)
+                # Team deletion and test fixture teardown may remove the
+                # coordination directory after the Run completes.  The slot
+                # no longer exists in that case, so reconciliation is already
+                # satisfied.
+                with contextlib.suppress(FileNotFoundError):
+                    self._reconcile_run_slot_usage(team_state, team_id, session_pool)
+
+        with logfire.span(
+            "team.parallel_capacity.watch",
+            team_id=team_id,
+            session_id=member_session_id,
+        ):
+            task = asyncio.create_task(_wait_for_idle())
+        _cleanup_tasks.add(task)
+
+        def observe_completion(done: asyncio.Task[None]) -> None:
+            _cleanup_tasks.discard(done)
+            if done.cancelled():
+                return
+            exception = done.exception()
+            if exception is not None:
+                logger.error(
+                    "Team run-slot release listener failed",
+                    team_id=team_id,
+                    session_id=member_session_id,
+                    exception_type=type(exception).__name__,
+                    exception_message=str(exception),
+                )
+
+        task.add_done_callback(observe_completion)
+
     async def _notify_member(
         self,
         agent_ctx: AgentContextDeps,
@@ -206,9 +434,12 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
             f"{msg_body}\n\n</team-message>"
         )
         try:
-            await session_pool.send_message(
-                target_sid,
-                self._wrap_notice_content(wrapped),
+            await self._deliver_to_team_member(
+                team_state=team_state,
+                team_id=team_id,
+                member_name=member_name,
+                session_pool=session_pool,
+                content=self._wrap_notice_content(wrapped),
                 mode=self._notice_mode,
                 source="accepted",
                 meta={"from": "system", "team_id": team_id},
@@ -590,10 +821,9 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
             state: dict[str, Any] = FileTeamState._read_json(state_path)
             members: dict[str, dict[str, str]] = state.get("members", {})
 
-            from wolfharness.lifecycle.types import DeliveryMode
-
             mode = self._notice_mode
             delivered = 0
+            capacity_limited = 0
             lead_sid = agent_ctx.session.session_id
             msg_body = (
                 f'<team-message from="{self._agent_name}" type="broadcast">'
@@ -603,29 +833,33 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
                 target_sid = team_state.get_member_session_id(team_id, member_name)
                 if target_sid is None or target_sid == lead_sid:
                     continue  # Skip self (lead broadcasting to itself).
-                result = await session_pool.send_message(
-                    target_sid,
-                    self._wrap_notice_content(msg_body),
+                delivery = await self._deliver_to_team_member(
+                    team_state=team_state,
+                    team_id=team_id,
+                    member_name=member_name,
+                    session_pool=session_pool,
+                    content=self._wrap_notice_content(msg_body),
                     mode=mode,
                     source="accepted",
                     meta={"from": self._agent_name, "team_id": team_id},
                 )
-                # Distinguish None-as-queued from None-as-failure:
-                # - STEER: None = failure.
-                # - QUEUE: None = queued (success) OR failure. Check
-                #   session existence to disambiguate.
-                if result is not None:
+                if delivery.delivered:
                     delivered += 1
-                elif mode is DeliveryMode.QUEUE:
-                    target_session = session_pool.sessions.get_session(target_sid)
-                    if target_session is not None and not target_session.closing:
-                        delivered += 1
+                elif delivery.capacity_limited or delivery.activation_in_progress:
+                    capacity_limited += 1
                 team_state.write_message(
                     team_id,
                     member_name,
                     {"from": self._agent_name, "body": body},
                 )
-            return ToolReturn(return_value=f"Broadcast sent to {delivered} members")
+            capacity_suffix = (
+                f"; {capacity_limited} members not activated by parallel capacity"
+                if capacity_limited
+                else ""
+            )
+            return ToolReturn(
+                return_value=f"Broadcast sent to {delivered} members{capacity_suffix}"
+            )
 
         agent_ctx = self._resolve_agent_context(ctx)
         team_state = self._get_team_state(agent_ctx)
@@ -671,35 +905,45 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
                     )
                 )
 
-            member_info["turn_count"] = turn_count + 1
-            members_state[to] = member_info
-            current_state["members"] = members_state
-            FileTeamState._atomic_write(state_path, current_state)
-
-        from wolfharness.lifecycle.types import DeliveryMode
+            turn_claimed, claimed_turn_count = team_state.increment_member_turn_if_below(
+                team_id,
+                to,
+                max_member_turns=self._config.bounds.max_member_turns,
+            )
+            if not turn_claimed:
+                return ToolReturn(
+                    return_value=(
+                        f"Member '{to}' has exceeded max turns "
+                        f"({claimed_turn_count} >= {self._config.bounds.max_member_turns})"
+                    )
+                )
 
         mode = self._notice_mode
         msg_body = (
             f'<team-message from="{self._agent_name}" type="private">\n\n{body}\n\n</team-message>'
         )
-        result = await session_pool.send_message(
-            target_sid,
-            self._wrap_notice_content(msg_body),
+        delivery = await self._deliver_to_team_member(
+            team_state=team_state,
+            team_id=team_id,
+            member_name=to,
+            session_pool=session_pool,
+            content=self._wrap_notice_content(msg_body),
             mode=mode,
             source="accepted",
             meta={"from": self._agent_name, "team_id": team_id},
         )
-        # Distinguish None-as-queued from None-as-failure:
-        # - STEER mode: None always means failure (session not found/closing).
-        # - QUEUE mode: None means queued (success) OR failure. Check
-        #   session existence to disambiguate.
-        if result is None:
-            if mode is DeliveryMode.STEER:
-                return ToolReturn(return_value=f"Failed to deliver message to '{to}'")
-            # QUEUE mode — verify session still exists.
-            target_session = session_pool.sessions.get_session(target_sid)
-            if target_session is None or target_session.closing or target_session.is_closing:
-                return ToolReturn(return_value=f"Failed to deliver message to '{to}'")
+        if not delivery.delivered:
+            if delivery.activation_in_progress:
+                return ToolReturn(return_value=f"Member '{to}' activation is already in progress")
+            if delivery.capacity_limited:
+                return ToolReturn(
+                    return_value=(
+                        f"Team parallel capacity exhausted "
+                        f"({delivery.active_count}/{delivery.limit}); "
+                        f"member '{to}' was not activated"
+                    )
+                )
+            return ToolReturn(return_value=f"Failed to deliver message to '{to}'")
 
         # Persist to inbox for audit trail.
         team_state.write_message(
@@ -1648,11 +1892,11 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
         if team_state is None:
             return ToolReturn(return_value="Not in a team session")
 
-        from wolfharness.capabilities.file_team_state import FileTeamState
-
         state_path = team_state._state_path(team_id)
         if not state_path.exists():
             return ToolReturn(return_value="Team state not found")
+
+        from wolfharness.capabilities.file_team_state import FileTeamState
 
         state: dict[str, Any] = FileTeamState._read_json(state_path)
         team_name: str = state.get("team_name", "unknown")
@@ -1665,6 +1909,14 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
 
         # Access SessionPool for runtime member state.
         session_pool = agent_ctx.host.session_pool
+        if session_pool is not None:
+            slot_usage = self._reconcile_run_slot_usage(team_state, team_id, session_pool)
+            active_parallel_members = slot_usage.active_count
+            max_parallel_members = slot_usage.limit
+        else:
+            slots: dict[str, dict[str, str]] = state.get("active_run_slots", {})
+            active_parallel_members = len(slots)
+            max_parallel_members = int(state["max_parallel_members"])
 
         member_lines: list[str] = []
         for m_name, info in members.items():
@@ -1712,6 +1964,7 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
             f"Team: {team_name}",
             f"Status: {status}",
             f"Team ID: {team_id}",
+            (f"Parallel members: {active_parallel_members}/{max_parallel_members}"),
             f"Members ({len(members)}):",
             *member_lines,
         ]
@@ -1821,9 +2074,44 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
                 )
             )
 
+        # Initial members are all activated immediately. Reject the full
+        # batch before Team state or any child Session is created.
+        if len(members) > self._config.bounds.max_parallel_members:
+            return ToolReturn(
+                return_value=(
+                    "Team exceeds max_parallel_members "
+                    f"({len(members)} > {self._config.bounds.max_parallel_members})"
+                )
+            )
+
+        # Display names are roster identities. Validate the whole batch
+        # before creating Team state or child Sessions so dict projection
+        # cannot collapse members or overwrite the Lead.
+        lead_member_name = agent_ctx.session.metadata.get(
+            "team_member_name",
+            self._agent_name,
+        )
+        raw_member_names = [member.get("name") for member in members]
+        if any(not isinstance(member_name, str) for member_name in raw_member_names):
+            return ToolReturn(return_value="Team member names must be strings")
+        member_names = cast("list[str]", raw_member_names)
+        if any(not member_name.strip() for member_name in member_names):
+            return ToolReturn(return_value="Team member names must be non-empty")
+        if any(member_name != member_name.strip() for member_name in member_names):
+            return ToolReturn(return_value="Team member names must not contain outer whitespace")
+        if len(set(member_names)) != len(member_names):
+            return ToolReturn(return_value="Team member names must be unique")
+        if lead_member_name in member_names:
+            return ToolReturn(
+                return_value=f"Team member name '{lead_member_name}' conflicts with Lead"
+            )
+
         # Generate team_id and create state.
         team_id = f"team_{uuid.uuid4().hex[:8]}"
         lead_session_id: str = agent_ctx.session.session_id
+        session_pool = agent_ctx.host.session_pool
+        if session_pool is None:
+            return ToolReturn(return_value="SessionPool not available")
 
         from wolfharness.capabilities.file_team_state import FileTeamState
 
@@ -1837,25 +2125,19 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
             team_id,
             name,
             [{"name": m["name"], "agent": m["agent"]} for m in members],
+            max_parallel_members=self._config.bounds.max_parallel_members,
         )
 
         # Register the lead as a member so other members can send_message
         # to the lead by name.  The lead's member name comes from session
         # metadata (set by the factory), falling back to the agent name.
-        lead_member_name = agent_ctx.session.metadata.get(
-            "team_member_name",
-            self._agent_name,
-        )
         team_state.register_member(team_id, lead_member_name, lead_session_id)
 
         # Record started_at timestamp for wall-clock enforcement.
-        state = team_state._read_json(team_state._state_path(team_id))
-        state["started_at"] = datetime.datetime.now(datetime.UTC).isoformat()
-        team_state._atomic_write(team_state._state_path(team_id), state)
-
-        session_pool = agent_ctx.host.session_pool
-        if session_pool is None:
-            return ToolReturn(return_value="SessionPool not available")
+        team_state.set_started_at(
+            team_id,
+            datetime.datetime.now(datetime.UTC).isoformat(),
+        )
 
         from wolfharness.lifecycle.types import DeliveryMode
 
@@ -1923,13 +2205,29 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
                         "\n\nRemember to report progress regularly using "
                         '`task_update(technical_note="...")`.'
                     )
-                await session_pool.send_message(
-                    member_session_id,
-                    full_prompt,
+                delivery = await self._deliver_to_team_member(
+                    team_state=team_state,
+                    team_id=team_id,
+                    member_name=member["name"],
+                    session_pool=session_pool,
+                    content=full_prompt,
                     mode=DeliveryMode.QUEUE,
                     source="accepted",
                     meta={"from": self._agent_name, "team_id": team_id},
+                    expected_target_session_id=member_session_id,
                 )
+                if not delivery.delivered:
+                    for session_id in created_sessions:
+                        with contextlib.suppress(Exception):
+                            await session_pool.close_session(session_id)
+                    with contextlib.suppress(Exception):
+                        team_state.cleanup(team_id)
+                    return ToolReturn(
+                        return_value=(
+                            f"Failed to activate initial member '{member['name']}' "
+                            "within parallel capacity"
+                        )
+                    )
         except Exception as exc:  # noqa: BLE001
             for sid in created_sessions:
                 with contextlib.suppress(Exception):
@@ -1995,6 +2293,8 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
         session_pool = agent_ctx.host.session_pool
         if session_pool is None:
             return
+        team_id = self._get_team_id(agent_ctx)
+        team_state = self._get_team_state(agent_ctx)
 
         import time
 
@@ -2078,6 +2378,8 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
                                 member_session_id=msid,
                                 lead_session_id=lead_session_id,
                             )
+                    if team_id is not None and team_state is not None:
+                        self._reconcile_run_slot_usage(team_state, team_id, session_pool)
                     # Clear list so cascade close is a no-op.
                     current_session.metadata["team_member_sessions"] = []
                     return  # Cleanup done, exit loop.
@@ -2117,26 +2419,31 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
         if team_state is None:
             return ToolReturn(return_value="Not in a team session")
 
-        from wolfharness.capabilities.file_team_state import FileTeamState
-
         state_path = team_state._state_path(team_id)
         if not state_path.exists():
             return ToolReturn(return_value="Team state not found")
-        state: dict[str, Any] = FileTeamState._read_json(state_path)
-        members: dict[str, dict[str, str]] = state.get("members", {})
-
         session_pool = agent_ctx.host.session_pool
         lead_session_id = agent_ctx.session.session_id
+        member_session_ids = team_state.mark_deleted(team_id)
         if session_pool is not None:
-            for member_info in members.values():
-                sid: str = member_info.get("session_id", "")
+            for sid in member_session_ids:
                 if sid and sid != lead_session_id:
-                    await session_pool.close_session(sid)
+                    try:
+                        await session_pool.close_session(sid)
+                    except Exception:
+                        logger.exception(
+                            "Failed to close Team member Session during deletion",
+                            team_id=team_id,
+                            session_id=sid,
+                        )
 
         # Clear member session IDs from metadata so the auto-cleanup
         # callback (scheduled in team_create) knows manual cleanup was
         # already performed and skips double-closing.
         agent_ctx.session.metadata["team_member_sessions"] = []
+        agent_ctx.session.metadata.pop("team_id", None)
+        agent_ctx.session.metadata.pop("team_name", None)
+        agent_ctx.session.metadata.pop("team_base_dir", None)
 
         team_state.cleanup(team_id)
         return ToolReturn(return_value="Team deleted")
@@ -2251,7 +2558,16 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
 
         from wolfharness.capabilities.file_team_state import FileTeamState
 
-        # Check name not already in team state members.
+        if not isinstance(name, str):
+            return ToolReturn(return_value="Team member name must be a string")
+        if not name.strip():
+            return ToolReturn(return_value="Team member name must be non-empty")
+        if name != name.strip():
+            return ToolReturn(return_value="Team member name must not contain outer whitespace")
+
+        # Read-only early checks avoid unnecessary Session creation. The
+        # authoritative identity and max_members claim happens atomically
+        # after Session creation and before activation.
         state_path = team_state._state_path(team_id)
         if not state_path.exists():
             return ToolReturn(return_value="Team state not found")
@@ -2277,6 +2593,15 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
         session_pool = agent_ctx.host.session_pool
         if session_pool is None:
             return ToolReturn(return_value="SessionPool not available")
+
+        usage = self._reconcile_run_slot_usage(team_state, team_id, session_pool)
+        if usage.active_count >= usage.limit:
+            return ToolReturn(
+                return_value=(
+                    "Team parallel capacity exhausted "
+                    f"({usage.active_count}/{usage.limit}); member was not created"
+                )
+            )
 
         lead_session_id: str = agent_ctx.session.session_id
 
@@ -2315,13 +2640,18 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
         if member_agent is not None:
             member_agent._display_name = name
 
-        # Register member in team state.
-        team_state.register_member(
+        claimed, claim_error = team_state.claim_new_member(
             team_id,
             name,
             member_session_id,
             agent=agent,
+            lead_member_name=lead_member_name,
+            max_members=self._config.bounds.max_members,
         )
+        if not claimed:
+            with contextlib.suppress(Exception):
+                await session_pool.close_session(member_session_id)
+            return ToolReturn(return_value=claim_error)
 
         # Send initial prompt to member (with existing member roster).
         from wolfharness.lifecycle.types import DeliveryMode
@@ -2353,13 +2683,42 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
                 "\n\nRemember to report progress regularly using "
                 '`task_update(technical_note="...")`.'
             )
-        await session_pool.send_message(
-            member_session_id,
-            initial_prompt,
-            mode=DeliveryMode.QUEUE,
-            source="accepted",
-            meta={"from": self._agent_name, "team_id": team_id},
-        )
+        try:
+            delivery = await self._deliver_to_team_member(
+                team_state=team_state,
+                team_id=team_id,
+                member_name=name,
+                session_pool=session_pool,
+                content=initial_prompt,
+                mode=DeliveryMode.QUEUE,
+                source="accepted",
+                meta={"from": self._agent_name, "team_id": team_id},
+                expected_target_session_id=member_session_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            team_state.remove_member(
+                team_id,
+                name,
+                expected_session_id=member_session_id,
+            )
+            with contextlib.suppress(Exception):
+                await session_pool.close_session(member_session_id)
+            return ToolReturn(return_value=f"Failed to activate member '{name}': {exc}")
+        if not delivery.delivered:
+            team_state.remove_member(
+                team_id,
+                name,
+                expected_session_id=member_session_id,
+            )
+            await session_pool.close_session(member_session_id)
+            if delivery.capacity_limited:
+                return ToolReturn(
+                    return_value=(
+                        "Team parallel capacity exhausted "
+                        f"({delivery.active_count}/{delivery.limit}); member was not created"
+                    )
+                )
+            return ToolReturn(return_value=f"Failed to activate member '{name}'")
 
         # Ephemeral lifecycle: schedule auto-close when run completes.
         if lifecycle == "ephemeral":
@@ -2409,9 +2768,12 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
                 existing_sid: str = existing_info.get("session_id", "")
                 if not existing_sid:
                     continue
-                await session_pool.send_message(
-                    existing_sid,
-                    self._wrap_notice_content(broadcast_msg),
+                await self._deliver_to_team_member(
+                    team_state=team_state,
+                    team_id=team_id,
+                    member_name=existing_name,
+                    session_pool=session_pool,
+                    content=self._wrap_notice_content(broadcast_msg),
                     mode=self._notice_mode,
                     source="accepted",
                     meta={"from": self._agent_name, "team_id": team_id},
@@ -2475,8 +2837,6 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
         if team_state is None:
             return ToolReturn(return_value="Not in a team session")
 
-        from wolfharness.capabilities.file_team_state import FileTeamState
-
         member_sid = team_state.get_member_session_id(team_id, member_name)
         if member_sid is None:
             return ToolReturn(return_value=f"Member '{member_name}' not found")
@@ -2485,17 +2845,25 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
         unfinished = self._get_unfinished_tasks(team_state, team_id, member_name)
 
         session_pool = agent_ctx.host.session_pool
+        close_error: Exception | None = None
         if session_pool is not None:
-            await session_pool.close_session(member_sid)
+            try:
+                await session_pool.close_session(member_sid)
+            except Exception as exc:
+                close_error = exc
+                logger.exception(
+                    "Failed to close Team member Session during shutdown",
+                    team_id=team_id,
+                    session_id=member_sid,
+                )
 
-        # Remove from team state: read, delete member, write back.
-        state_path = team_state._state_path(team_id)
-        if state_path.exists():
-            state: dict[str, Any] = FileTeamState._read_json(state_path)
-            members_dict: dict[str, dict[str, Any]] = state.get("members", {})
-            members_dict.pop(member_name, None)
-            state["members"] = members_dict
-            FileTeamState._atomic_write(state_path, state)
+        # Roster and capacity cleanup is independent of Session close
+        # success so a transport/cleanup exception cannot strand the Team.
+        team_state.remove_member(
+            team_id,
+            member_name,
+            expected_session_id=member_sid,
+        )
 
         # Remove from session metadata team_member_sessions.
         team_member_sessions: list[str] = agent_ctx.session.metadata.get(
@@ -2521,6 +2889,14 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
             logger.warning(
                 "Failed to write member_update to blackboard for '%s'",
                 member_name,
+            )
+
+        if close_error is not None:
+            return ToolReturn(
+                return_value=(
+                    f"Removed {member_name} from Team, but Session close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
             )
 
         if unfinished:
@@ -2590,13 +2966,12 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
                 # team_status(watch=True) detects the mtime change
                 # immediately, even if close_session fails below.
                 team_state = FileTeamState(base_dir)
-                state_path = team_state._state_path(team_id)
-                if state_path.exists():
-                    state = team_state._read_json(state_path)
-                    members = state.get("members", {})
-                    members.pop(member_name, None)
-                    state["members"] = members
-                    team_state._atomic_write(state_path, state)
+                if team_state._state_path(team_id).exists():
+                    team_state.remove_member(
+                        team_id,
+                        member_name,
+                        expected_session_id=member_session_id,
+                    )
 
                 # Then close the session — suppress errors so a failing
                 # close does not prevent the state file update above.
@@ -2756,14 +3131,19 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
             from wolfharness.lifecycle.types import DeliveryMode
 
             # Use QUEUE mode: the run is ending, so STEER would be lost.
-            await session_pool.send_message(
-                agent_ctx.session.session_id,
-                self._wrap_notice_content(msg_body),
+            delivery = await self._deliver_to_team_member(
+                team_state=team_state,
+                team_id=team_id,
+                member_name=member_name,
+                session_pool=session_pool,
+                content=self._wrap_notice_content(msg_body),
                 mode=DeliveryMode.QUEUE,
                 source="accepted",
                 meta={"from": "system", "team_id": team_id},
+                expected_target_session_id=agent_ctx.session.session_id,
             )
-            agent_ctx.session.metadata["_task_reminder_count"] = reminder_count + 1
+            if delivery.delivered:
+                agent_ctx.session.metadata["_task_reminder_count"] = reminder_count + 1
 
         return result
 
@@ -2815,6 +3195,18 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
         if not self._config.enabled or not self._session_metadata:
             return None
         role: str = self._session_metadata.get("team_role", "unknown")
+        if role != "lead" and not self._session_metadata.get("team_id"):
+            return None
+        if role == "lead" and not self._session_metadata.get("team_id"):
+            member_name = self._session_metadata.get("team_member_name", self._agent_name)
+            team_name = self._session_metadata.get("team_name", "unknown")
+            return (
+                f"You are `{member_name}` with role `lead`. "
+                f"The proposed Team name is `{team_name}`. "
+                "You may create a Dynamic Team with `team_create`. "
+                "Team messaging and shared-state tools become available only "
+                "after the Team has been created."
+            )
         base = self._config.protocol_template.format(
             team_name=self._session_metadata.get("team_name", "unknown"),
             role=role,
@@ -2874,4 +3266,9 @@ class TeamCommCapability(FunctionToolsetCapability[Any]):
         """
         if not self._config.enabled:
             return []
+        if self._session_metadata and not self._session_metadata.get("team_id"):
+            role: str = self._session_metadata.get("team_role", "")
+            if role != "lead":
+                return []
+            return [tool for tool in self._tools if tool.name == "team_create"]
         return self._tools

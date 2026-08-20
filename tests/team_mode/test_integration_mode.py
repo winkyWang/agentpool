@@ -134,6 +134,7 @@ def _init_team(
             {"name": "translator_agent", "agent": "worker"},
             {"name": "reviewer_agent", "agent": "reviewer"},
         ],
+        max_parallel_members=5,
     )
     state.register_member(team_id, "translator_agent", "sess_translator")
     state.register_member(team_id, "reviewer_agent", "sess_reviewer")

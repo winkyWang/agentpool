@@ -57,6 +57,35 @@ def _make_run_context(
     return ctx
 
 
+def _install_runtime_tracking(mock_pool: MagicMock) -> None:
+    """Give a SessionPool mock authoritative Session and Run state."""
+    runtime_sessions: dict[str, MagicMock] = {}
+
+    def get_session(session_id: str) -> MagicMock:
+        session = runtime_sessions.get(session_id)
+        if session is None:
+            session = MagicMock()
+            session.session_id = session_id
+            session.current_run_id = None
+            session.closing = False
+            session.is_closing = False
+            session.metadata = {"team_role": "member"}
+            runtime_sessions[session_id] = session
+        return session
+
+    async def send_message(session_id: str, *_args: Any, **_kwargs: Any) -> str:
+        get_session(session_id).current_run_id = f"run_{session_id}"
+        return "msg_id"
+
+    async def close_session(session_id: str) -> None:
+        runtime_sessions.pop(session_id, None)
+
+    mock_pool.sessions.get_session.side_effect = get_session
+    mock_pool.send_message = AsyncMock(side_effect=send_message)
+    mock_pool.close_session = AsyncMock(side_effect=close_session)
+    mock_pool.get_run.return_value = None
+
+
 @pytest.mark.integration
 async def test_team_create_with_config_default_members(tmp_path: Any) -> None:
     """Given: TeamCommCapability with defaults config, lead role.
@@ -69,10 +98,9 @@ async def test_team_create_with_config_default_members(tmp_path: Any) -> None:
     config = _make_defaults_config(str(tmp_path))
 
     mock_pool = MagicMock()
-    mock_pool.send_message = AsyncMock(return_value="msg_id")
-    mock_pool.close_session = AsyncMock()
     mock_pool.sessions = MagicMock()
     mock_pool.sessions.get_or_create_session_agent = AsyncMock()
+    _install_runtime_tracking(mock_pool)
     mock_pool.event_bus = None
 
     mock_registry = MagicMock()
@@ -131,10 +159,9 @@ async def test_team_create_config_default_members_graceful_degradation(
     config = _make_defaults_config(str(tmp_path))
 
     mock_pool = MagicMock()
-    mock_pool.send_message = AsyncMock(return_value="msg_id")
-    mock_pool.close_session = AsyncMock()
     mock_pool.sessions = MagicMock()
     mock_pool.sessions.get_or_create_session_agent = AsyncMock()
+    _install_runtime_tracking(mock_pool)
     mock_pool.event_bus = None
     mock_pool.create_child_session = AsyncMock(side_effect=RuntimeError("Session creation failed"))
 
@@ -182,10 +209,9 @@ async def test_team_create_defaults_member_skills_injected(tmp_path: Any) -> Non
     )
 
     mock_pool = MagicMock()
-    mock_pool.send_message = AsyncMock(return_value="msg_id")
-    mock_pool.close_session = AsyncMock()
     mock_pool.sessions = MagicMock()
     mock_pool.sessions.get_or_create_session_agent = AsyncMock()
+    _install_runtime_tracking(mock_pool)
     mock_pool.event_bus = None
 
     child_ids = iter(["child_translator", "child_reviewer"])
@@ -267,10 +293,9 @@ async def test_team_create_defaults_member_instructions_propagated(tmp_path: Any
     )
 
     mock_pool = MagicMock()
-    mock_pool.send_message = AsyncMock(return_value="msg_id")
-    mock_pool.close_session = AsyncMock()
     mock_pool.sessions = MagicMock()
     mock_pool.sessions.get_or_create_session_agent = AsyncMock()
+    _install_runtime_tracking(mock_pool)
     mock_pool.event_bus = None
     mock_pool.create_child_session = AsyncMock(
         side_effect=lambda **kw: MagicMock(session_id="child_translator")
@@ -317,10 +342,9 @@ async def test_team_create_config_default_members_then_delete(tmp_path: Any) -> 
     config = _make_defaults_config(str(tmp_path))
 
     mock_pool = MagicMock()
-    mock_pool.send_message = AsyncMock(return_value="msg_id")
-    mock_pool.close_session = AsyncMock()
     mock_pool.sessions = MagicMock()
     mock_pool.sessions.get_or_create_session_agent = AsyncMock()
+    _install_runtime_tracking(mock_pool)
     mock_pool.event_bus = None
 
     mock_registry = MagicMock()

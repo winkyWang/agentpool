@@ -800,45 +800,52 @@ ctx = AgentContext(
 #### Team State (file-based)
 
 ```
-{base_dir}/teams/{team_id}/
-├── state.json                    # Team runtime state
-├── inboxes/
-│   ├── lead/
-│   │   └── {uuid}.json           # Individual message files
-│   └── {member_name}/
-│       └── {uuid}.json
-├── tasks/
-│   ├── {task_id}.json            # Individual task files
-│   └── .highwatermark            # ID counter
-└── blackboard/
-    ├── glossary.json             # Per-key files
-    ├── outline.json
-    ├── findings/
-    │   ├── ch1.json
-    │   └── ch2.json
-    └── .locks/
-        └── glossary.lock         # File locks (open write policy)
+{base_dir}/teams/
+├── .state-locks/
+│   └── {team_id}.lock            # state.json lifecycle/read-modify-write lock
+└── {team_id}/
+    ├── state.json                    # Team runtime state
+    ├── inboxes/
+    │   ├── lead/
+    │   │   └── {uuid}.json           # Individual message files
+    │   └── {member_name}/
+    │       └── {uuid}.json
+    ├── tasks/
+    │   ├── {task_id}.json            # Individual task files
+    │   └── .highwatermark            # ID counter
+    └── blackboard/
+        ├── glossary.json             # Per-key files
+        ├── outline.json
+        ├── findings/
+        │   ├── ch1.json
+        │   └── ch2.json
+        └── .locks/
+            └── glossary.lock         # File locks (open write policy)
 ```
+
+运行时将 `max_parallel_members` 固化为 Team state 中的单一容量事实，并在
+`active_run_slots` 中按成员保存当前 `run_id` 与 `pending_reservations`。
+成员 Session 的 per-agent 配置 overlay 不能覆盖已经创建的 Team 上限。
 
 #### state.json Schema
 
 ```json
 {
-  "version": 1,
-  "team_id": "uuid",
   "team_name": "translation-team",
   "status": "active",
-  "created_at": 1234567890,
+  "created_at": "2026-08-21T00:00:00+00:00",
   "ended_at": null,
-  "members": [
-    {"name": "lead", "session_id": "ses_...", "agent": "orchestrator", "role": "lead"},
-    {"name": "terminology", "session_id": "ses_...", "agent": "researcher", "role": "member"}
-  ],
-  "bounds": {
-    "max_members": 10,
-    "max_parallel_members": 4,
-    "max_wall_clock_minutes": 120,
-    "max_member_turns": 500
+  "max_parallel_members": 4,
+  "members": {
+    "lead": {"session_id": "ses_lead", "agent": "orchestrator"},
+    "terminology": {"session_id": "ses_member", "agent": "researcher"}
+  },
+  "active_run_slots": {
+    "terminology": {
+      "session_id": "ses_member",
+      "run_id": "run_123",
+      "pending_reservations": {}
+    }
   }
 }
 ```
@@ -1250,10 +1257,11 @@ The mechanisms serve different needs:
 - [ ] Team isolation: all paths scoped by team_id (UUID)
 - [ ] Message size limit: message_max_bytes (default 32KB)
 - [ ] Inbox size limit: inbox_max_bytes (default 256KB)
-- [ ] Team bounds: max_members, max_parallel_members, max_wall_clock_minutes, max_member_turns
+- [x] Team size and parallel bounds: max_members, max_parallel_members
+- [ ] Remaining Team bounds: max_wall_clock_minutes and actual model-turn accounting
 - [ ] TTL cleanup: teams auto-deleted after ttl_hours from end
 - [ ] File atomic writes: tmp + rename for crash safety
-- [ ] File locking: filelock for blackboard concurrent write protection
+- [x] File locking: filelock for blackboard and Team state read-modify-write protection
 
 ### Compliance
 
@@ -1312,7 +1320,7 @@ No specific regulatory requirements. Team state is ephemeral coordination data, 
 ### Rollback Strategy
 
 - `team_mode.enabled: false` in YAML config disables all team_mode functionality
-- `TeamCommCapability.get_tools()` returns empty list when `ctx.host.session_pool` is None (standalone mode) or no `team_id` in session metadata
+- `TeamCommCapability.get_tools()` returns no member tools without `team_id`; a Lead without `team_id` sees only `team_create`
 - No changes to existing `graph:`, `teams:`, or `subagent` code paths
 - All new files can be removed without affecting existing functionality
 - AgentContext new field (`team_mode_config`) defaults to `None` — existing code unaffected

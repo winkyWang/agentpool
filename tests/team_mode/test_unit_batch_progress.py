@@ -44,6 +44,7 @@ def initialized_team(state: FileTeamState) -> FileTeamState:
         team_id="team-1",
         team_name="Test Team",
         members=[{"name": "alice", "agent": "alice"}, {"name": "bob"}],
+        max_parallel_members=5,
     )
     return state
 

@@ -189,6 +189,38 @@ async def test_skeleton_get_tools_returns_empty_when_disabled() -> None:
 
 
 @pytest.mark.unit
+async def test_member_eligible_standalone_session_has_no_team_surface() -> None:
+    """A non-Team member-eligible Session receives no Team tools or protocol."""
+    config = _make_enabled_config()
+    metadata: dict[str, Any] = {
+        "team_role": "member",
+        "team_member_name": "reviewer",
+    }
+    cap = TeamCommCapability(config, "worker", metadata)
+
+    assert cap.get_instructions() is None
+    assert list(await cap.get_tools()) == []
+
+
+@pytest.mark.unit
+async def test_lead_before_team_creation_only_sees_team_create() -> None:
+    """A Lead without team_id can form a Team but cannot use Team state yet."""
+    config = _make_enabled_config()
+    metadata: dict[str, Any] = {
+        "team_role": "lead",
+        "team_member_name": "coordinator",
+    }
+    cap = TeamCommCapability(config, "coordinator", metadata)
+
+    instructions = cap.get_instructions()
+    tools = await cap.get_tools()
+
+    assert instructions is not None
+    assert "team_create" in instructions
+    assert [tool.name for tool in tools] == ["team_create"]
+
+
+@pytest.mark.unit
 def test_skeleton_get_instructions_uses_agent_name_as_default_member() -> None:
     """Given: enabled config + metadata without team_member_name key.
 
@@ -459,6 +491,26 @@ def _make_run_context(
     # Ensure mock pool has needed async methods for _create_member_session.
     # Only set up if not already configured (avoids overriding explicit test setups).
     if session_pool is not None:
+        runtime_sessions: dict[str, MagicMock] = {}
+
+        def get_session(runtime_session_id: str) -> MagicMock:
+            runtime_session = runtime_sessions.get(runtime_session_id)
+            if runtime_session is None:
+                runtime_session = MagicMock()
+                runtime_session.session_id = runtime_session_id
+                runtime_session.current_run_id = None
+                runtime_session.closing = False
+                runtime_session.is_closing = False
+                runtime_session.metadata = {
+                    "team_role": (
+                        "lead"
+                        if runtime_session_id == (session_id or "lead_session_001")
+                        else "member"
+                    )
+                }
+                runtime_sessions[runtime_session_id] = runtime_session
+            return runtime_session
+
         if not isinstance(session_pool.create_child_session, AsyncMock):
             _child_state = MagicMock()
             _child_state.session_id = "child_session"
@@ -469,6 +521,23 @@ def _make_run_context(
         ):
             session_pool.sessions = MagicMock()
             session_pool.sessions.get_or_create_session_agent = AsyncMock()
+        if session_pool.sessions.get_session.side_effect is None:
+            session_pool.sessions.get_session.side_effect = get_session
+        if (
+            isinstance(session_pool.send_message, AsyncMock)
+            and session_pool.send_message.side_effect is None
+        ):
+            configured_result = session_pool.send_message.return_value
+
+            async def send_message(runtime_session_id: str, *_args: Any, **_kwargs: Any) -> Any:
+                runtime_session = get_session(runtime_session_id)
+                runtime_session.current_run_id = f"run_{runtime_session_id}"
+                return configured_result
+
+            session_pool.send_message.side_effect = send_message
+        if not isinstance(session_pool.close_session, AsyncMock):
+            session_pool.close_session = AsyncMock()
+        session_pool.get_run.return_value = None
         # event_bus: set to None unless explicitly configured as MagicMock with publish
         _eb = session_pool.event_bus
         if not (
@@ -499,7 +568,12 @@ def _make_lead_metadata(team_id: str = "team_123") -> dict[str, Any]:
     }
 
 
-def _init_team(base_dir: str, team_id: str = "team_123") -> None:
+def _init_team(
+    base_dir: str,
+    team_id: str = "team_123",
+    *,
+    max_parallel_members: int = 5,
+) -> None:
     """Initialize a real FileTeamState with a team and members."""
     from wolfharness.capabilities.file_team_state import FileTeamState
 
@@ -511,6 +585,7 @@ def _init_team(base_dir: str, team_id: str = "team_123") -> None:
             {"name": "translator_agent", "agent": "worker"},
             {"name": "reviewer_agent", "agent": "reviewer"},
         ],
+        max_parallel_members=max_parallel_members,
     )
     state.register_member(team_id, "translator_agent", "sess_translator")
     state.register_member(team_id, "reviewer_agent", "sess_reviewer")
@@ -666,6 +741,382 @@ async def test_send_message_uses_steer_by_default(tmp_path: Any) -> None:
     assert call_kwargs.kwargs["mode"] is DeliveryMode.STEER
 
 
+@pytest.mark.unit
+async def test_member_activation_enforces_parallel_capacity_and_reuses_active_slot(
+    tmp_path: Any,
+) -> None:
+    """A second idle member is rejected while active-member steer reuses one slot."""
+    _init_team(str(tmp_path), max_parallel_members=1)
+    config = _make_enabled_config(base_dir=str(tmp_path)).model_copy(
+        update={"bounds": TeamBounds(max_members=4, max_parallel_members=1)},
+    )
+    mock_pool = MagicMock()
+    mock_pool.send_message = AsyncMock(return_value="msg_id")
+    ctx = _make_run_context(
+        metadata=_make_lead_metadata(),
+        session_pool=mock_pool,
+        config=config,
+        base_dir=str(tmp_path),
+    )
+    cap = TeamCommCapability(config, "coordinator", _make_lead_metadata())
+
+    first = await cap.send_message(ctx, "translator_agent", "start")
+    second = await cap.send_message(ctx, "reviewer_agent", "start")
+    steer = await cap.send_message(ctx, "translator_agent", "continue")
+    status = await cap.team_status(ctx)
+
+    assert first.return_value == "Message sent to translator_agent"
+    assert "parallel capacity exhausted" in second.return_value
+    assert steer.return_value == "Message sent to translator_agent"
+    assert "Parallel members: 1/1" in status.return_value
+
+
+@pytest.mark.unit
+async def test_concurrent_capability_instances_share_parallel_capacity(tmp_path: Any) -> None:
+    """Per-Session capability instances share one atomic Team capacity limit."""
+    _init_team(str(tmp_path), max_parallel_members=1)
+    config = _make_enabled_config(base_dir=str(tmp_path)).model_copy(
+        update={"bounds": TeamBounds(max_members=4, max_parallel_members=1)},
+    )
+    mock_pool = MagicMock()
+    mock_pool.send_message = AsyncMock(return_value="msg_id")
+    first_ctx = _make_run_context(
+        metadata=_make_lead_metadata(),
+        session_pool=mock_pool,
+        config=config,
+        base_dir=str(tmp_path),
+    )
+    second_ctx = _make_run_context(
+        metadata=_make_lead_metadata(),
+        session_pool=mock_pool,
+        config=config,
+        base_dir=str(tmp_path),
+    )
+    get_session = mock_pool.sessions.get_session
+
+    async def activate_member(session_id: str, *_args: Any, **_kwargs: Any) -> str:
+        await asyncio.sleep(0)
+        get_session(session_id).current_run_id = f"run_{session_id}"
+        return "msg_id"
+
+    mock_pool.send_message.side_effect = activate_member
+    first_cap = TeamCommCapability(config, "coordinator", _make_lead_metadata())
+    second_cap = TeamCommCapability(config, "coordinator", _make_lead_metadata())
+
+    results = await asyncio.gather(
+        first_cap.send_message(first_ctx, "translator_agent", "start"),
+        second_cap.send_message(second_ctx, "reviewer_agent", "start"),
+    )
+
+    return_values = [result.return_value for result in results]
+    assert sum(value.startswith("Message sent") for value in return_values) == 1
+    assert sum("parallel capacity exhausted" in value for value in return_values) == 1
+    assert mock_pool.send_message.await_count == 1
+
+
+@pytest.mark.unit
+async def test_team_persisted_limit_overrides_member_config_overlay(tmp_path: Any) -> None:
+    """A member's looser config cannot override the Team creation limit."""
+    _init_team(str(tmp_path), max_parallel_members=1)
+    lead_config = _make_enabled_config(base_dir=str(tmp_path)).model_copy(
+        update={"bounds": TeamBounds(max_members=4, max_parallel_members=1)},
+    )
+    member_config = _make_enabled_config(base_dir=str(tmp_path)).model_copy(
+        update={"bounds": TeamBounds(max_members=4, max_parallel_members=5)},
+    )
+    mock_pool = MagicMock()
+    mock_pool.send_message = AsyncMock(return_value="msg_id")
+    lead_metadata = _make_lead_metadata()
+    member_metadata = _make_session_metadata()
+    lead_ctx = _make_run_context(
+        metadata=lead_metadata,
+        session_pool=mock_pool,
+        config=lead_config,
+        base_dir=str(tmp_path),
+    )
+    member_ctx = _make_run_context(
+        metadata=member_metadata,
+        session_pool=mock_pool,
+        config=member_config,
+        base_dir=str(tmp_path),
+        session_id="sess_translator",
+    )
+    lead_cap = TeamCommCapability(lead_config, "coordinator", lead_metadata)
+    member_cap = TeamCommCapability(member_config, "worker", member_metadata)
+
+    first = await lead_cap.send_message(lead_ctx, "translator_agent", "start")
+    second = await member_cap.send_message(member_ctx, "reviewer_agent", "start")
+    status = await member_cap.team_status(member_ctx)
+
+    assert first.return_value == "Message sent to translator_agent"
+    assert "parallel capacity exhausted" in second.return_value
+    assert "Parallel members: 1/1" in status.return_value
+    assert mock_pool.send_message.await_count == 1
+
+
+@pytest.mark.unit
+async def test_active_delivery_reservation_blocks_peer_after_old_run_finishes(
+    tmp_path: Any,
+) -> None:
+    """A blocked active-member send keeps its slot across old Run completion."""
+    _init_team(str(tmp_path), max_parallel_members=1)
+    config = _make_enabled_config(base_dir=str(tmp_path))
+    mock_pool = MagicMock()
+    mock_pool.send_message = AsyncMock(return_value="msg_id")
+    metadata = _make_lead_metadata()
+    ctx = _make_run_context(
+        metadata=metadata,
+        session_pool=mock_pool,
+        config=config,
+        base_dir=str(tmp_path),
+    )
+    get_session = mock_pool.sessions.get_session
+    entered_second_send = asyncio.Event()
+    release_second_send = asyncio.Event()
+    send_count = 0
+
+    async def controlled_send(session_id: str, *_args: Any, **_kwargs: Any) -> str:
+        nonlocal send_count
+        send_count += 1
+        session = get_session(session_id)
+        if send_count == 1:
+            session.current_run_id = "run-1"
+            return "msg-1"
+        entered_second_send.set()
+        await release_second_send.wait()
+        session.current_run_id = "run-2"
+        return "msg-2"
+
+    mock_pool.send_message.side_effect = controlled_send
+    cap = TeamCommCapability(config, "coordinator", metadata)
+
+    first = await cap.send_message(ctx, "translator_agent", "start")
+    second_task = asyncio.create_task(
+        cap.send_message(ctx, "translator_agent", "next"),
+    )
+    await entered_second_send.wait()
+    get_session("sess_translator").current_run_id = None
+    status = await cap.team_status(ctx)
+    peer = await cap.send_message(ctx, "reviewer_agent", "start")
+    release_second_send.set()
+    second = await second_task
+    get_session("sess_translator").current_run_id = None
+    await asyncio.sleep(0.02)
+
+    assert first.return_value == "Message sent to translator_agent"
+    assert second.return_value == "Message sent to translator_agent"
+    assert "Parallel members: 1/1" in status.return_value
+    assert "parallel capacity exhausted" in peer.return_value
+    assert mock_pool.send_message.await_count == 2
+
+
+@pytest.mark.unit
+async def test_cancelled_send_releases_pending_parallel_reservation(tmp_path: Any) -> None:
+    """Cancelling a blocked delivery removes only its pending reservation."""
+    from wolfharness.capabilities.file_team_state import FileTeamState
+
+    _init_team(str(tmp_path), max_parallel_members=1)
+    config = _make_enabled_config(base_dir=str(tmp_path))
+    mock_pool = MagicMock()
+    mock_pool.send_message = AsyncMock(return_value="msg_id")
+    metadata = _make_lead_metadata()
+    ctx = _make_run_context(
+        metadata=metadata,
+        session_pool=mock_pool,
+        config=config,
+        base_dir=str(tmp_path),
+    )
+    entered_send = asyncio.Event()
+
+    async def blocked_send(*_args: Any, **_kwargs: Any) -> str:
+        entered_send.set()
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    mock_pool.send_message.side_effect = blocked_send
+    cap = TeamCommCapability(config, "coordinator", metadata)
+    send_task = asyncio.create_task(cap.send_message(ctx, "translator_agent", "start"))
+    await entered_send.wait()
+
+    send_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await send_task
+
+    state = FileTeamState._read_json(FileTeamState(str(tmp_path))._state_path("team_123"))
+    assert state["active_run_slots"] == {}
+
+
+@pytest.mark.unit
+async def test_send_failure_releases_parallel_reservation(tmp_path: Any) -> None:
+    """A failed SessionPool delivery cannot strand a pending run slot."""
+    from wolfharness.capabilities.file_team_state import FileTeamState
+
+    _init_team(str(tmp_path), max_parallel_members=1)
+    config = _make_enabled_config(base_dir=str(tmp_path)).model_copy(
+        update={"bounds": TeamBounds(max_members=4, max_parallel_members=1)},
+    )
+    mock_pool = MagicMock()
+    mock_pool.send_message = AsyncMock(side_effect=RuntimeError("delivery failed"))
+    ctx = _make_run_context(
+        metadata=_make_lead_metadata(),
+        session_pool=mock_pool,
+        config=config,
+        base_dir=str(tmp_path),
+    )
+    cap = TeamCommCapability(config, "coordinator", _make_lead_metadata())
+
+    with pytest.raises(RuntimeError, match="delivery failed"):
+        await cap.send_message(ctx, "translator_agent", "start")
+
+    state = FileTeamState._read_json(FileTeamState(str(tmp_path))._state_path("team_123"))
+    assert state["active_run_slots"] == {}
+
+
+@pytest.mark.unit
+async def test_stale_activation_cannot_target_or_remove_same_name_replacement(
+    tmp_path: Any,
+) -> None:
+    """An old blocked activation cannot mutate a replacement member's identity or slot."""
+    from wolfharness.capabilities.file_team_state import FileTeamState
+    from wolfharness.lifecycle.types import DeliveryMode
+
+    _init_team(str(tmp_path), max_parallel_members=2)
+    config = _make_enabled_config(base_dir=str(tmp_path))
+    mock_pool = MagicMock()
+    old_send_entered = asyncio.Event()
+    release_old_send = asyncio.Event()
+
+    async def controlled_send(session_id: str, *_args: Any, **_kwargs: Any) -> str:
+        if session_id == "sess_translator":
+            old_send_entered.set()
+            await release_old_send.wait()
+            raise RuntimeError("old activation failed")
+        mock_pool.sessions.get_session(session_id).current_run_id = "run-replacement"
+        return "replacement-message"
+
+    mock_pool.send_message = AsyncMock(side_effect=controlled_send)
+    metadata = _make_lead_metadata()
+    _make_run_context(
+        metadata=metadata,
+        session_pool=mock_pool,
+        config=config,
+        base_dir=str(tmp_path),
+    )
+    cap = TeamCommCapability(config, "coordinator", metadata)
+    team_state = FileTeamState(str(tmp_path))
+    delivery_kwargs = {
+        "team_state": team_state,
+        "team_id": "team_123",
+        "member_name": "translator_agent",
+        "session_pool": mock_pool,
+        "content": "initial prompt",
+        "mode": DeliveryMode.QUEUE,
+        "source": "accepted",
+        "meta": {"from": "coordinator", "team_id": "team_123"},
+    }
+
+    old_delivery = asyncio.create_task(
+        cap._deliver_to_team_member(
+            **delivery_kwargs,
+            expected_target_session_id="sess_translator",
+        )
+    )
+    await old_send_entered.wait()
+    assert (
+        team_state.remove_member(
+            "team_123",
+            "translator_agent",
+            expected_session_id="sess_translator",
+        )
+        == "sess_translator"
+    )
+    replacement_claimed, _reason = team_state.claim_new_member(
+        "team_123",
+        "translator_agent",
+        "sess_replacement",
+        agent="worker",
+        lead_member_name="coordinator",
+        max_members=4,
+    )
+    assert replacement_claimed
+    replacement_delivery = await cap._deliver_to_team_member(
+        **delivery_kwargs,
+        expected_target_session_id="sess_replacement",
+    )
+
+    release_old_send.set()
+    with pytest.raises(RuntimeError, match="old activation failed"):
+        await old_delivery
+    assert (
+        team_state.remove_member(
+            "team_123",
+            "translator_agent",
+            expected_session_id="sess_translator",
+        )
+        is None
+    )
+
+    persisted = team_state._read_json(team_state._state_path("team_123"))
+    assert replacement_delivery.delivered
+    assert persisted["members"]["translator_agent"]["session_id"] == "sess_replacement"
+    replacement_slot = persisted["active_run_slots"]["translator_agent"]
+    assert replacement_slot["session_id"] == "sess_replacement"
+
+
+@pytest.mark.unit
+async def test_shutdown_releases_member_parallel_slot(tmp_path: Any) -> None:
+    """Member shutdown removes its persisted run-slot lease."""
+    from wolfharness.capabilities.file_team_state import FileTeamState
+
+    _init_team(str(tmp_path), max_parallel_members=1)
+    config = _make_enabled_config(base_dir=str(tmp_path)).model_copy(
+        update={"bounds": TeamBounds(max_members=4, max_parallel_members=1)},
+    )
+    mock_pool = MagicMock()
+    mock_pool.send_message = AsyncMock(return_value="msg_id")
+    ctx = _make_run_context(
+        metadata=_make_lead_metadata(),
+        session_pool=mock_pool,
+        config=config,
+        base_dir=str(tmp_path),
+    )
+    cap = TeamCommCapability(config, "coordinator", _make_lead_metadata())
+
+    await cap.send_message(ctx, "translator_agent", "start")
+    result = await cap.shutdown_request(ctx, "translator_agent")
+
+    state = FileTeamState._read_json(FileTeamState(str(tmp_path))._state_path("team_123"))
+    assert result.return_value == "Shutdown completed for translator_agent"
+    assert state["active_run_slots"] == {}
+
+
+@pytest.mark.unit
+async def test_shutdown_close_failure_still_releases_roster_and_slot(tmp_path: Any) -> None:
+    """Session close failure cannot strand Team roster or capacity state."""
+    from wolfharness.capabilities.file_team_state import FileTeamState
+
+    _init_team(str(tmp_path), max_parallel_members=1)
+    config = _make_enabled_config(base_dir=str(tmp_path))
+    mock_pool = MagicMock()
+    mock_pool.send_message = AsyncMock(return_value="msg_id")
+    ctx = _make_run_context(
+        metadata=_make_lead_metadata(),
+        session_pool=mock_pool,
+        config=config,
+        base_dir=str(tmp_path),
+    )
+    mock_pool.close_session = AsyncMock(side_effect=RuntimeError("close failed"))
+    cap = TeamCommCapability(config, "coordinator", _make_lead_metadata())
+
+    await cap.send_message(ctx, "translator_agent", "start")
+    result = await cap.shutdown_request(ctx, "translator_agent")
+
+    state = FileTeamState._read_json(FileTeamState(str(tmp_path))._state_path("team_123"))
+    assert "Session close failed" in result.return_value
+    assert "translator_agent" not in state["members"]
+    assert state["active_run_slots"] == {}
+
+
 # ---- T9 Bounds enforcement tests ----
 
 
@@ -709,6 +1160,92 @@ async def test_bounds_max_members_exceeded(tmp_path: Any) -> None:
     assert "exceeds max_members" in result.return_value
     assert "4" in result.return_value
     assert "3" in result.return_value
+
+
+@pytest.mark.unit
+async def test_team_create_parallel_oversize_creates_no_state_or_session(tmp_path: Any) -> None:
+    """Initial activation over max_parallel_members is rejected atomically."""
+    config = _make_enabled_config(
+        member_eligible=["worker"],
+        base_dir=str(tmp_path),
+    ).model_copy(
+        update={"bounds": TeamBounds(max_members=4, max_parallel_members=1)},
+    )
+    mock_pool = MagicMock()
+    mock_pool.create_child_session = AsyncMock()
+    mock_pool.sessions = MagicMock()
+    registry = MagicMock()
+    registry.exists.return_value = True
+    ctx = _make_run_context(
+        metadata=_make_lead_metadata(team_id=""),
+        session_pool=mock_pool,
+        config=config,
+        base_dir=str(tmp_path),
+        agent_registry=registry,
+    )
+    cap = TeamCommCapability(config, "coordinator", _make_lead_metadata(team_id=""))
+
+    result = await cap.team_create(
+        ctx,
+        "oversize",
+        [
+            {"agent": "worker", "name": "first"},
+            {"agent": "worker", "name": "second"},
+        ],
+    )
+
+    assert "exceeds max_parallel_members" in result.return_value
+    mock_pool.create_child_session.assert_not_awaited()
+    assert not (tmp_path / "teams").exists()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("member_names", "expected_error"),
+    [
+        (["duplicate", "duplicate"], "must be unique"),
+        (["coordinator"], "conflicts with Lead"),
+        ([""], "must be non-empty"),
+        (["   "], "must be non-empty"),
+        ([" padded"], "must not contain outer whitespace"),
+        ([None], "must be strings"),
+        ([42], "must be strings"),
+        ([["nested"]], "must be strings"),
+    ],
+)
+async def test_team_create_rejects_invalid_roster_identity_before_side_effects(
+    tmp_path: Any,
+    member_names: list[Any],
+    expected_error: str,
+) -> None:
+    """Invalid roster identities are rejected before state or Session creation."""
+    config = _make_enabled_config(
+        member_eligible=["worker"],
+        base_dir=str(tmp_path),
+    )
+    mock_pool = MagicMock()
+    mock_pool.create_child_session = AsyncMock()
+    registry = MagicMock()
+    registry.exists.return_value = True
+    metadata = _make_lead_metadata(team_id="")
+    ctx = _make_run_context(
+        metadata=metadata,
+        session_pool=mock_pool,
+        config=config,
+        base_dir=str(tmp_path),
+        agent_registry=registry,
+    )
+    cap = TeamCommCapability(config, "coordinator", metadata)
+
+    result = await cap.team_create(
+        ctx,
+        "invalid_roster",
+        [{"agent": "worker", "name": name} for name in member_names],
+    )
+
+    assert expected_error in result.return_value
+    mock_pool.create_child_session.assert_not_awaited()
+    assert not (tmp_path / "teams").exists()
 
 
 @pytest.mark.unit
@@ -1505,19 +2042,47 @@ async def test_team_delete_success(tmp_path: Any) -> None:
     _init_team(str(tmp_path))
     mock_pool = MagicMock()
     mock_pool.close_session = AsyncMock()
+    metadata = _make_lead_metadata()
     ctx = _make_run_context(
-        metadata=_make_lead_metadata(),
+        metadata=metadata,
         session_pool=mock_pool,
         base_dir=str(tmp_path),
     )
     config = _make_enabled_config(base_dir=str(tmp_path))
-    cap = TeamCommCapability(config, "coordinator", _make_lead_metadata())
+    cap = TeamCommCapability(config, "coordinator", metadata)
 
     result = await cap.team_delete(ctx)
+    tools_after_delete = await cap.get_tools()
+    recreated = await cap.team_create(ctx, "replacement_team", [])
 
     assert result.return_value == "Team deleted"
     # Two members registered in _init_team.
     assert mock_pool.close_session.await_count == 2
+    assert [tool.name for tool in tools_after_delete] == ["team_create"]
+    assert recreated.return_value.startswith("Team 'replacement_team' created")
+
+
+@pytest.mark.unit
+async def test_team_delete_continues_after_member_close_failure(tmp_path: Any) -> None:
+    """One close failure cannot prevent deletion of the remaining Team."""
+    _init_team(str(tmp_path))
+    mock_pool = MagicMock()
+    mock_pool.close_session = AsyncMock(side_effect=[RuntimeError("close failed"), None])
+    metadata = _make_lead_metadata()
+    ctx = _make_run_context(
+        metadata=metadata,
+        session_pool=mock_pool,
+        base_dir=str(tmp_path),
+    )
+    config = _make_enabled_config(base_dir=str(tmp_path))
+    cap = TeamCommCapability(config, "coordinator", metadata)
+
+    result = await cap.team_delete(ctx)
+
+    assert result.return_value == "Team deleted"
+    assert mock_pool.close_session.await_count == 2
+    assert "team_id" not in metadata
+    assert not (tmp_path / "teams" / "team_123").exists()
 
 
 @pytest.mark.unit
@@ -2224,6 +2789,19 @@ async def test_team_add_member_duplicate_name(tmp_path: Any) -> None:
     result = await cap.team_add_member(ctx, "translator_agent", "worker")
 
     assert result.return_value == "Member 'translator_agent' already exists"
+
+
+@pytest.mark.unit
+async def test_team_add_member_rejects_invalid_name_before_session_creation(
+    tmp_path: Any,
+) -> None:
+    """A malformed dynamic roster identity has no Session side effects."""
+    cap, ctx, mock_pool, _mock_delegation, _mock_registry = _make_add_member_setup(tmp_path)
+
+    result = await cap.team_add_member(ctx, " padded", "worker")
+
+    assert "must not contain outer whitespace" in result.return_value
+    mock_pool.create_child_session.assert_not_awaited()
 
 
 @pytest.mark.unit

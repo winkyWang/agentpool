@@ -16,16 +16,32 @@ import pytest
 from wolfharness.capabilities.file_team_state import (
     FileTeamState,
     TaskRecord,
+    TeamMemberRuntime,
     format_task_xml,
     start_team_cleanup_task,
 )
 
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
 pytestmark = pytest.mark.unit
+
+
+def _runtime_resolver(
+    runtime_members: dict[str, TeamMemberRuntime],
+) -> Callable[[str, str], TeamMemberRuntime | None]:
+    """Adapt deterministic runtime fixtures to the locked resolver contract."""
+
+    def resolve(member_name: str, session_id: str) -> TeamMemberRuntime | None:
+        runtime = runtime_members.get(member_name)
+        if runtime is None or runtime.session_id != session_id:
+            return None
+        return runtime
+
+    return resolve
 
 
 # ------------------------------------------------------------------
@@ -46,6 +62,7 @@ def initialized_team(state: FileTeamState) -> FileTeamState:
         team_id="team-1",
         team_name="Test Team",
         members=[{"name": "alice", "agent": "alice"}, {"name": "bob"}],
+        max_parallel_members=1,
     )
     return state
 
@@ -57,7 +74,7 @@ def initialized_team(state: FileTeamState) -> FileTeamState:
 
 def test_init_creates_directory_structure(state: FileTeamState, tmp_path: Path) -> None:
     """Given init, the full directory tree and state.json exist."""
-    state.init("team-1", "Test Team", [{"name": "alice"}])
+    state.init("team-1", "Test Team", [{"name": "alice"}], max_parallel_members=5)
 
     team_dir = tmp_path / "teams" / "team-1"
     assert team_dir.is_dir()
@@ -70,7 +87,12 @@ def test_init_creates_directory_structure(state: FileTeamState, tmp_path: Path) 
 
 def test_init_state_json_contents(state: FileTeamState) -> None:
     """Given init, state.json has correct metadata fields."""
-    state.init("team-1", "My Team", [{"name": "alice"}, {"name": "bob"}])
+    state.init(
+        "team-1",
+        "My Team",
+        [{"name": "alice"}, {"name": "bob"}],
+        max_parallel_members=5,
+    )
 
     state_data = json.loads(
         (state._team_dir("team-1") / "state.json").read_text(),
@@ -81,6 +103,269 @@ def test_init_state_json_contents(state: FileTeamState) -> None:
     assert "created_at" in state_data
     assert "alice" in state_data["members"]
     assert "bob" in state_data["members"]
+    assert state_data["active_run_slots"] == {}
+    assert state_data["max_parallel_members"] == 5
+
+
+@pytest.mark.unit
+async def test_parallel_slot_reservation_is_atomic_across_idle_members(
+    initialized_team: FileTeamState,
+) -> None:
+    """Concurrent idle-member activation cannot exceed one Team run slot."""
+    initialized_team.register_member("team-1", "alice", "sess-alice")
+    initialized_team.register_member("team-1", "bob", "sess-bob")
+    runtime = {
+        "alice": TeamMemberRuntime(session_id="sess-alice", run_id=None),
+        "bob": TeamMemberRuntime(session_id="sess-bob", run_id=None),
+    }
+
+    async def reserve(member_name: str, session_id: str) -> bool:
+        result = await asyncio.to_thread(
+            initialized_team.reserve_run_slot,
+            "team-1",
+            member_name,
+            session_id,
+            _runtime_resolver(runtime),
+        )
+        return result.accepted
+
+    accepted = await asyncio.gather(
+        reserve("alice", "sess-alice"),
+        reserve("bob", "sess-bob"),
+    )
+
+    assert accepted.count(True) == 1
+    assert accepted.count(False) == 1
+
+
+def test_pending_member_activation_cannot_share_reservation_token(
+    initialized_team: FileTeamState,
+) -> None:
+    """A second delivery cannot enter an idle member's activation window."""
+    initialized_team.register_member("team-1", "alice", "sess-alice")
+    runtime = {"alice": TeamMemberRuntime(session_id="sess-alice", run_id=None)}
+
+    first = initialized_team.reserve_run_slot(
+        "team-1",
+        "alice",
+        "sess-alice",
+        _runtime_resolver(runtime),
+    )
+    second = initialized_team.reserve_run_slot(
+        "team-1",
+        "alice",
+        "sess-alice",
+        _runtime_resolver(runtime),
+    )
+
+    assert first.accepted is True
+    assert second.accepted is False
+    assert second.activation_in_progress is True
+
+
+def test_active_member_reuses_capacity_with_new_aba_safe_token(
+    initialized_team: FileTeamState,
+) -> None:
+    """Active steer refreshes the token and an old watcher cannot release it."""
+    initialized_team.register_member("team-1", "alice", "sess-alice")
+    idle = {"alice": TeamMemberRuntime(session_id="sess-alice", run_id=None)}
+    first = initialized_team.reserve_run_slot(
+        "team-1",
+        "alice",
+        "sess-alice",
+        _runtime_resolver(idle),
+    )
+    assert first.reservation_id is not None
+    assert initialized_team.complete_run_slot_delivery(
+        "team-1",
+        "alice",
+        first.reservation_id,
+        run_id="run-1",
+    )
+
+    active = {"alice": TeamMemberRuntime(session_id="sess-alice", run_id="run-1")}
+    second = initialized_team.reserve_run_slot(
+        "team-1",
+        "alice",
+        "sess-alice",
+        _runtime_resolver(active),
+    )
+
+    assert second.accepted is True
+    assert second.active_count == 1
+    assert second.reservation_id != first.reservation_id
+    assert (
+        initialized_team.release_run_slot(
+            "team-1",
+            "alice",
+            reservation_id=first.reservation_id,
+        )
+        is False
+    )
+
+
+def test_pending_active_member_delivery_survives_old_run_completion(
+    initialized_team: FileTeamState,
+) -> None:
+    """An active member keeps capacity while its next delivery is in flight."""
+    initialized_team.register_member("team-1", "alice", "sess-alice")
+    initialized_team.register_member("team-1", "bob", "sess-bob")
+    idle_alice = {"alice": TeamMemberRuntime(session_id="sess-alice", run_id=None)}
+    first = initialized_team.reserve_run_slot(
+        "team-1",
+        "alice",
+        "sess-alice",
+        _runtime_resolver(idle_alice),
+    )
+    assert first.reservation_id is not None
+    initialized_team.complete_run_slot_delivery(
+        "team-1",
+        "alice",
+        first.reservation_id,
+        run_id="run-1",
+    )
+
+    active_alice = {
+        "alice": TeamMemberRuntime(session_id="sess-alice", run_id="run-1"),
+        "bob": TeamMemberRuntime(session_id="sess-bob", run_id=None),
+    }
+    second = initialized_team.reserve_run_slot(
+        "team-1",
+        "alice",
+        "sess-alice",
+        _runtime_resolver(active_alice),
+    )
+    assert second.reservation_id is not None
+
+    both_idle = {
+        "alice": TeamMemberRuntime(session_id="sess-alice", run_id=None),
+        "bob": TeamMemberRuntime(session_id="sess-bob", run_id=None),
+    }
+    usage = initialized_team.reconcile_run_slots(
+        "team-1",
+        _runtime_resolver(both_idle),
+    )
+    bob = initialized_team.reserve_run_slot(
+        "team-1",
+        "bob",
+        "sess-bob",
+        _runtime_resolver(both_idle),
+    )
+
+    assert usage.active_count == 1
+    assert bob.accepted is False
+    assert initialized_team.complete_run_slot_delivery(
+        "team-1",
+        "alice",
+        second.reservation_id,
+        run_id="run-2",
+    )
+
+
+def test_idle_bound_slot_is_reconciled_and_remove_member_clears_slot(
+    initialized_team: FileTeamState,
+) -> None:
+    """Idle completed Runs and removed members cannot retain capacity."""
+    initialized_team.register_member("team-1", "alice", "sess-alice")
+    idle = {"alice": TeamMemberRuntime(session_id="sess-alice", run_id=None)}
+    reservation = initialized_team.reserve_run_slot(
+        "team-1",
+        "alice",
+        "sess-alice",
+        _runtime_resolver(idle),
+    )
+    assert reservation.reservation_id is not None
+    initialized_team.complete_run_slot_delivery(
+        "team-1",
+        "alice",
+        reservation.reservation_id,
+        run_id="run-1",
+    )
+
+    usage = initialized_team.reconcile_run_slots(
+        "team-1",
+        _runtime_resolver(idle),
+    )
+    assert usage.active_count == 0
+    assert usage.removed_stale_count == 1
+
+    replacement = initialized_team.reserve_run_slot(
+        "team-1",
+        "alice",
+        "sess-alice",
+        _runtime_resolver(idle),
+    )
+    assert replacement.accepted is True
+    assert initialized_team.remove_member("team-1", "alice") == "sess-alice"
+    state_data = FileTeamState._read_json(initialized_team._state_path("team-1"))
+    assert "alice" not in state_data["active_run_slots"]
+
+
+def test_other_atomic_state_mutations_preserve_pending_slot(
+    initialized_team: FileTeamState,
+) -> None:
+    """Roster and budget mutations cannot overwrite a concurrent reservation."""
+    initialized_team.register_member("team-1", "alice", "sess-alice")
+    runtime = {"alice": TeamMemberRuntime(session_id="sess-alice", run_id=None)}
+    reservation = initialized_team.reserve_run_slot(
+        "team-1",
+        "alice",
+        "sess-alice",
+        _runtime_resolver(runtime),
+    )
+    assert reservation.reservation_id is not None
+
+    initialized_team.register_member("team-1", "bob", "sess-bob")
+    initialized_team.increment_member_turn_if_below(
+        "team-1",
+        "bob",
+        max_member_turns=4,
+    )
+    initialized_team.set_started_at("team-1", "2026-08-20T00:00:00+00:00")
+
+    state_data = FileTeamState._read_json(initialized_team._state_path("team-1"))
+    assert (
+        reservation.reservation_id
+        in state_data["active_run_slots"]["alice"]["pending_reservations"]
+    )
+
+
+def test_pending_slot_is_not_time_reclaimed_and_deleted_team_cannot_readopt(
+    initialized_team: FileTeamState,
+) -> None:
+    """Live pending sends persist until completion and deletion stops admission."""
+    initialized_team.register_member("team-1", "alice", "sess-alice")
+    runtime = {"alice": TeamMemberRuntime(session_id="sess-alice", run_id=None)}
+    reservation = initialized_team.reserve_run_slot(
+        "team-1",
+        "alice",
+        "sess-alice",
+        _runtime_resolver(runtime),
+    )
+    assert reservation.accepted is True
+
+    usage = initialized_team.reconcile_run_slots(
+        "team-1",
+        _runtime_resolver(runtime),
+    )
+    assert usage.active_count == 1
+    assert usage.removed_stale_count == 0
+
+    initialized_team.mark_deleted("team-1")
+    active = {"alice": TeamMemberRuntime(session_id="sess-alice", run_id="run-1")}
+    deleted_usage = initialized_team.reconcile_run_slots(
+        "team-1",
+        _runtime_resolver(active),
+    )
+    rejected = initialized_team.reserve_run_slot(
+        "team-1",
+        "alice",
+        "sess-alice",
+        _runtime_resolver(active),
+    )
+    assert deleted_usage.active_count == 0
+    assert rejected.accepted is False
+    assert rejected.active_count == 0
 
 
 # ------------------------------------------------------------------
@@ -399,7 +684,7 @@ def test_cleanup_expired_teams_removes_old_deleted(
     tmp_path: Path,
 ) -> None:
     """Given a deleted team older than TTL, it is removed."""
-    state.init("old-team", "Old", [{"name": "alice"}])
+    state.init("old-team", "Old", [{"name": "alice"}], max_parallel_members=5)
 
     # Mark as deleted with an old ended_at timestamp.
     state_path = tmp_path / "teams" / "old-team" / "state.json"
@@ -424,7 +709,7 @@ def test_cleanup_expired_teams_preserves_active(
     tmp_path: Path,
 ) -> None:
     """Given an active team, it is not removed by cleanup_expired_teams."""
-    state.init("active-team", "Active", [{"name": "alice"}])
+    state.init("active-team", "Active", [{"name": "alice"}], max_parallel_members=5)
 
     removed = FileTeamState.cleanup_expired_teams(str(tmp_path), ttl_hours=1)
     assert removed == 0
@@ -473,7 +758,7 @@ def test_cleanup_marks_orphaned_active_old(
     tmp_path: Path,
 ) -> None:
     """Given an active team older than TTL with no ended_at, it is marked orphaned."""
-    state.init("stale-team", "Stale", [{"name": "alice"}])
+    state.init("stale-team", "Stale", [{"name": "alice"}], max_parallel_members=5)
 
     state_path = tmp_path / "teams" / "stale-team" / "state.json"
     state_data = json.loads(state_path.read_text())
@@ -500,7 +785,7 @@ def test_cleanup_preserves_active_recent(
     tmp_path: Path,
 ) -> None:
     """Given a recently created active team, it is not modified by cleanup."""
-    state.init("fresh-team", "Fresh", [{"name": "alice"}])
+    state.init("fresh-team", "Fresh", [{"name": "alice"}], max_parallel_members=5)
 
     removed = FileTeamState.cleanup_expired_teams(str(tmp_path), ttl_hours=24)
     assert removed == 0
@@ -522,7 +807,7 @@ def test_cleanup_returns_correct_count(
 ) -> None:
     """Given multiple teams (some expired, some not), cleanup returns correct count."""
     # Team 1: deleted and old -> removed
-    state.init("old-deleted", "Old", [{"name": "alice"}])
+    state.init("old-deleted", "Old", [{"name": "alice"}], max_parallel_members=5)
     sp = tmp_path / "teams" / "old-deleted" / "state.json"
     sd = json.loads(sp.read_text())
     sd["status"] = "deleted"
@@ -532,7 +817,7 @@ def test_cleanup_returns_correct_count(
     sp.write_text(json.dumps(sd, default=str))
 
     # Team 2: deleted but recent -> preserved
-    state.init("recent-deleted", "Recent", [{"name": "alice"}])
+    state.init("recent-deleted", "Recent", [{"name": "alice"}], max_parallel_members=5)
     sp = tmp_path / "teams" / "recent-deleted" / "state.json"
     sd = json.loads(sp.read_text())
     sd["status"] = "deleted"
@@ -540,7 +825,7 @@ def test_cleanup_returns_correct_count(
     sp.write_text(json.dumps(sd, default=str))
 
     # Team 3: active and old -> orphaned, preserved
-    state.init("old-active", "OldActive", [{"name": "alice"}])
+    state.init("old-active", "OldActive", [{"name": "alice"}], max_parallel_members=5)
     sp = tmp_path / "teams" / "old-active" / "state.json"
     sd = json.loads(sp.read_text())
     sd["created_at"] = (
@@ -565,7 +850,7 @@ def test_cleanup_does_not_orphan_with_ended_at(
     tmp_path: Path,
 ) -> None:
     """Given an old active team with ended_at set, it is not orphaned."""
-    state.init("ended-team", "Ended", [{"name": "alice"}])
+    state.init("ended-team", "Ended", [{"name": "alice"}], max_parallel_members=5)
 
     state_path = tmp_path / "teams" / "ended-team" / "state.json"
     state_data = json.loads(state_path.read_text())
@@ -592,7 +877,7 @@ async def test_start_team_cleanup_task_cancellable(
     tmp_path: Path,
 ) -> None:
     """Given start_team_cleanup_task, the returned task can be cancelled."""
-    state.init("active-team-2", "Active", [{"name": "alice"}])
+    state.init("active-team-2", "Active", [{"name": "alice"}], max_parallel_members=5)
 
     task = await start_team_cleanup_task(
         base_dir=str(tmp_path),
@@ -788,3 +1073,109 @@ async def test_concurrent_register_member_preserves_all_members(
     for m in members:
         sid = initialized_team.get_member_session_id("team-1", m)
         assert sid == f"session-{m}", f"Member {m} lost during concurrent registration"
+
+
+@pytest.mark.parametrize(
+    "member_names",
+    [
+        ("new_member", "new_member"),
+        ("first_member", "second_member"),
+    ],
+)
+async def test_claim_new_member_is_atomic_for_identity_and_max_members(
+    state: FileTeamState,
+    member_names: tuple[str, str],
+) -> None:
+    """Concurrent dynamic additions cannot overwrite identity or exceed max_members."""
+    state.init(
+        "team-claim",
+        "Claim Team",
+        [],
+        max_parallel_members=4,
+    )
+    state.register_member("team-claim", "lead", "session-lead", agent="coordinator")
+
+    async def claim(member_name: str, session_id: str) -> tuple[bool, str]:
+        return await asyncio.to_thread(
+            state.claim_new_member,
+            "team-claim",
+            member_name,
+            session_id,
+            agent="worker",
+            lead_member_name="lead",
+            max_members=1,
+        )
+
+    results = await asyncio.gather(
+        claim(member_names[0], "session-first"),
+        claim(member_names[1], "session-second"),
+    )
+
+    assert sum(accepted for accepted, _reason in results) == 1
+    persisted = state._read_json(state._state_path("team-claim"))["members"]
+    assert len([name for name in persisted if name != "lead"]) == 1
+    if member_names[0] == member_names[1]:
+        assert persisted[member_names[0]]["session_id"] in {
+            "session-first",
+            "session-second",
+        }
+
+
+def test_stale_member_cleanup_cannot_remove_same_name_replacement(
+    state: FileTeamState,
+) -> None:
+    """Compare-and-remove preserves a replacement roster entry and run slot."""
+    state.init(
+        "team-aba",
+        "Replacement Team",
+        [],
+        max_parallel_members=1,
+    )
+    state.register_member("team-aba", "lead", "session-lead", agent="coordinator")
+    claimed, _reason = state.claim_new_member(
+        "team-aba",
+        "worker",
+        "session-old",
+        agent="worker",
+        lead_member_name="lead",
+        max_members=1,
+    )
+    assert claimed
+    assert (
+        state.remove_member(
+            "team-aba",
+            "worker",
+            expected_session_id="session-old",
+        )
+        == "session-old"
+    )
+    replacement_claimed, _reason = state.claim_new_member(
+        "team-aba",
+        "worker",
+        "session-new",
+        agent="worker",
+        lead_member_name="lead",
+        max_members=1,
+    )
+    assert replacement_claimed
+    reservation = state.reserve_run_slot(
+        "team-aba",
+        "worker",
+        "session-new",
+        _runtime_resolver({
+            "worker": TeamMemberRuntime(session_id="session-new", run_id=None),
+        }),
+    )
+    assert reservation.accepted
+
+    assert (
+        state.remove_member(
+            "team-aba",
+            "worker",
+            expected_session_id="session-old",
+        )
+        is None
+    )
+    persisted = state._read_json(state._state_path("team-aba"))
+    assert persisted["members"]["worker"]["session_id"] == "session-new"
+    assert persisted["active_run_slots"]["worker"]["session_id"] == "session-new"

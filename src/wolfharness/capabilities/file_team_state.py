@@ -14,6 +14,7 @@ Directory layout::
         tasks/
         blackboard/
         blackboard/.locks/
+    {base_dir}/teams/.state-locks/{team_id}.lock
 """
 
 from __future__ import annotations
@@ -26,15 +27,22 @@ import json
 from pathlib import Path
 import re
 import shutil
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import uuid
 
 from filelock import FileLock
 
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
 __all__ = [
     "FileTeamState",
     "TaskRecord",
+    "TeamMemberRuntime",
+    "TeamRunSlotReservation",
+    "TeamRunSlotUsage",
     "format_owner_summary",
     "format_task_xml",
     "start_team_cleanup_task",
@@ -83,6 +91,34 @@ class TaskRecord:
             progress_current=data.get("progress_current"),
             progress_total=data.get("progress_total"),
         )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TeamMemberRuntime:
+    """SessionPool snapshot used to reconcile one Team member run slot."""
+
+    session_id: str
+    run_id: str | None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TeamRunSlotReservation:
+    """Result of atomically reserving capacity for one member delivery."""
+
+    accepted: bool
+    reservation_id: str | None
+    active_count: int
+    limit: int
+    activation_in_progress: bool = False
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TeamRunSlotUsage:
+    """Reconciled Dynamic Team non-Lead run-slot usage."""
+
+    active_count: int
+    limit: int
+    removed_stale_count: int
 
 
 def format_task_xml(
@@ -183,8 +219,9 @@ class FileTeamState:
 
     def _state_lock(self, team_id: str) -> FileLock:
         """Return a file lock protecting state.json read-modify-write cycles."""
-        self._locks_dir(team_id).mkdir(parents=True, exist_ok=True)
-        return FileLock(str(self._locks_dir(team_id) / "state.lock"))
+        state_locks_dir = self._teams_dir() / ".state-locks"
+        state_locks_dir.mkdir(parents=True, exist_ok=True)
+        return FileLock(str(state_locks_dir / f"{team_id}.lock"))
 
     # ------------------------------------------------------------------
     # Atomic write helper
@@ -216,6 +253,8 @@ class FileTeamState:
         team_id: str,
         team_name: str,
         members: list[dict[str, str]],
+        *,
+        max_parallel_members: int,
     ) -> None:
         """Create the team directory structure and initial state.json.
 
@@ -223,7 +262,11 @@ class FileTeamState:
             team_id: Unique team identifier (used as directory name).
             team_name: Human-readable team name.
             members: List of member dicts, each with at least ``name``.
+            max_parallel_members: Immutable non-Lead Run capacity for this Team.
         """
+        if max_parallel_members < 1:
+            msg = "max_parallel_members must be at least 1"
+            raise ValueError(msg)
         team_dir = self._team_dir(team_id)
         team_dir.mkdir(parents=True, exist_ok=True)
         self._inbox_dir(team_id, "_").parent.mkdir(parents=True, exist_ok=True)
@@ -242,6 +285,8 @@ class FileTeamState:
         state: dict[str, Any] = {
             "team_name": team_name,
             "members": members_map,
+            "active_run_slots": {},
+            "max_parallel_members": max_parallel_members,
             "status": "active",
             "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
             "ended_at": None,
@@ -279,6 +324,45 @@ class FileTeamState:
                 members[member_name]["agent"] = agent
             self._atomic_write(self._state_path(team_id), state)
 
+    def claim_new_member(
+        self,
+        team_id: str,
+        member_name: str,
+        session_id: str,
+        *,
+        agent: str,
+        lead_member_name: str,
+        max_members: int,
+    ) -> tuple[bool, str]:
+        """Atomically claim a new roster identity within ``max_members``.
+
+        The Session is created before this claim but is not activated until
+        the claim succeeds. A losing caller can therefore close its inactive
+        Session without ever overwriting another member or starting a Run.
+        """
+        with self._state_lock(team_id):
+            state_path = self._state_path(team_id)
+            if not state_path.exists():
+                return False, "Team state not found"
+            state = self._read_json(state_path)
+            if state.get("status") != "active":
+                return False, "Team is not active"
+            members: dict[str, dict[str, Any]] = state.get("members", {})
+            if member_name in members:
+                return False, f"Member '{member_name}' already exists"
+            non_lead_count = sum(1 for name in members if name != lead_member_name)
+            if non_lead_count >= max_members:
+                return (
+                    False,
+                    f"Team exceeds max_members ({non_lead_count + 1} > {max_members})",
+                )
+            members[member_name] = {
+                "agent": agent,
+                "session_id": session_id,
+            }
+            self._atomic_write(state_path, state)
+            return True, ""
+
     def get_member_session_id(self, team_id: str, member_name: str) -> str | None:
         """Return the session_id for a member, or ``None`` if not registered.
 
@@ -293,6 +377,322 @@ class FileTeamState:
             return None
         sid: str = member.get("session_id", "")
         return sid if sid else None
+
+    def remove_member(
+        self,
+        team_id: str,
+        member_name: str,
+        *,
+        expected_session_id: str | None = None,
+    ) -> str | None:
+        """Atomically remove a member and any run slot owned by it.
+
+        When ``expected_session_id`` is provided, a same-name replacement is
+        preserved. This compare-and-remove contract prevents an old cleanup
+        callback from deleting a newer member Session and its capacity slot.
+
+        Returns:
+            Removed member Session identifier, or ``None`` when absent.
+        """
+        with self._state_lock(team_id):
+            state_path = self._state_path(team_id)
+            if not state_path.exists():
+                return None
+            state = self._read_json(state_path)
+            members: dict[str, dict[str, Any]] = state.get("members", {})
+            member = members.get(member_name)
+            if member is None:
+                return None
+            session_id = str(member.get("session_id", ""))
+            if expected_session_id is not None and session_id != expected_session_id:
+                return None
+            members.pop(member_name)
+            slots: dict[str, dict[str, Any]] = state.setdefault("active_run_slots", {})
+            slots.pop(member_name, None)
+            self._atomic_write(self._state_path(team_id), state)
+            return session_id or None
+
+    def increment_member_turn_if_below(
+        self,
+        team_id: str,
+        member_name: str,
+        *,
+        max_member_turns: int,
+    ) -> tuple[bool, int]:
+        """Atomically claim one configured member-message turn."""
+        with self._state_lock(team_id):
+            state = self._read_json(self._state_path(team_id))
+            members: dict[str, dict[str, Any]] = state.get("members", {})
+            member = members.get(member_name)
+            if member is None:
+                return False, 0
+            turn_count = int(member.get("turn_count", 0))
+            if turn_count >= max_member_turns:
+                return False, turn_count
+            member["turn_count"] = turn_count + 1
+            self._atomic_write(self._state_path(team_id), state)
+            return True, turn_count + 1
+
+    def set_started_at(self, team_id: str, started_at: str) -> None:
+        """Atomically record the Team wall-clock origin."""
+        with self._state_lock(team_id):
+            state = self._read_json(self._state_path(team_id))
+            state["started_at"] = started_at
+            self._atomic_write(self._state_path(team_id), state)
+
+    def mark_deleted(self, team_id: str) -> list[str]:
+        """Atomically stop new reservations and clear all active run slots."""
+        with self._state_lock(team_id):
+            state = self._read_json(self._state_path(team_id))
+            state["status"] = "deleted"
+            state["ended_at"] = datetime.datetime.now(datetime.UTC).isoformat()
+            state["active_run_slots"] = {}
+            members: dict[str, dict[str, Any]] = state.get("members", {})
+            session_ids = [
+                session_id
+                for member in members.values()
+                if (session_id := str(member.get("session_id", "")))
+            ]
+            self._atomic_write(self._state_path(team_id), state)
+            return session_ids
+
+    @staticmethod
+    def _runtime_members_locked(
+        state: dict[str, Any],
+        runtime_resolver: Callable[[str, str], TeamMemberRuntime | None],
+    ) -> dict[str, TeamMemberRuntime]:
+        """Resolve the current roster while the caller holds the state lock."""
+        runtime_members: dict[str, TeamMemberRuntime] = {}
+        members: dict[str, dict[str, Any]] = state.get("members", {})
+        for member_name, member in members.items():
+            session_id = str(member.get("session_id", ""))
+            if not session_id:
+                continue
+            runtime = runtime_resolver(member_name, session_id)
+            if runtime is not None and runtime.session_id == session_id:
+                runtime_members[member_name] = runtime
+        return runtime_members
+
+    @staticmethod
+    def _reconcile_run_slots_locked(
+        state: dict[str, Any],
+        runtime_members: dict[str, TeamMemberRuntime],
+    ) -> int:
+        """Reconcile persisted run slots against a SessionPool snapshot.
+
+        The caller must hold :meth:`_state_lock` for the Team.
+
+        Returns:
+            Number of stale records removed.
+        """
+        slots: dict[str, dict[str, Any]] = state.setdefault("active_run_slots", {})
+        removed = 0
+        for member_name, slot in list(slots.items()):
+            runtime = runtime_members.get(member_name)
+            session_id: str = slot.get("session_id", "")
+            if runtime is None or runtime.session_id != session_id:
+                slots.pop(member_name, None)
+                removed += 1
+                continue
+            if runtime.run_id is not None:
+                slot["run_id"] = runtime.run_id
+                continue
+            pending_reservations: dict[str, str] = slot.setdefault(
+                "pending_reservations",
+                {},
+            )
+            if pending_reservations:
+                continue
+            slots.pop(member_name, None)
+            removed += 1
+
+        for member_name, runtime in runtime_members.items():
+            if runtime.run_id is None or member_name in slots:
+                continue
+            slots[member_name] = {
+                "session_id": runtime.session_id,
+                "pending_reservations": {},
+                "run_id": runtime.run_id,
+            }
+        state["active_run_slots"] = slots
+        return removed
+
+    def reserve_run_slot(
+        self,
+        team_id: str,
+        member_name: str,
+        session_id: str,
+        runtime_resolver: Callable[[str, str], TeamMemberRuntime | None],
+    ) -> TeamRunSlotReservation:
+        """Atomically reserve or reuse a non-Lead member run slot."""
+        with self._state_lock(team_id):
+            state_path = self._state_path(team_id)
+            state = self._read_json(state_path) if state_path.exists() else None
+            max_parallel_members = int(state.get("max_parallel_members", 0)) if state else 0
+            if state is None or state.get("status") != "active":
+                return TeamRunSlotReservation(
+                    accepted=False,
+                    reservation_id=None,
+                    active_count=0,
+                    limit=max_parallel_members,
+                )
+            members: dict[str, dict[str, Any]] = state.get("members", {})
+            member = members.get(member_name)
+            if member is None or str(member.get("session_id", "")) != session_id:
+                return TeamRunSlotReservation(
+                    accepted=False,
+                    reservation_id=None,
+                    active_count=len(state.get("active_run_slots", {})),
+                    limit=max_parallel_members,
+                )
+            runtime_members = self._runtime_members_locked(state, runtime_resolver)
+            self._reconcile_run_slots_locked(state, runtime_members)
+            slots: dict[str, dict[str, Any]] = state["active_run_slots"]
+            slot = slots.get(member_name)
+            if slot is not None:
+                runtime = runtime_members.get(member_name)
+                if runtime is None or runtime.run_id is None:
+                    self._atomic_write(self._state_path(team_id), state)
+                    return TeamRunSlotReservation(
+                        accepted=False,
+                        reservation_id=None,
+                        active_count=len(slots),
+                        limit=max_parallel_members,
+                        activation_in_progress=True,
+                    )
+                reservation_id = f"slot_{uuid.uuid4().hex}"
+                pending_reservations: dict[str, str] = slot.setdefault(
+                    "pending_reservations",
+                    {},
+                )
+                pending_reservations[reservation_id] = datetime.datetime.now(
+                    datetime.UTC
+                ).isoformat()
+                slot["run_id"] = runtime.run_id
+                self._atomic_write(self._state_path(team_id), state)
+                return TeamRunSlotReservation(
+                    accepted=True,
+                    reservation_id=reservation_id,
+                    active_count=len(slots),
+                    limit=max_parallel_members,
+                )
+            if len(slots) >= max_parallel_members:
+                self._atomic_write(self._state_path(team_id), state)
+                return TeamRunSlotReservation(
+                    accepted=False,
+                    reservation_id=None,
+                    active_count=len(slots),
+                    limit=max_parallel_members,
+                )
+            reservation_id = f"slot_{uuid.uuid4().hex}"
+            slots[member_name] = {
+                "session_id": session_id,
+                "pending_reservations": {
+                    reservation_id: datetime.datetime.now(datetime.UTC).isoformat(),
+                },
+                "run_id": "",
+            }
+            self._atomic_write(self._state_path(team_id), state)
+            return TeamRunSlotReservation(
+                accepted=True,
+                reservation_id=reservation_id,
+                active_count=len(slots),
+                limit=max_parallel_members,
+            )
+
+    def complete_run_slot_delivery(
+        self,
+        team_id: str,
+        member_name: str,
+        reservation_id: str,
+        *,
+        run_id: str | None,
+    ) -> bool:
+        """Confirm one delivery and bind its slot to the observed Run."""
+        with self._state_lock(team_id):
+            state_path = self._state_path(team_id)
+            if not state_path.exists():
+                return False
+            state = self._read_json(state_path)
+            slots: dict[str, dict[str, Any]] = state.setdefault("active_run_slots", {})
+            slot = slots.get(member_name)
+            if slot is None:
+                return False
+            pending_reservations: dict[str, str] = slot.setdefault(
+                "pending_reservations",
+                {},
+            )
+            if reservation_id not in pending_reservations:
+                return False
+            pending_reservations.pop(reservation_id)
+            if run_id is not None:
+                slot["run_id"] = run_id
+            elif not pending_reservations and not slot.get("run_id"):
+                slots.pop(member_name, None)
+            self._atomic_write(self._state_path(team_id), state)
+            return True
+
+    def release_run_slot(
+        self,
+        team_id: str,
+        member_name: str,
+        *,
+        reservation_id: str | None = None,
+    ) -> bool:
+        """Idempotently release one member slot, optionally token-bound."""
+        with self._state_lock(team_id):
+            state_path = self._state_path(team_id)
+            if not state_path.exists():
+                return False
+            state = self._read_json(state_path)
+            slots: dict[str, dict[str, Any]] = state.setdefault("active_run_slots", {})
+            slot = slots.get(member_name)
+            if slot is None:
+                return False
+            if reservation_id is None:
+                slots.pop(member_name, None)
+            else:
+                pending_reservations: dict[str, str] = slot.setdefault(
+                    "pending_reservations",
+                    {},
+                )
+                if reservation_id not in pending_reservations:
+                    return False
+                pending_reservations.pop(reservation_id)
+                if not pending_reservations and not slot.get("run_id"):
+                    slots.pop(member_name, None)
+            self._atomic_write(self._state_path(team_id), state)
+            return True
+
+    def reconcile_run_slots(
+        self,
+        team_id: str,
+        runtime_resolver: Callable[[str, str], TeamMemberRuntime | None],
+    ) -> TeamRunSlotUsage:
+        """Reconcile slots and return current non-Lead capacity usage."""
+        with self._state_lock(team_id):
+            state_path = self._state_path(team_id)
+            if not state_path.exists():
+                return TeamRunSlotUsage(
+                    active_count=0,
+                    limit=0,
+                    removed_stale_count=0,
+                )
+            state = self._read_json(state_path)
+            max_parallel_members = int(state["max_parallel_members"])
+            if state.get("status") != "active":
+                removed = len(state.get("active_run_slots", {}))
+                state["active_run_slots"] = {}
+            else:
+                runtime_members = self._runtime_members_locked(state, runtime_resolver)
+                removed = self._reconcile_run_slots_locked(state, runtime_members)
+            slots: dict[str, dict[str, Any]] = state["active_run_slots"]
+            self._atomic_write(self._state_path(team_id), state)
+            return TeamRunSlotUsage(
+                active_count=len(slots),
+                limit=max_parallel_members,
+                removed_stale_count=removed,
+            )
 
     # ------------------------------------------------------------------
     # Messaging
@@ -776,9 +1176,10 @@ class FileTeamState:
         Args:
             team_id: Team to remove.
         """
-        team_dir = self._team_dir(team_id)
-        if team_dir.exists():
-            shutil.rmtree(team_dir)
+        with self._state_lock(team_id):
+            team_dir = self._team_dir(team_id)
+            if team_dir.exists():
+                shutil.rmtree(team_dir)
 
     @classmethod
     def cleanup_expired_teams(cls, base_dir: str, ttl_hours: int) -> int:
@@ -823,7 +1224,7 @@ class FileTeamState:
                     ended_at = ended_at.replace(tzinfo=datetime.UTC)
                 age_hours = (now - ended_at).total_seconds() / 3600
                 if age_hours >= ttl_hours:
-                    shutil.rmtree(entry)
+                    cls(base_dir).cleanup(entry.name)
                     removed += 1
 
             elif status == "active":
@@ -840,9 +1241,14 @@ class FileTeamState:
                     created_at = created_at.replace(tzinfo=datetime.UTC)
                 age_hours = (now - created_at).total_seconds() / 3600
                 if age_hours >= ttl_hours:
-                    state["status"] = "orphaned"
                     with contextlib.suppress(OSError):
-                        cls._atomic_write(state_path, state)
+                        store = cls(base_dir)
+                        with store._state_lock(entry.name):
+                            current_state = cls._read_json(state_path)
+                            if current_state.get("status") == "active":
+                                current_state["status"] = "orphaned"
+                                current_state["active_run_slots"] = {}
+                                cls._atomic_write(state_path, current_state)
 
         return removed
 
