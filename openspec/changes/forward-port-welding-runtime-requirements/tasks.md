@@ -34,7 +34,7 @@
 - [x] 6.1 Add the unreleased changelog entry and update affected documentation
 - [x] 6.2 Run strict OpenSpec validation, Ruff, mypy, and the focused/full WolfHarness test suites
 - [ ] 6.3 Archive the completed OpenSpec change and commit the framework implementation
-- [ ] 6.4 Push the WolfHarness feature branch to the personal fork
+- [x] 6.4 Push the WolfHarness feature branch to the personal fork
 
 ## 7. Parent repository migration
 
