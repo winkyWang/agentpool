@@ -38,7 +38,7 @@
 
 ## 7. Parent repository migration
 
-- [ ] 7.1 Migrate affected parent packages from AgentPool 2.9.5 names to WolfHarness 4.x contracts
-- [ ] 7.2 Run welding-agent and affected cross-package integration tests
-- [ ] 7.3 Update `.gitmodules`, synchronize the submodule URL, and commit the new submodule pointer
+- [x] 7.1 Migrate affected parent packages from AgentPool 2.9.5 names to WolfHarness 4.x contracts
+- [x] 7.2 Run welding-agent and affected cross-package integration tests
+- [x] 7.3 Update `.gitmodules`, synchronize the submodule URL, and commit the new submodule pointer
 - [ ] 7.4 Push the parent `feature/tasiawang/welding_agent` branch without merging its upstream base
