@@ -314,9 +314,7 @@ class AgentPool[TPoolDeps = None]:
                     enable_auto_resume=cfg.enable_auto_resume,
                     enable_event_bus=cfg.enable_event_bus,
                     max_auto_resume=cfg.max_auto_resume,
-                    subagent_inactivity_timeout_seconds=(
-                        cfg.subagent_inactivity_timeout_seconds
-                    ),
+                    subagent_inactivity_timeout_seconds=(cfg.subagent_inactivity_timeout_seconds),
                 )
                 # Configure additional SessionPool settings
                 self._session_pool.sessions._session_ttl_seconds = cfg.session_ttl_seconds

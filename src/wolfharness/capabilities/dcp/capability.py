@@ -614,11 +614,7 @@ class DynamicContextPruningCapability(AbstractCapability[Any]):
             original_msg_count,
             total_tokens,
             max_context_tokens,
-            (
-                (total_tokens / max_context_tokens * 100)
-                if max_context_tokens > 0
-                else 0.0
-            ),
+            ((total_tokens / max_context_tokens * 100) if max_context_tokens > 0 else 0.0),
             level.name,
             estimated_tokens,
             last_request_actual,
@@ -839,11 +835,7 @@ class DynamicContextPruningCapability(AbstractCapability[Any]):
             state.watermark_level.name,
             state.current_tokens,
             max_context_tokens,
-            (
-                (state.current_tokens / max_context_tokens * 100)
-                if max_context_tokens > 0
-                else 0.0
-            ),
+            ((state.current_tokens / max_context_tokens * 100) if max_context_tokens > 0 else 0.0),
             pending_count,
             len(state.applied_action_ids),
             state.nudge_counter,
