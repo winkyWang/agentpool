@@ -33,7 +33,7 @@
 
 - [x] 6.1 Add the unreleased changelog entry and update affected documentation
 - [x] 6.2 Run strict OpenSpec validation, Ruff, mypy, and the focused/full WolfHarness test suites
-- [ ] 6.3 Archive the completed OpenSpec change and commit the framework implementation
+- [x] 6.3 Archive the completed OpenSpec change and commit the framework implementation
 - [x] 6.4 Push the WolfHarness feature branch to the personal fork
 
 ## 7. Parent repository migration
@@ -41,4 +41,4 @@
 - [x] 7.1 Migrate affected parent packages from AgentPool 2.9.5 names to WolfHarness 4.x contracts
 - [x] 7.2 Run welding-agent and affected cross-package integration tests
 - [x] 7.3 Update `.gitmodules`, synchronize the submodule URL, and commit the new submodule pointer
-- [ ] 7.4 Push the parent `feature/tasiawang/welding_agent` branch without merging its upstream base
+- [x] 7.4 Push the parent `feature/tasiawang/welding_agent` branch without merging its upstream base

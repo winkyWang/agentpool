@@ -13,9 +13,10 @@ absence of a matcher SHALL NOT enable eager injection.
 - **THEN** the matcher SHALL select relevant visible Skills
 - **AND** only selected and always-active Skill bodies SHALL be injected
 
-#### Scenario: Matcher mode has no matcher
+#### Scenario: All skills injected without matcher (backward compat)
 - **WHEN** matcher mode is configured without a matcher
-- **THEN** the request SHALL retain metadata-only disclosure
+- **THEN** the legacy eager-injection behavior SHALL NOT apply
+- **AND** the request SHALL retain metadata-only disclosure
 - **AND** no Skill body SHALL be injected implicitly
 
 #### Scenario: All-injection is explicitly selected
