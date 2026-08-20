@@ -136,6 +136,23 @@ async def test_non_deferred_tool_tool_result_conversion(agent_ctx: AgentContext)
     assert result.metadata == {"key": "val"}
 
 
+@pytest.mark.unit
+async def test_non_deferred_tool_failure_raises_tool_failed(agent_ctx: AgentContext) -> None:
+    """A declared ToolResult failure does not masquerade as a successful return."""
+    from pydantic_ai.exceptions import ToolFailed
+
+    from wolfharness.agents.native_agent.tool_wrapping import wrap_tool
+    from wolfharness.tools.base import ToolResult
+
+    def result_tool() -> ToolResult:
+        return ToolResult(content="boom", is_error=True)
+
+    wrapped = wrap_tool(_create_deferred_tool(result_tool, deferred=False), agent_ctx)
+
+    with pytest.raises(ToolFailed, match="boom"):
+        await wrapped()
+
+
 # ============================================================================
 # Tests: deferred=True catch CallDeferred during resume re-execution
 # ============================================================================

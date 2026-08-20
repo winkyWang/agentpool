@@ -241,8 +241,11 @@ class EventProcessor:
                 tool_call_id=tool_call_id,
                 tool_result=result,
                 metadata=event_metadata,
+                is_error=is_error,
             ) if ctx.has_tool_part(tool_call_id):
-                for e in self._process_tool_complete(ctx, tool_call_id, result, event_metadata):
+                for e in self._process_tool_complete(
+                    ctx, tool_call_id, result, event_metadata, is_error
+                ):
                     yield e
 
             case StepUsageEvent() as step_usage_event:
@@ -843,6 +846,7 @@ class EventProcessor:
         tool_call_id: str,
         result: Any,
         event_metadata: dict[str, Any] | None,
+        is_error: bool,
     ) -> Iterator[Event]:
         """Process tool call completion.
 
@@ -851,6 +855,7 @@ class EventProcessor:
             tool_call_id: The unique identifier for this tool call.
             result: The result of the tool execution.
             event_metadata: Optional metadata about the tool execution.
+            is_error: First-class execution failure marker.
 
         Yields:
             PartUpdatedEvent for the completed tool part.
@@ -861,13 +866,12 @@ class EventProcessor:
 
         result_str = _format_tool_output(result)
         tool_input = ctx.get_tool_input(tool_call_id) or {}
-        is_error = isinstance(result, dict) and result.get("error")
         start = ctx.stream_start_ms
 
         new_state: ToolStateCompleted | ToolStateError
         if is_error:
             t = TimeStartEnd(start=start, end=now_ms())
-            error_string = str(result.get("error", "Unknown error"))
+            error_string = result_str or "Tool execution failed"
             new_state = ToolStateError(error=error_string, input=tool_input, time=t)
         else:
             # Merge accumulated diff text (from DiffContentItem in progress events)

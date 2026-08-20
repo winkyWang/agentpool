@@ -813,13 +813,11 @@ class ACPEventConverter:
                 tool_call_id=tc_id,
                 tool_name=tool_name,
                 tool_result=result,
-                metadata=meta,
+                is_error=is_error,
             ):
                 # ToolCallCompleteEvent is produced by EventMapper from
-                # FunctionToolResultEvent. When metadata contains
-                # ``is_error=True``, the original part was a
-                # RetryPromptPart (tool failure).
-                is_error = bool(meta and meta.get("is_error"))
+                # FunctionToolResultEvent and carries failure as a first-class
+                # field rather than protocol-specific metadata.
                 completion_status: Literal["completed", "failed"] = (
                     "failed" if is_error else "completed"
                 )

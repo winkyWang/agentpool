@@ -393,9 +393,10 @@ class TestToolCallCompleteEventConversion:
             tool_name="bash",
             tool_call_id="call-004",
             tool_input={"command": "false"},
-            tool_result={"error": "Command failed with exit code 1"},
+            tool_result="Command failed with exit code 1",
             agent_name="test-agent",
             message_id="msg-001",
+            is_error=True,
         )
         events = await _collect_events(adapter.convert_event(complete_event))
 
@@ -405,6 +406,43 @@ class TestToolCallCompleteEventConversion:
         assert isinstance(tool_part, ToolPart)
         assert isinstance(tool_part.state, ToolStateError)
         assert tool_part.state.error == "Command failed with exit code 1"
+
+    @pytest.mark.asyncio
+    async def test_successful_error_shaped_payload_remains_completed(
+        self,
+        adapter_context: EventProcessorContext,
+    ) -> None:
+        """A domain payload named error is not interpreted as execution failure."""
+        adapter = OpenCodeEventAdapter(context=adapter_context)
+        await _collect_events(
+            adapter.convert_event(
+                ToolCallStartEvent(
+                    tool_call_id="call-domain-negative",
+                    tool_name="qualify",
+                    title="Qualify",
+                    raw_input={},
+                )
+            )
+        )
+
+        events = await _collect_events(
+            adapter.convert_event(
+                ToolCallCompleteEvent(
+                    tool_name="qualify",
+                    tool_call_id="call-domain-negative",
+                    tool_input={},
+                    tool_result={"error": "not qualified"},
+                    agent_name="test-agent",
+                    message_id="msg-001",
+                )
+            )
+        )
+
+        part_updated = [event for event in events if isinstance(event, PartUpdatedEvent)]
+        assert len(part_updated) == 1
+        tool_part = part_updated[0].properties.part
+        assert isinstance(tool_part, ToolPart)
+        assert isinstance(tool_part.state, ToolStateCompleted)
 
 
 # =============================================================================
@@ -1095,9 +1133,10 @@ class TestToolCallCompleteEventConversionV2:
             tool_name="bash",
             tool_call_id="call-004",
             tool_input={"command": "false"},
-            tool_result={"error": "Command failed with exit code 1"},
+            tool_result="Command failed with exit code 1",
             agent_name="test-agent",
             message_id="msg-001",
+            is_error=True,
         )
         events = await _collect_events_v2(adapter.convert_event(complete_event))
 

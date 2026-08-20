@@ -12,7 +12,7 @@ import inspect
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic_ai import RunContext
-from pydantic_ai.exceptions import ApprovalRequired, CallDeferred
+from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ToolFailed
 from pydantic_ai.messages import ToolReturn
 
 from wolfharness.agents.context import AgentContext
@@ -61,6 +61,8 @@ def _inject_additional_context(
 def _convert_result(result: Any) -> Any:
     """Convert AgentPool ToolResult to pydantic-ai ToolReturn."""
     if isinstance(result, ToolResult):
+        if result.is_error:
+            raise ToolFailed(str(result.content))
         val = result.structured_content or result.content
         return ToolReturn(return_value=val, content=result.content, metadata=result.metadata)
     return result

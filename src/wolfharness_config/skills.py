@@ -73,11 +73,10 @@ class SkillsInstructionConfig(Schema):
         title="Maximum skills",
         examples=[10, 20, 50],
     )
-    """Maximum number of skills to inject.
+    """Maximum distinct Skill bodies activated during one run.
 
-    Limits the number of skills included in prompts to prevent
-    excessive token usage. Skills are ranked by relevance when
-    this limit is exceeded.
+    The limit is shared by matcher, always-active, all-injection, and
+    explicit loading. Requests that exceed it fail without truncation.
     """
 
 
@@ -135,6 +134,13 @@ class SkillsConfig(Schema):
 
     instruction: SkillsInstructionConfig = Field(default_factory=SkillsInstructionConfig)
     """Configuration for dynamic skills injection via AbstractCapability."""
+
+    node_visibility: dict[str, list[str]] = Field(default_factory=dict)
+    """Explicit node-to-Skill visibility allow-lists.
+
+    When non-empty, each listed node can discover and activate only the named
+    Skills. Nodes omitted from the mapping see no Skills.
+    """
 
     def get_effective_paths(self, config_file_path: UPath | None = None) -> list[UPath]:
         """Get the effective list of paths for skill discovery.

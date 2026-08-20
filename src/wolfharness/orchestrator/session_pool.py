@@ -73,6 +73,7 @@ class SessionPool(
         max_concurrent_runs: int | None = None,
         replay_buffer_size: int = 100,
         config: SessionPoolConfig | None = None,
+        subagent_inactivity_timeout_seconds: float | None = 120.0,
     ) -> None:
         """Initialize the session pool.
 
@@ -87,6 +88,8 @@ class SessionPool(
             config: Optional SessionPoolConfig for tunable parameters
                 (message cache size, TTL intervals). Defaults to
                 ``SessionPoolConfig()`` with standard defaults.
+            subagent_inactivity_timeout_seconds: Maximum silence between
+                delegated Agent events. ``None`` disables the deadline.
         """
         self.pool = pool
         self._config = config or SessionPoolConfig()
@@ -112,6 +115,7 @@ class SessionPool(
         self._message_cache: OrderedDict[str, list[ChatMessage[Any]]] = OrderedDict()
         self._message_cache_maxsize: int = self._config.message_cache_maxsize
         self._elicitation_registries: dict[str, Any] = {}
+        self._subagent_inactivity_timeout_seconds = subagent_inactivity_timeout_seconds
 
     async def start(self) -> None:
         """Start the session pool and background tasks."""

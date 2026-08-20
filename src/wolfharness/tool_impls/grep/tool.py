@@ -157,6 +157,7 @@ class GrepTool(Tool[ToolResult]):
                 return ToolResult(
                     content=error_msg,
                     metadata={"matches": 0, "truncated": False},
+                    is_error=True,
                 )
 
             # Format output
@@ -184,6 +185,7 @@ class GrepTool(Tool[ToolResult]):
             return ToolResult(
                 content=error_msg,
                 metadata={"matches": 0, "truncated": False},
+                is_error=True,
             )
         else:
             return ToolResult(

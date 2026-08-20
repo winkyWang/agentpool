@@ -21,9 +21,11 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
+from pydantic_ai.toolsets import FunctionToolset
 import pytest
 
 from wolfharness.capabilities.dcp.block_store import CompressionBlockStore
+from wolfharness.capabilities.dcp.capability import DynamicContextPruningCapability
 from wolfharness.capabilities.dcp.config import DCPConfig
 from wolfharness.capabilities.dcp.nudge import build_nudge_text
 from wolfharness.capabilities.dcp.prunable_list import (
@@ -200,6 +202,17 @@ def test_estimate_tokens_tiktoken_fallback_cjk_heuristic() -> None:
 # ---------------------------------------------------------------------------
 # 8.2 — watermark.py
 # ---------------------------------------------------------------------------
+
+
+def test_prune_tool_has_two_corrective_retries() -> None:
+    """Only prune receives a tool-specific two-retry allowance."""
+    capability = DynamicContextPruningCapability()
+    toolset = capability.get_toolset()
+
+    assert isinstance(toolset, FunctionToolset)
+    assert toolset.tools["prune"].max_retries == 2
+    assert toolset.tools["distill"].max_retries is None
+    assert toolset.tools["decompress"].max_retries is None
 
 
 def test_watermark_normal_to_info_at_60_percent() -> None:

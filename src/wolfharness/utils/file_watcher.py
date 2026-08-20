@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from watchfiles import Change
 
     FileChangeCallback = Callable[[AbstractSet[tuple[Change, str]]], Awaitable[None]]
+    FilePathFilter = Callable[[str], bool]
 
 
 logger = log.get_logger(__name__)
@@ -56,6 +57,9 @@ class FileWatcher:
 
     debounce: int = 100
     """Debounce time in milliseconds."""
+
+    path_filter: FilePathFilter | None = None
+    """Optional predicate selecting paths before they are logged or dispatched."""
 
     _task: asyncio.Task[None] | None = field(default=None, repr=False)
     """Background watch task."""
@@ -98,15 +102,33 @@ class FileWatcher:
                 *existing_paths,
                 debounce=self.debounce,
                 stop_event=self._stop_event,
+                watch_filter=self._watchfiles_filter,
             ):
-                logger.info("FileWatcher detected changes", changes=changes)
+                selected_changes = self._select_changes(changes)
+                if not selected_changes:
+                    continue
+                logger.info("FileWatcher detected changes", changes=selected_changes)
                 # Don't let callback errors kill the watcher
                 try:
-                    await self.callback(changes)
+                    await self.callback(selected_changes)
                 except Exception:
                     logger.exception("Error in file watcher callback")
         except Exception:
             logger.exception("FileWatcher watch loop failed")
+
+    def _select_changes(
+        self,
+        changes: AbstractSet[tuple[Change, str]],
+    ) -> set[tuple[Change, str]]:
+        """Apply the path predicate before a change can produce watcher output."""
+        return {
+            change for change in changes if self.path_filter is None or self.path_filter(change[1])
+        }
+
+    def _watchfiles_filter(self, change: Change, path: str) -> bool:
+        """Filter paths inside watchfiles before its own change logging runs."""
+        del change
+        return self.path_filter is None or self.path_filter(path)
 
     async def __aenter__(self) -> Self:
         """Start watcher on context enter."""

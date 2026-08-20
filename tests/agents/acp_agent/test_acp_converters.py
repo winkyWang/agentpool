@@ -23,10 +23,28 @@ from acp.schema import (
 from wolfharness.agents.acp_agent.acp_converters import (
     ACPMessageAccumulator,
     acp_notifications_to_messages,
+    acp_to_native_event,
 )
+from wolfharness.agents.events import ToolCallCompleteEvent
 
 
 pytestmark = pytest.mark.unit
+
+
+def test_failed_acp_tool_progress_maps_to_first_class_failure() -> None:
+    """ACP's failed status is preserved instead of downgraded to progress."""
+    result = acp_to_native_event(
+        ToolCallProgress(
+            tool_call_id="tc-failed",
+            status="failed",
+            title="remote_tool",
+            raw_output="remote failure",
+        )
+    )
+
+    assert isinstance(result, ToolCallCompleteEvent)
+    assert result.is_error is True
+    assert result.tool_result == "remote failure"
 
 
 class TestACPMessageAccumulator:

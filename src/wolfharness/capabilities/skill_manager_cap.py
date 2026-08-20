@@ -235,6 +235,8 @@ class SkillManagerCap(
         *,
         matcher_fn: Callable[..., list[str]] | None = None,
         always_active: set[str] | None = None,
+        visible_skills: set[str] | frozenset[str] | None = None,
+        max_skills: int = 20,
         registry: Any | None = None,
         name: str | None = None,
         tool_manager: SkillToolManager | None = None,
@@ -251,6 +253,8 @@ class SkillManagerCap(
                 When ``None``, ``"matcher"`` falls back to ``description``.
             always_active: Set of skill names that always have their instructions
                 injected, bypassing the matcher (matcher mode only).
+            visible_skills: Optional exact allow-list for this node view.
+            max_skills: Maximum distinct Skill bodies activated in one run.
             registry: Optional ``SkillsRegistry`` reference for hot-reload.
             name: Optional name override.
             tool_manager: Optional ``SkillToolManager`` for importing Python tools
@@ -263,6 +267,8 @@ class SkillManagerCap(
         self._children: list[AbstractCapability[AgentDepsT]] = list(children) if children else []
         self._matcher_fn = matcher_fn
         self._always_active: set[str] = set(always_active) if always_active else set()
+        self._visible_skills = frozenset(visible_skills) if visible_skills is not None else None
+        self._max_skills = max_skills
         self._inject_mode = inject_mode
         self._registry = registry
         self._tool_manager: SkillToolManager | None = tool_manager
@@ -334,6 +340,25 @@ class SkillManagerCap(
         """
         self._local_skills[skill.name] = skill
 
+    def _is_visible(self, skill_name: str) -> bool:
+        """Return whether a Skill name belongs to this node view."""
+        return self._visible_skills is None or skill_name in self._visible_skills
+
+    def scoped(self, visible_skills: set[str] | frozenset[str]) -> SkillManagerCap[AgentDepsT]:
+        """Create a node-specific view sharing authoritative Skill definitions."""
+        return SkillManagerCap(
+            local_skills=self._local_skills,
+            children=self._children,
+            matcher_fn=self._matcher_fn,
+            always_active=self._always_active,
+            visible_skills=visible_skills,
+            max_skills=self._max_skills,
+            registry=self._registry,
+            name=self._name,
+            tool_manager=self._tool_manager,
+            inject_mode=self._inject_mode,
+        )
+
     # ---- Pool resolution from RunContext ----
 
     @staticmethod
@@ -398,6 +423,8 @@ class SkillManagerCap(
         if self._tool_manager is None:
             return
         for name, skill in self._local_skills.items():
+            if not self._is_visible(name):
+                continue
             if not skill.tools:
                 continue
             try:
@@ -421,6 +448,8 @@ class SkillManagerCap(
         from wolfharness.capabilities.mcp_server_cap import McpServerCap
 
         for name, skill in self._local_skills.items():
+            if not self._is_visible(name):
+                continue
             if not skill.mcp_servers:
                 continue
             caps: list[McpServerCap] = []
@@ -535,6 +564,8 @@ class SkillManagerCap(
 
         # 1. Python tools: PrefixedToolset per skill.
         for skill_name, tools in self._skill_tools.items():
+            if not self._is_visible(skill_name):
+                continue
             pa_tools: list[Any] = [t.to_pydantic_ai() for t in tools]
             if pa_tools:
                 toolsets.append(
@@ -546,6 +577,8 @@ class SkillManagerCap(
 
         # 2. Per-skill McpServerCap children: PrefixedToolset per skill.
         for skill_name, child_caps in self._skill_mcp_children.items():
+            if not self._is_visible(skill_name):
+                continue
             for child in child_caps:
                 child_ts = child.get_toolset()
                 if child_ts is not None:
@@ -577,6 +610,8 @@ class SkillManagerCap(
         """
         skill_filters: dict[str, set[str]] = {}
         for name, skill in self._local_skills.items():
+            if not self._is_visible(name):
+                continue
             allowed = skill.parsed_allowed_tools()
             if allowed is not None:
                 skill_filters[name] = set(allowed)
@@ -631,6 +666,8 @@ class SkillManagerCap(
         """Build the static ``<available-skills>`` XML block."""
         lines = ["<available-skills>"]
         for name, skill in self._local_skills.items():
+            if not self._is_visible(name):
+                continue
             if skill.disable_model_invocation:
                 continue
             desc = html.escape(skill.description)
@@ -653,8 +690,28 @@ class SkillManagerCap(
         if not self._local_skills:
             return None
 
-        # description mode → catalog only, no <skill_content> injected.
+        from wolfharness.agents.context import AgentContext as RuntimeAgentContext
+        from wolfharness.skills.activation import (
+            SkillActivationSource,
+            activate_skills,
+            record_skill_trace,
+        )
+
+        visible_names = {
+            name
+            for name, skill in self._local_skills.items()
+            if self._is_visible(name) and not skill.disable_model_invocation
+        }
+        agent_ctx = ctx.deps if isinstance(ctx.deps, RuntimeAgentContext) else None
+
+        # Description mode exposes metadata but activates no Skill body.
         if self._inject_mode == "description":
+            await record_skill_trace(
+                agent_ctx,
+                visible_skills=visible_names,
+                activated_skills=(),
+                source="metadata",
+            )
             return None
 
         messages = ctx.messages
@@ -667,27 +724,48 @@ class SkillManagerCap(
                     "inject=matcher configured but no matcher_fn provided; "
                     "falling back to description mode (catalog only)"
                 )
+                await record_skill_trace(
+                    agent_ctx,
+                    visible_skills=visible_names,
+                    activated_skills=(),
+                    source="metadata",
+                )
                 return None
             sig = inspect.signature(self._matcher_fn)
             if len(sig.parameters) >= 2:  # noqa: PLR2004
-                result = self._matcher_fn(messages, list(self._local_skills.keys()))
+                result = self._matcher_fn(messages, sorted(visible_names))
             else:
                 result = self._matcher_fn(messages)
             if inspect.isawaitable(result):
                 result = await result
-            matched: set[str] = {n for n in result if n in self._local_skills}
-            # Always add always_active skills.
-            matched |= self._always_active & set(self._local_skills.keys())
+            matcher_selected: set[str] = {name for name in result if name in visible_names}
+            always_active = self._always_active & visible_names
+            requested = matcher_selected | always_active
+            source: SkillActivationSource = "matcher" if matcher_selected else "always_active"
         else:
-            # "all" mode (and any other): inject every skill.
-            matched = set(self._local_skills.keys())
+            requested = visible_names
+            source = "all"
 
-        if not matched:
+        if not requested:
+            await record_skill_trace(
+                agent_ctx,
+                visible_skills=visible_names,
+                activated_skills=(),
+                source="metadata",
+            )
             return None
+
+        await activate_skills(
+            agent_ctx,
+            requested_skills=requested,
+            visible_skills=visible_names,
+            max_skills=self._max_skills,
+            source=source,
+        )
 
         # Build injection text.
         parts: list[str] = []
-        for name in sorted(matched):
+        for name in sorted(requested):
             skill = self._local_skills[name]
             try:
                 instructions = skill.load_instructions()
@@ -814,6 +892,8 @@ class SkillManagerCap(
             children=children_for_run,
             matcher_fn=self._matcher_fn,
             always_active=self._always_active,
+            visible_skills=self._visible_skills,
+            max_skills=self._max_skills,
             registry=self._registry,
             name=self._name,
             tool_manager=self._tool_manager,
@@ -899,6 +979,33 @@ class SkillManagerCap(
         # Apply argument substitution
         instructions = _substitute_arguments(instructions, arguments)
 
+        # A reference read does not activate the Skill body. Every full body
+        # load shares the run-level activation limit with matcher injection.
+        effective_ref_path = skill.resolved_reference_path or (
+            resolved.reference_path if is_uri else None
+        )
+        is_reference_load = is_uri and effective_ref_path is not None
+        if not is_reference_load:
+            from wolfharness.agents.context import AgentContext as RuntimeAgentContext
+            from wolfharness.skills.activation import activate_skills
+
+            agent_ctx = ctx.deps if isinstance(ctx.deps, RuntimeAgentContext) else None
+            visible_names = {
+                name
+                for name, candidate in self._local_skills.items()
+                if self._is_visible(name)
+                and not candidate.disable_model_invocation
+                and _is_skill_visible_to_node(pool, candidate, node_name_effective)
+            }
+            visible_names.add(skill.name)
+            await activate_skills(
+                agent_ctx,
+                requested_skills={skill.name},
+                visible_skills=visible_names,
+                max_skills=self._max_skills,
+                source="explicit",
+            )
+
         # Activate MCP servers and tools declared in the skill.
         # When ``include_assembly`` is False (e.g. instruction-only injection
         # into a team member prompt), skip the MCP/tool status appendix
@@ -918,12 +1025,6 @@ class SkillManagerCap(
                 result = tool_manager.import_tool(tool_config)
                 status = "✓" if result is not None else "✗"
                 tool_lines.append(f"- `{tool_config.import_path}` ({status})")
-
-        # Determine if this is a reference-only load
-        effective_ref_path = skill.resolved_reference_path or (
-            resolved.reference_path if is_uri else None
-        )
-        is_reference_load = is_uri and effective_ref_path is not None
 
         # Build the response
         if is_reference_load:
@@ -970,7 +1071,9 @@ class SkillManagerCap(
         pool, node_name = self._resolve_pool(ctx)
 
         # Get local skills from the cap's own _local_skills
-        local_skill_list = list(self._local_skills.values())
+        local_skill_list = [
+            skill for skill in self._local_skills.values() if self._is_visible(skill.name)
+        ]
         visible_local = _visible_model_skills(pool, local_skill_list, node_name)
 
         # Get remote skills from child SkillResource providers
@@ -988,6 +1091,7 @@ class SkillManagerCap(
                         instructions="",
                     )
                     for entry in entries
+                    if self._is_visible(entry.name)
                 )
 
         visible_remote = _visible_model_skills(pool, remote_skills, node_name)
@@ -1062,7 +1166,11 @@ class SkillManagerCap(
                 if local_skill is not None:
                     break
 
-        if local_skill is not None and _is_skill_visible_to_node(pool, local_skill, node_name):
+        if (
+            local_skill is not None
+            and self._is_visible(local_skill.name)
+            and _is_skill_visible_to_node(pool, local_skill, node_name)
+        ):
             try:
                 instructions = local_skill.load_instructions()
             except (ValueError, OSError):
@@ -1088,6 +1196,7 @@ class SkillManagerCap(
                     instructions="",
                 )
                 for entry in provider_entries
+                if self._is_visible(entry.name)
             ]
             visible_skills = _visible_model_skills(pool, provider_skills, node_name)
             matching_skill = next(
@@ -1129,7 +1238,9 @@ class SkillManagerCap(
         Returns:
             Sorted comma-separated string of skill names.
         """
-        local_skill_list = list(self._local_skills.values())
+        local_skill_list = [
+            skill for skill in self._local_skills.values() if self._is_visible(skill.name)
+        ]
         visible_local = _visible_model_skills(pool, local_skill_list, node_name)
 
         remote_skills: list[Skill] = []
@@ -1146,6 +1257,7 @@ class SkillManagerCap(
                         instructions="",
                     )
                     for entry in entries
+                    if self._is_visible(entry.name)
                 )
 
         visible_remote = _visible_model_skills(pool, remote_skills, node_name)
@@ -1164,13 +1276,15 @@ class SkillManagerCap(
             The skill instructions string, or empty string if not found.
         """
         # Local first
-        if skill_name in self._local_skills:
+        if self._is_visible(skill_name) and skill_name in self._local_skills:
             try:
                 return self._local_skills[skill_name].load_instructions()
             except (ValueError, OSError):
                 return ""
 
         # Remote
+        if not self._is_visible(skill_name):
+            return ""
         for child in self._children:
             if isinstance(child, SkillResource):
                 try:
@@ -1194,6 +1308,8 @@ class SkillManagerCap(
 
         # Local skills.
         for name, skill in self._local_skills.items():
+            if not self._is_visible(name):
+                continue
             entries.append(
                 SkillEntry(
                     name=name,
@@ -1209,7 +1325,7 @@ class SkillManagerCap(
             if isinstance(child, SkillResource):
                 try:
                     remote_skills = await child.list_skills()
-                    entries.extend(remote_skills)
+                    entries.extend(entry for entry in remote_skills if self._is_visible(entry.name))
                 except Exception:
                     logger.warning(
                         "Failed to list skills from child %r",
@@ -1231,13 +1347,15 @@ class SkillManagerCap(
             Skill content as string, or ``None`` if not found.
         """
         # Local first.
-        if name in self._local_skills:
+        if self._is_visible(name) and name in self._local_skills:
             try:
                 return self._local_skills[name].load_instructions()
             except (ValueError, OSError):
                 return None
 
         # Remote.
+        if not self._is_visible(name):
+            return None
         for child in self._children:
             if isinstance(child, SkillResource):
                 try:
@@ -1265,10 +1383,12 @@ class SkillManagerCap(
             ``True`` if the skill exists, ``False`` otherwise.
         """
         # Local.
-        if name in self._local_skills:
+        if self._is_visible(name) and name in self._local_skills:
             return True
 
         # Remote.
+        if not self._is_visible(name):
+            return False
         for child in self._children:
             if isinstance(child, SkillResource):
                 try:
@@ -1294,6 +1414,8 @@ class SkillManagerCap(
 
         # Local skills as commands.
         for name, skill in self._local_skills.items():
+            if not self._is_visible(name):
+                continue
             if not skill.user_invocable:
                 continue
             entries.append(
@@ -1310,7 +1432,9 @@ class SkillManagerCap(
             if isinstance(child, CommandResource):
                 try:
                     remote_commands = await child.list_commands()
-                    entries.extend(remote_commands)
+                    entries.extend(
+                        entry for entry in remote_commands if self._is_visible(entry.name)
+                    )
                 except Exception:
                     logger.warning(
                         "Failed to list commands from child %r",
@@ -1332,7 +1456,7 @@ class SkillManagerCap(
             ``CommandEntry`` if found, ``None`` otherwise.
         """
         # Local first.
-        if name in self._local_skills:
+        if self._is_visible(name) and name in self._local_skills:
             skill = self._local_skills[name]
             if skill.user_invocable:
                 return CommandEntry(
@@ -1343,6 +1467,8 @@ class SkillManagerCap(
                 )
 
         # Remote.
+        if not self._is_visible(name):
+            return None
         for child in self._children:
             if isinstance(child, CommandResource):
                 try:

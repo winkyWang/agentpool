@@ -20,6 +20,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from pydantic_ai import ModelRetry
+from pydantic_ai.exceptions import ToolFailed
 from pydantic_ai.messages import ToolCallPart, ToolReturn
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import RunContext, ToolDefinition
@@ -186,7 +187,7 @@ async def test_get_wrapper_toolset_per_tool_wraps_with_approval_required(
 
 
 # ============================================================================
-# 5.4: wrap_tool_execute() catches exception and returns annotated ToolReturn
+# 5.4: wrap_tool_execute() maps execution exceptions to ToolFailed
 # ============================================================================
 
 
@@ -194,7 +195,7 @@ async def test_get_wrapper_toolset_per_tool_wraps_with_approval_required(
 async def test_wrap_tool_execute_catches_exception(
     mock_hook_manager: MagicMock,
 ) -> None:
-    """wrap_tool_execute() catches exception and returns annotated ToolReturn."""
+    """wrap_tool_execute() maps an ordinary exception to a typed tool failure."""
     cap = make_capability(mock_hook_manager)
     ctx = make_run_context()
     call = make_tool_call("failing_tool")
@@ -204,13 +205,32 @@ async def test_wrap_tool_execute_catches_exception(
     async def failing_handler(a: dict[str, Any]) -> Any:
         raise ValueError("Something went wrong")
 
-    result = await cap.wrap_tool_execute(
-        ctx, call=call, tool_def=tool_def, args=args, handler=failing_handler
-    )
+    with pytest.raises(ToolFailed, match=r"failing_tool.*Something went wrong"):
+        await cap.wrap_tool_execute(
+            ctx, call=call, tool_def=tool_def, args=args, handler=failing_handler
+        )
 
-    assert isinstance(result, ToolReturn)
-    assert "failing_tool" in str(result.content)
-    assert "Something went wrong" in str(result.content)
+
+@pytest.mark.anyio
+async def test_wrap_tool_execute_maps_declared_tool_result_failure(
+    mock_hook_manager: MagicMock,
+) -> None:
+    """Canonical ToolResult failures become pydantic-ai ToolFailed outcomes."""
+    from wolfharness.tools.base import ToolResult
+
+    cap = make_capability(mock_hook_manager)
+    ctx = make_run_context()
+    call = make_tool_call("declared_failure")
+    tool_def = make_tool_def("declared_failure")
+
+    async def failing_handler(args: dict[str, Any]) -> ToolResult:
+        del args
+        return ToolResult(content="declared failure", is_error=True)
+
+    with pytest.raises(ToolFailed, match="declared failure"):
+        await cap.wrap_tool_execute(
+            ctx, call=call, tool_def=tool_def, args={}, handler=failing_handler
+        )
 
 
 # ============================================================================

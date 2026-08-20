@@ -828,6 +828,13 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
         # Construct full model ID with provider prefix (e.g., "anthropic:claude-haiku-4-5")
         return f"{self._model.system}:{self._model.model_name}" if self._model else None
 
+    @property
+    def model_context_window_tokens(self) -> int | None:
+        """Return the active model configuration's declared context window."""
+        if self._resolved_model_config is None:
+            return None
+        return self._resolved_model_config.context_length
+
     def to_tool(
         self,
         *,
@@ -1146,14 +1153,11 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
         tool_capabilities.extend(mcp_capabilities)
         # 5. Skill capabilities — from pool-scoped instances created during __aenter__.
         #    Each SkillManagerCap provides tools and MCP servers.
+        skill_capability = None
         if pool is not None:
-            pool_capabilities = pool.skill_capabilities
-            if pool_capabilities:
-                from wolfharness.capabilities.skill_manager_cap import SkillManagerCap
-
-                tool_capabilities.extend(
-                    cap for cap in pool_capabilities if isinstance(cap, SkillManagerCap)
-                )
+            skill_capability = pool.skill_capability_for_node(self.name)
+            if skill_capability is not None:
+                tool_capabilities.append(skill_capability)
             # 6. ResourceCapability — unified resource access tools.
             #    Per-agent opt-out via ``resources.enabled: false`` in YAML.
             if self.config is not None and self.config.resources.enabled:
@@ -1181,16 +1185,6 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
                     session_scope = Scope(level=ScopeLevel.SESSION, session_id=session_id)
                     for cap in mcp_capabilities:
                         registry.register(cap, session_scope)
-                    if pool is not None:
-                        pool_caps = pool.skill_capabilities
-                        if pool_caps:
-                            from wolfharness.capabilities.skill_manager_cap import (
-                                SkillManagerCap,
-                            )
-
-                            for cap in pool_caps:
-                                if isinstance(cap, SkillManagerCap):
-                                    registry.register(cap, session_scope)
                     self._registered_session_ids.add(session_id)
 
         # Collect pydantic-ai compatible instructions from SystemPrompts and providers
@@ -1532,6 +1526,7 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
         else:
             # Direct Model instance assignment (no signal emission)
             self._model = model
+            self._resolved_model_config = None
 
     def create_turn(
         self,
@@ -2004,6 +1999,10 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
             # Set the model using variant name (preserves model_settings)
             old_model = self._model
             self._model, settings = self._resolve_model_string(variant_name)
+            if ctx and variant_name in ctx.manifest.model_variants:
+                self._resolved_model_config = ctx.manifest.model_variants[variant_name]
+            else:
+                self._resolved_model_config = None
             if settings:
                 self.model_settings = settings
             self.log.info("Model changed from %s to %s", old_model, self._model)

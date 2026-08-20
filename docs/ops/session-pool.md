@@ -30,6 +30,20 @@ await session_pool.start()
 - The cleanup task scans for expired sessions every `session_ttl_seconds / 2` (default 30 min).
 - No events are processed until `process_prompt()` is called.
 
+### Delegated-run inactivity deadline
+
+Manifest configuration controls how long `run_agent()` waits between events
+from a delegated agent:
+
+```yaml
+session_pool:
+  subagent_inactivity_timeout_seconds: 600
+```
+
+The deadline measures silence, not total execution time: every received event
+starts a new wait. Set the value to `null` to rely on explicit cancellation and
+wait indefinitely for the next event. The default remains 120 seconds.
+
 ## Shutdown
 
 ```python

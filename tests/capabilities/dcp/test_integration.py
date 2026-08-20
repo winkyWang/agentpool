@@ -120,6 +120,7 @@ def _make_run_context(
     usage_input_tokens: int = 0,
     enqueue_enabled: bool = True,
     session_pool: Any = None,
+    model_context_window_tokens: int | None = None,
 ) -> MagicMock:
     """Create a mock ``RunContext[AgentContext]``.
 
@@ -138,6 +139,8 @@ def _make_run_context(
     # AgentContext mock — get_session_state returns SessionData or None.
     deps = MagicMock()
     deps.get_session_state.return_value = session_data
+    deps.model_name = "test:test-model"
+    deps.native_agent.model_context_window_tokens = model_context_window_tokens
     ctx.deps = deps
 
     # Usage mock with input_tokens.
@@ -223,6 +226,26 @@ def _find_tool_returns(messages: list[Any]) -> list[tuple[int, int, ToolReturnPa
 # =============================================================================
 # 9.1 — Full pipeline with 3-turn conversation
 # =============================================================================
+
+
+async def test_model_context_window_drives_watermark_budget() -> None:
+    """The active model window overrides DCP's programmatic budget."""
+    capability = _make_capability(max_context_tokens=100)
+    session_data = _make_session_data()
+    ctx = _make_run_context(
+        session_data=session_data,
+        model_context_window_tokens=100_000,
+    )
+    request_context = _make_request_context(
+        [_make_request([UserPromptPart(content="x" * 1000)])],
+    )
+
+    await capability.before_model_request(ctx, request_context)
+
+    state = _get_dcp_state(capability, ctx)
+    assert state.current_tokens > 100
+    assert state.watermark_level == WatermarkLevel.NORMAL
+    assert capability._effective_config(ctx).max_context_tokens == 100_000
 
 
 async def test_before_model_request_3turn_pipeline_phases_execute() -> None:

@@ -142,6 +142,7 @@ def _convert_to_tool_result(result: Any) -> FastMCPToolResult:
                 content=result.content,
                 structured_content=result.structured_content,
                 meta=result.metadata,
+                is_error=result.is_error,
             )
         case ToolReturn():
             metadata = result.metadata if isinstance(result.metadata, dict) else None

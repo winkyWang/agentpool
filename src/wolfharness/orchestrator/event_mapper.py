@@ -317,19 +317,19 @@ class EventMapper:
         Returns ``None`` if no matching tool call start was seen (i.e. the
         ``tool_call_id`` is not in ``_pending_tool_calls``).
 
-        Note:
-            ``RetryPromptPart`` is not a ``BaseToolReturnPart`` but shares
-            the ``tool_call_id`` and ``content`` attributes. When the part
-            is a ``RetryPromptPart``, ``metadata={"is_error": True}`` is
-            set so downstream consumers can distinguish failures from
-            successful completions.
+        ``RetryPromptPart`` and pydantic-ai tool returns whose ``outcome`` is
+        ``"failed"`` are the framework-level failure signals here.
         """
         call_id = tool_return.tool_call_id
         tool_name = self._pending_tool_calls.pop(call_id, None)
         if tool_name is None:
             return None
         tool_input = self._pending_tool_inputs.pop(call_id, {})
-        is_error = isinstance(tool_return, RetryPromptPart)
+        is_error = isinstance(tool_return, RetryPromptPart) or (
+            isinstance(tool_return, BaseToolReturnPart) and tool_return.outcome == "failed"
+        )
+        raw_metadata = getattr(tool_return, "metadata", None)
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else None
         return ToolCallCompleteEvent(
             tool_name=tool_name,
             tool_call_id=call_id,
@@ -337,7 +337,8 @@ class EventMapper:
             tool_result=tool_return.content,
             agent_name=self._agent_name,
             message_id=self._message_id,
-            metadata={"is_error": True} if is_error else None,
+            metadata=metadata,
+            is_error=is_error,
         )
 
     def flush_cancelled_tool_calls(self) -> list[ToolCallCompleteEvent]:
@@ -346,7 +347,7 @@ class EventMapper:
         Called when a turn is cancelled mid-tool-execution to ensure
         downstream consumers receive a completion event for every
         ``ToolCallStartEvent`` that was emitted. Each event carries
-        ``metadata={"is_error": True, "cancelled": True}``.
+        ``is_error=True`` and cancellation metadata.
 
         Returns:
             A list of ``ToolCallCompleteEvent`` instances, one per
@@ -363,7 +364,8 @@ class EventMapper:
                     tool_result="Tool execution was cancelled.",
                     agent_name=self._agent_name,
                     message_id=self._message_id,
-                    metadata={"is_error": True, "cancelled": True},
+                    metadata={"cancelled": True},
+                    is_error=True,
                 ),
             )
         self._pending_tool_calls.clear()

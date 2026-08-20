@@ -98,6 +98,34 @@ def test_function_tool_result_event_maps_to_tool_call_complete() -> None:
     assert result.tool_result == "hello\n"
     assert result.agent_name == "test-agent"
     assert result.message_id == "msg-001"
+    assert result.is_error is False
+
+
+@pytest.mark.unit
+def test_failed_tool_outcome_maps_to_first_class_failure() -> None:
+    """Pydantic-ai's failed outcome is preserved without metadata guessing."""
+    mapper = EventMapper(agent_name="test-agent", message_id="msg-001")
+    mapper.map_event(
+        FunctionToolCallEvent(
+            part=ToolCallPart(tool_name="bash", args={}, tool_call_id="tc-failed")
+        )
+    )
+
+    result = mapper.map_event(
+        FunctionToolResultEvent(
+            part=ToolReturnPart(
+                tool_name="bash",
+                tool_call_id="tc-failed",
+                content="permission denied",
+                metadata={"diagnostic": "stderr"},
+                outcome="failed",
+            )
+        )
+    )
+
+    assert isinstance(result, ToolCallCompleteEvent)
+    assert result.is_error is True
+    assert result.metadata == {"diagnostic": "stderr"}
 
 
 @pytest.mark.unit
@@ -286,10 +314,12 @@ def test_flush_cancelled_tool_calls_returns_error_events_for_pending() -> None:
     assert all(isinstance(e, ToolCallCompleteEvent) for e in events)
     assert events[0].tool_call_id == "tc-001"
     assert events[0].tool_name == "bash"
-    assert events[0].metadata == {"is_error": True, "cancelled": True}
+    assert events[0].is_error is True
+    assert events[0].metadata == {"cancelled": True}
     assert "cancelled" in str(events[0].tool_result).lower()
     assert events[1].tool_call_id == "tc-002"
-    assert events[1].metadata == {"is_error": True, "cancelled": True}
+    assert events[1].is_error is True
+    assert events[1].metadata == {"cancelled": True}
 
 
 @pytest.mark.unit

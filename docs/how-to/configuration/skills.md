@@ -5,7 +5,7 @@ order: 10
 icon: material/lightning-bolt
 ---
 
-Skills provide specialized instructions and techniques that agents can follow. AgentPool supports automatic injection of skills into agent system prompts using structured XML formatting.
+Skills provide specialized instructions and techniques that agents can follow. WolfHarness supports progressive Skill disclosure using structured XML formatting.
 
 ## Overview
 
@@ -34,8 +34,14 @@ skills:
   instruction:
     # Full-instruction injection mode: description, matcher, or all
     inject: description
-    # Maximum number of skills to inject (default: 20)
+    # Maximum distinct Skill bodies activated in one run (default: 20)
     max_skills: 20
+
+  # Optional exact allow-list per agent node. If this mapping is non-empty,
+  # omitted nodes see no Skills.
+  node_visibility:
+    coordinator: [planning, shared-standards]
+    reviewer: [review, shared-standards]
 ```
 
 ### Injection Modes
@@ -56,7 +62,10 @@ which costs more tokens.
 Per-agent overrides are handled by the (deprecated) `type: skills` toolset, which
 is a no-op since skills tools are auto-provided by `SkillManagerCap`. The
 `inject`/`max_skills` settings are global; there is no per-agent
-`injection_mode` override.
+`injection_mode` override. `max_skills` is enforced against the distinct union
+of matcher-selected, always-active, all-injected, and explicitly loaded Skill
+bodies for one run. Requests that exceed the limit fail instead of truncating
+the selection.
 
 ## XML Output Format
 
@@ -95,6 +104,9 @@ skills:
   instruction:
     inject: description
     max_skills: 20
+  node_visibility:
+    coordinator: [planning, shared-standards]
+    reviewer: [review, shared-standards]
 ```
 
 ## Behavior Notes
@@ -106,6 +118,10 @@ skills:
   warning.
 - Full instructions are always available on demand via the `load_skill` tool,
   regardless of the `inject` mode.
+- When `node_visibility` is non-empty, the same policy controls catalogs,
+  matcher candidates, `list_skills`, explicit loads, reference reads,
+  Skill-backed commands, and Skill-owned tools. A reference-only read does not
+  consume another activation.
 
 ## Related Configuration
 

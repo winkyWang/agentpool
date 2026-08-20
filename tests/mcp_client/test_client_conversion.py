@@ -18,6 +18,7 @@ from pydantic_ai.usage import RunUsage
 import pytest
 
 from wolfharness.mcp_server import MCPClient
+from wolfharness.tools.base import ToolResult
 from wolfharness_config.mcp_server import StdioMCPServerConfig
 
 
@@ -109,6 +110,30 @@ async def test_structured_mcp_result_preserves_text_as_tool_return() -> None:
     assert isinstance(result, ToolReturn)
     assert result.return_value == "<file>\n00001| report body\n</file>"
     assert result.metadata == {"file_path": "reports/case.md", "total_lines": 1}
+
+
+async def test_mcp_failure_returns_canonical_tool_result() -> None:
+    """MCP failures retain the canonical boundary marker for native interception."""
+    ctx = RunContext(
+        tool_call_id="test-call-failed",
+        deps=None,
+        model=TestModel(),
+        usage=RunUsage(),
+    )
+    client = MCPClient(StdioMCPServerConfig(name="test_server", command="uv", args=["--version"]))
+    client._client = MagicMock()
+    client._client.is_connected.return_value = True
+    client._client.call_tool = AsyncMock(
+        return_value=SimpleNamespace(
+            is_error=True,
+            content=[TextContent(type="text", text="remote failure")],
+            data=None,
+        )
+    )
+
+    result = await client.call_tool("remote", run_context=ctx, arguments={})
+
+    assert result == ToolResult(content="remote failure", is_error=True)
 
 
 if __name__ == "__main__":

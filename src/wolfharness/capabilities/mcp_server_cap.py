@@ -349,6 +349,8 @@ class McpServerCap(
 
         client = await self._ensure_client()
         result = await client.call_tool(name, RunContext(deps=None, model=None, usage=None), args)  # type: ignore[arg-type]
+        if isinstance(result, ToolResult):
+            return result
         if isinstance(result, str):
             return ToolResult(content=result)
         # ToolReturn or other — extract text representation

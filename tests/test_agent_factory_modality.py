@@ -392,6 +392,38 @@ def test_model_config_names_test_config() -> None:
     assert names == []
 
 
+def test_model_context_window_comes_from_resolved_model_config() -> None:
+    """DCP reads the context window declared for the active model variant."""
+    variant_config = StringModelConfig(
+        identifier="openai:gpt-4o",
+        context_length=128_000,
+    )
+    agent = Agent(
+        name="test",
+        model="test",
+        resolved_model_config=variant_config,
+    )
+
+    assert agent.model_context_window_tokens == 128_000
+
+
+async def test_direct_model_switch_clears_stale_context_window() -> None:
+    """A direct model object cannot retain the previous variant's budget."""
+    variant_config = StringModelConfig(
+        identifier="openai:gpt-4o",
+        context_length=128_000,
+    )
+    agent = Agent(
+        name="test",
+        model="test",
+        resolved_model_config=variant_config,
+    )
+
+    await agent.set_model(TestModel())
+
+    assert agent.model_context_window_tokens is None
+
+
 def test_model_config_names_fallback_with_strings() -> None:
     """FallbackModelConfig with plain string sub-models."""
     config = FallbackModelConfig(models=["openai:gpt-4o", "anthropic:claude-sonnet-4-5"])

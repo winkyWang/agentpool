@@ -109,6 +109,7 @@ class ListDirectoryTool(Tool[ToolResult]):
                 return ToolResult(
                     content=f"Error: {error_msg}",
                     metadata={"count": 0, "truncated": False},
+                    is_error=True,
                 )
 
             # Build glob path
@@ -134,6 +135,7 @@ class ListDirectoryTool(Tool[ToolResult]):
                 return ToolResult(
                     content=error_msg,
                     metadata={"count": total_found, "truncated": True},
+                    is_error=True,
                 )
 
             for file_path, file_info in paths.items():  # pyright: ignore[reportAttributeAccessIssue]
@@ -179,6 +181,7 @@ class ListDirectoryTool(Tool[ToolResult]):
             return ToolResult(
                 content=error_msg,
                 metadata={"count": 0, "truncated": False},
+                is_error=True,
             )
         else:
             total_items = len(files) + len(dirs)

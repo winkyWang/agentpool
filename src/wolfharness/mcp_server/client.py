@@ -25,7 +25,7 @@ from wolfharness.mcp_server.constants import MCP_TO_LOGGING
 from wolfharness.mcp_server.helpers import extract_text_content, mcp_tool_to_fn_schema
 from wolfharness.mcp_server.message_handler import MCPMessageHandler
 from wolfharness.tools import CallDeferred
-from wolfharness.tools.base import FunctionTool
+from wolfharness.tools.base import FunctionTool, ToolResult
 from wolfharness.utils.signatures import create_modified_signature
 from wolfharness_config.mcp_server import (
     AcpMCPServerConfig,
@@ -726,9 +726,8 @@ class MCPClient:
                     }
                 )
             if result.is_error:
-                # MCP tool returned an error - return it as content so LLM can see it
                 error_text = extract_text_content(result.content)
-                return ToolReturn(return_value=f"Tool error: {error_text}", content=error_text)
+                return ToolResult(content=error_text, is_error=True)
             content = await from_mcp_content(result.content)
             # Decision logic for return type
             match (result.data is not None, bool(content)):

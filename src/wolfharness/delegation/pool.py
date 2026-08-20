@@ -314,6 +314,9 @@ class AgentPool[TPoolDeps = None]:
                     enable_auto_resume=cfg.enable_auto_resume,
                     enable_event_bus=cfg.enable_event_bus,
                     max_auto_resume=cfg.max_auto_resume,
+                    subagent_inactivity_timeout_seconds=(
+                        cfg.subagent_inactivity_timeout_seconds
+                    ),
                 )
                 # Configure additional SessionPool settings
                 self._session_pool.sessions._session_ttl_seconds = cfg.session_ttl_seconds
@@ -567,8 +570,39 @@ class AgentPool[TPoolDeps = None]:
         return self._default_skill_scope
 
     def is_skill_visible_to_node(self, skill: Any, node_name: str | None) -> bool:
-        """Return whether a skill is visible to a node's package scope."""
+        """Return whether a Skill satisfies explicit and package-scope visibility."""
+        node_visibility = self.manifest.skills.node_visibility
+        if node_visibility and (
+            node_name is None or skill.name not in node_visibility.get(node_name, [])
+        ):
+            return False
         return self.skill_scope_for_skill(skill) == self.skill_scope_for_node(node_name)
+
+    def visible_skill_names_for_node(self, node_name: str | None) -> set[str]:
+        """Return Skill names visible to a node under the unified policy."""
+        if self.skills is None:
+            return set()
+        discovered = self.skills.list_skills()
+        visible = {
+            skill.name
+            for skill in discovered
+            if not skill.disable_model_invocation
+            and self.is_skill_visible_to_node(skill, node_name)
+        }
+        if self.manifest.skills.node_visibility and node_name is not None:
+            local_names = {skill.name for skill in discovered}
+            configured_remote_names = (
+                set(self.manifest.skills.node_visibility.get(node_name, [])) - local_names
+            )
+            visible.update(configured_remote_names)
+        return visible
+
+    def skill_capability_for_node(self, node_name: str) -> SkillManagerCap[Any] | None:
+        """Create the node-scoped view of the authoritative Skill manager."""
+        for capability in self._skill_capabilities:
+            if isinstance(capability, SkillManagerCap):
+                return capability.scoped(self.visible_skill_names_for_node(node_name))
+        return None
 
     async def get_skill_instructions_for_node(self, skill_name: str, node_name: str) -> str:
         """Load skill instructions using a target node's package scope."""
@@ -679,6 +713,7 @@ class AgentPool[TPoolDeps = None]:
             name="pool-skills",
             tool_manager=tool_manager,
             inject_mode=inject_mode,
+            max_skills=self.manifest.skills.instruction.max_skills,
         )
         self._skill_capabilities = [cap]
 

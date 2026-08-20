@@ -24,6 +24,7 @@ from wolfharness_server.opencode_server.models import (
     ProviderListResponse,
     ProvidersResponse,
 )
+from wolfharness_server.opencode_server.models.config import DEFAULT_IGNORE
 from wolfharness_server.shared.constants import (
     DEFAULT_MODEL_CONTEXT_LIMIT,
     DEFAULT_MODEL_INPUT_COST,
@@ -45,7 +46,6 @@ if TYPE_CHECKING:
 
 router = APIRouter(tags=["config"])
 
-DEFAULT_IGNORE = ["node_modules/**", "__pycache__/**", ".venv/**", "*.pyc", ".mypy_cache/**"]
 # Provider display names and environment variable mappings
 PROVIDER_INFO: dict[str, tuple[str, list[str]]] = {
     "anthropic": ("Anthropic", ["ANTHROPIC_API_KEY"]),

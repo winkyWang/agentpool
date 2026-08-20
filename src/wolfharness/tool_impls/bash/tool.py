@@ -172,6 +172,7 @@ class BashTool(Tool[ToolResult]):
             return ToolResult(
                 content=f"Command rejected: {validation_error}",
                 metadata={"output": "", "exit": None, "description": command},
+                is_error=True,
             )
 
         # Check if we're running in ACP - terminal streams client-side
@@ -223,6 +224,7 @@ class BashTool(Tool[ToolResult]):
                     return ToolResult(
                         content=error_msg,
                         metadata={"output": "", "exit": None, "description": command},
+                        is_error=True,
                     )
 
             # Apply output limit if specified
@@ -239,6 +241,7 @@ class BashTool(Tool[ToolResult]):
                 return ToolResult(
                     content=result_output,
                     metadata={"output": output, "exit": exit_code, "description": command},
+                    is_error=True,
                 )
 
         except Exception as e:  # noqa: BLE001
@@ -248,6 +251,7 @@ class BashTool(Tool[ToolResult]):
             return ToolResult(
                 content=error_msg,
                 metadata={"output": "", "exit": None, "description": command},
+                is_error=True,
             )
 
         # Format success response
@@ -256,4 +260,5 @@ class BashTool(Tool[ToolResult]):
         return ToolResult(
             content=formatted_output,
             metadata={"output": combined_output, "exit": exit_code, "description": command},
+            is_error=exit_code not in (None, 0),
         )

@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from wolfharness import log
+from wolfharness_server.opencode_server.models.config import DEFAULT_IGNORE
 from wolfharness_server.opencode_server.routes import (
     agent_router,
     app_router,
@@ -49,6 +50,33 @@ if TYPE_CHECKING:
 
 VERSION = "0.1.0"
 logger = log.get_logger(__name__)
+
+
+def _watcher_ignore_patterns(config: Any) -> list[str]:
+    """Combine invariant runtime exclusions with optional project exclusions."""
+    patterns = list(DEFAULT_IGNORE)
+    configured = getattr(getattr(config, "watcher", None), "ignore", None) or []
+    patterns.extend(pattern for pattern in configured if pattern not in patterns)
+    return patterns
+
+
+def _should_ignore_watched_path(
+    file_path: str,
+    *,
+    working_dir: str,
+    ignore_patterns: list[str],
+) -> bool:
+    """Match a watched absolute path against project-relative glob patterns."""
+    import fnmatch
+
+    normalized_path = file_path.replace("\\", "/")
+    normalized_working_dir = working_dir.replace("\\", "/").rstrip("/")
+    if "/.git/" in normalized_path or normalized_path.endswith("/.git"):
+        return True
+    rel_path = normalized_path
+    if normalized_path.startswith(f"{normalized_working_dir}/"):
+        rel_path = normalized_path[len(normalized_working_dir) :].lstrip("/")
+    return any(fnmatch.fnmatch(rel_path, pattern) for pattern in ignore_patterns)
 
 
 def filter_headers(headers: Headers) -> dict[str, str]:
@@ -383,23 +411,16 @@ def create_app(*, agent: BaseAgent[Any, Any], working_dir: str | None = None) ->
             Change.deleted: "unlink",
         }
 
-        # Get ignore patterns from config
-        ignore_patterns: list[str] = []
-        if state.config and state.config.watcher and state.config.watcher.ignore:
-            ignore_patterns = state.config.watcher.ignore
+        # Runtime defaults exist before the public config endpoint is requested.
+        ignore_patterns = _watcher_ignore_patterns(state.config)
 
         def should_ignore(file_path: str) -> bool:
             """Check if a file path should be ignored."""
-            import fnmatch
-
-            # Always ignore .git
-            if "/.git/" in file_path or file_path.endswith("/.git"):
-                return True
-            # Check user-configured patterns
-            rel_path = file_path
-            if state.working_dir and file_path.startswith(state.working_dir):
-                rel_path = file_path[len(state.working_dir) :].lstrip("/")
-            return any(fnmatch.fnmatch(rel_path, pat) for pat in ignore_patterns)
+            return _should_ignore_watched_path(
+                file_path,
+                working_dir=state.working_dir,
+                ignore_patterns=ignore_patterns,
+            )
 
         async def on_file_change(changes: AbstractSet[tuple[Change, str]]) -> None:
             """Broadcast file changes to all subscribers."""
@@ -418,6 +439,7 @@ def create_app(*, agent: BaseAgent[Any, Any], working_dir: str | None = None) ->
             paths=[state.working_dir],
             callback=on_file_change,
             debounce=500,  # 500ms debounce to batch rapid changes
+            path_filter=lambda file_path: not should_ignore(file_path),
         )
         await project_file_watcher.start()
         logger.info("Project FileWatcher started")
