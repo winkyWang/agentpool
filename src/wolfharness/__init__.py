@@ -49,6 +49,7 @@ register_http_filesystems()
 # so we can resolve the forward references.
 from wolfharness.prompts.prompts import BasePrompt, PromptType
 from wolfharness_config.knowledge import Knowledge
+from wolfharness_config.paths import resolve_config_path
 from wolfharness_config.task import Job
 
 _ns = {"PromptType": PromptType, "BasePrompt": BasePrompt}
@@ -77,4 +78,5 @@ __all__ = [
     "VideoUrl",
     "__version__",
     "acp_test_session",
+    "resolve_config_path",
 ]

@@ -15,6 +15,8 @@ WolfHarness rather than merged across the package and capability refactors.
   a fixed total-duration timeout.
 - OpenCode project watching filters invariant runtime paths, including `logs/**`,
   before watch logging and callback dispatch.
+- The root `wolfharness` package exports `resolve_config_path` so extensions can
+  use the canonical resolver without importing configuration internals first.
 
 The change contains no welding-domain prompts or business rules and preserves
 the current WolfHarness capability architecture.
