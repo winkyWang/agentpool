@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 from typing import TYPE_CHECKING, Any
-import uuid
 
 import logfire
 from opentelemetry.context import attach, detach
@@ -351,7 +350,7 @@ class SessionControllerRunsMixin:
         )
 
         run_handle = RunHandle(
-            run_id=uuid.uuid4().hex,
+            run_id=run_ctx.run_id,
             session_id=session.session_id,
             agent_type=agent.AGENT_TYPE,
             agent=agent,
@@ -414,7 +413,7 @@ class SessionControllerRunsMixin:
         agent._cancelled = False
 
         run_handle = RunHandle(
-            run_id=uuid.uuid4().hex,
+            run_id=run_ctx.run_id,
             session_id=session_id,
             agent_type=agent.AGENT_TYPE,
             agent=agent,

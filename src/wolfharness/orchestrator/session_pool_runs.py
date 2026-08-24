@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from typing import TYPE_CHECKING, Any
-import uuid
 
 from wolfharness.agents.context import AgentRunContext
 from wolfharness.agents.events import (
@@ -128,7 +127,7 @@ class SessionPoolRunsMixin:
         # Use lifecycle dimensions from SessionState (per-prompt migration).
         # _host_context and _agent_registry are also sourced from SessionState.
         run_handle = RunHandle(
-            run_id=uuid.uuid4().hex,
+            run_id=run_ctx.run_id,
             session_id=session_id,
             agent_type=agent.AGENT_TYPE,
             agent=agent,

@@ -342,6 +342,54 @@ async def test_session_pool_create_run_handle_creates_protocol_dimensions() -> N
     session._comm_channel.close()
 
 
+@pytest.mark.unit
+async def test_session_pool_run_handle_uses_context_run_identity() -> None:
+    """SessionPool registers the exact run identity exposed to tools."""
+    agent = _make_mock_agent()
+    pool = _make_mock_pool(agent)
+    session_pool = SessionPool(pool, enable_event_bus=True)
+    session = SessionState(session_id="s1", agent_name="test_agent")
+    session_pool.sessions._sessions["s1"] = session
+
+    run_handle = session_pool._create_run_handle(session, agent, "s1")
+
+    assert run_handle.run_ctx.run_id == run_handle.run_id
+    assert session.current_run_id == run_handle.run_ctx.run_id
+    assert session_pool.sessions._runs[run_handle.run_ctx.run_id] is run_handle
+
+
+@pytest.mark.unit
+async def test_session_controller_run_handles_use_context_run_identity() -> None:
+    """Initial and chained turns expose their registered run identity."""
+    agent = _make_mock_agent()
+    pool = _make_mock_pool(agent)
+    controller = SessionController(pool)
+    controller._event_bus = EventBus()
+    session = SessionState(session_id="s1", agent_name="test_agent")
+    controller._sessions["s1"] = session
+    controller._session_agents["s1"] = agent
+    await controller._initialize_lifecycle_and_recovery(session, agent)
+
+    controller._start_run_handle(session, agent, "s1", "hello")
+    assert session.current_run_id is not None
+    initial_handle = controller._runs[session.current_run_id]
+    assert initial_handle.run_ctx.run_id == initial_handle.run_id
+    assert session.current_run_id == initial_handle.run_ctx.run_id
+
+    initial_handle.close()
+    await initial_handle.complete_event.wait()
+
+    chained_handle = controller._create_per_prompt_handle(
+        session,
+        agent,
+        "follow-up",
+    )
+    assert chained_handle.run_ctx.run_id == chained_handle.run_id
+    assert session.current_run_id == chained_handle.run_ctx.run_id
+    assert controller._runs[chained_handle.run_ctx.run_id] is chained_handle
+    chained_handle.close()
+
+
 # ---------------------------------------------------------------------------
 # Event delivery end-to-end through ProtocolChannel → EventBus
 # ---------------------------------------------------------------------------
