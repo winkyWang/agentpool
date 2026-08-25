@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+import inspect
 import os
 from pathlib import Path
 import re
@@ -70,7 +71,6 @@ if TYPE_CHECKING:
     )
     from agentpool.delegation import AgentPool, BaseTeam
     from agentpool.hooks import AgentHooks
-    from agentpool.messaging import ChatMessage
     from agentpool.orchestrator.core import EventBus, SessionPool, SessionState
     from agentpool.orchestrator.run import RunHandle
     from agentpool.orchestrator.turn import Turn
@@ -251,6 +251,7 @@ class BaseAgent[TDeps = None, TResult = str](MessageNode[TDeps, TResult]):
         self._background_task: asyncio.Task[ChatMessage[Any]] | None = None
         storage = agent_pool.storage if agent_pool else None
         self.conversation = MessageHistory(storage=storage)
+        self._resolved_persistence_processors: list[Callable[..., Any]] | None = None
         match env:
             case ExecutionEnvironment():
                 self.env = env
@@ -294,6 +295,32 @@ class BaseAgent[TDeps = None, TResult = str](MessageNode[TDeps, TResult]):
         self.metadata: dict[str, Any] = {}
         self._lifecycle_config: LifecycleConfig | None = lifecycle_config
         self._lifecycle_dimensions: tuple[Any, Any, Any, Any, Any] | None = None
+
+    def _get_persistence_processors(self) -> list[Callable[..., Any]]:
+        """Resolve configured persistence processors once per agent instance."""
+        if self._resolved_persistence_processors is not None:
+            return self._resolved_persistence_processors
+
+        from agentpool.utils.importing import import_callable
+
+        config = self.conversation._config
+        paths = config.persistence_processors if config is not None else None
+        self._resolved_persistence_processors = [import_callable(path) for path in paths or []]
+        return self._resolved_persistence_processors
+
+    async def project_message_for_persistence(
+        self,
+        message: ChatMessage[Any],
+    ) -> ChatMessage[Any]:
+        """Apply configured processors without changing the live message."""
+        projected = message
+        for processor in self._get_persistence_processors():
+            result = processor(projected)
+            projected = await result if inspect.isawaitable(result) else result
+            if not isinstance(projected, ChatMessage):
+                msg = "Persistence processors must return ChatMessage"
+                raise TypeError(msg)
+        return projected
 
     @property
     def _current_run_ctx(self) -> AgentRunContext | None:
@@ -1605,7 +1632,8 @@ class BaseAgent[TDeps = None, TResult = str](MessageNode[TDeps, TResult]):
         # This ensures user messages are preserved even if the run is cancelled
         # or no assistant response is generated (e.g., elicitation cancelled)
         if store_history:
-            conversation.add_chat_messages([user_msg])
+            persisted_user_message = await self.project_message_for_persistence(user_msg)
+            conversation.add_chat_messages([persisted_user_message])
 
         try:
             async for event in self._stream_events(
@@ -1667,7 +1695,10 @@ class BaseAgent[TDeps = None, TResult = str](MessageNode[TDeps, TResult]):
                     # Use extend_last=True to include both user_msg and
                     # final_message in _last_messages
                     await self.log_message(final_message)
-                    conversation.add_chat_messages([final_message], extend_last=True)
+                    persisted_final_message = await self.project_message_for_persistence(
+                        final_message
+                    )
+                    conversation.add_chat_messages([persisted_final_message], extend_last=True)
 
     async def _execute_slash_command_streaming(
         self, command_text: str

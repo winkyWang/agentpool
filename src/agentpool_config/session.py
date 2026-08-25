@@ -111,6 +111,18 @@ class MemoryConfig(Schema):
     ```
     """
 
+    persistence_processors: list[str] | None = Field(
+        default=None,
+        examples=[["agentpool.messaging.persistence:project_multimodal_references"]],
+        title="Persistence processors",
+    )
+    """Ordered import paths applied to `ChatMessage` objects before storage.
+
+    Unlike history processors, persistence processors do not affect the current
+    model request or emitted events. Each callable accepts and returns one
+    `ChatMessage`; synchronous and asynchronous callables are supported.
+    """
+
     model_config = ConfigDict(frozen=True)
 
     @classmethod

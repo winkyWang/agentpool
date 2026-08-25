@@ -15,6 +15,7 @@ import uuid
 
 import logfire
 
+from agentpool.agents.base_agent import BaseAgent
 from agentpool.agents.context import AgentRunContext
 from agentpool.agents.events import (
     RunErrorEvent,
@@ -36,7 +37,6 @@ if TYPE_CHECKING:
     from pydantic_ai import AgentRun
     from pydantic_ai.messages import ModelMessage
 
-    from agentpool.agents.base_agent import BaseAgent
     from agentpool.agents.events.events import RichAgentStreamEvent
     from agentpool.host.context import HostContext
     from agentpool.host.registry import AgentRegistry
@@ -601,8 +601,13 @@ class RunHandle:
                         # immediately after receiving StreamCompleteEvent, which
                         # prevents any code after `yield event` from executing.
                         if isinstance(event, StreamCompleteEvent) and event.message is not None:
+                            persisted_message = (
+                                await agent.project_message_for_persistence(event.message)
+                                if isinstance(agent, BaseAgent)
+                                else event.message
+                            )
                             agent.conversation.add_chat_messages(
-                                [event.message],
+                                [persisted_message],
                                 extend_last=True,
                             )
                             stream_complete_saved = True
@@ -647,8 +652,13 @@ class RunHandle:
                 # before any output was produced).  Skip if the
                 # StreamCompleteEvent branch already saved.
                 if not stream_complete_saved and turn._final_message is not None:
+                    persisted_message = (
+                        await agent.project_message_for_persistence(turn._final_message)
+                        if isinstance(agent, BaseAgent)
+                        else turn._final_message
+                    )
                     agent.conversation.add_chat_messages(
-                        [turn._final_message],
+                        [persisted_message],
                         extend_last=True,
                     )
 
