@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 KNOWN_CAPABILITY_TYPES: frozenset[str] = frozenset({
@@ -364,6 +364,8 @@ class EntryPointCapabilityConfig(BaseModel):
     users to know the full Python import path.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     type: str
     """Entry-point name registered under ``wolfharness.capabilities``."""
 
@@ -413,6 +415,8 @@ class GenericCapabilityConfig(BaseModel):
     Used when ``type`` is a Python import path (e.g.
     ``'pydantic_ai.capabilities.Instrumentation'``) rather than a short name.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     type: str
     """Import path to the capability class."""

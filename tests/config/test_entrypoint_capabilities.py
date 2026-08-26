@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from pydantic import ValidationError
 import pytest
 
 from wolfharness import AgentsManifest, NativeAgentConfig
@@ -191,6 +192,21 @@ def test_entrypoint_config_build_with_empty_args() -> None:
         result = config.build()
     assert isinstance(result, _FakeCustomCapability)
     assert result.kwargs == {}
+
+
+def test_capability_constructor_arguments_must_be_nested_under_args() -> None:
+    """Reject silently ignored constructor values at the capability boundary."""
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        EntryPointCapabilityConfig(
+            type="custom_cap",
+            mission_timeout_seconds=1200,
+        )
+
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        GenericCapabilityConfig(
+            type="example.module.Capability",
+            max_model_requests=25,
+        )
 
 
 def test_entrypoint_config_build_unknown_raises() -> None:
