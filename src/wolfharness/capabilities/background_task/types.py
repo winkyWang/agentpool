@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
     from wolfharness.capabilities.background_task.manager import BackgroundTaskManager
     from wolfharness.capabilities.background_task.notification import NotificationBatcher
+    from wolfharness.execution import MissionExecutionContext
 
 TaskStatus = Literal[
     "pending",
@@ -39,6 +40,7 @@ class BackgroundTask:
     prompt: str
     parent_session_id: str | None
     child_session_id: str | None
+    mission: MissionExecutionContext | None = None
     load_skills: list[str] = field(default_factory=list)
     status: TaskStatus = "pending"
     created_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
@@ -47,6 +49,9 @@ class BackgroundTask:
     output_file: str | None = None
     result: str | None = None
     error: str | None = None
+    expected_artifact_type: str | None = None
+    completion_artifact_uri: str | None = None
+    completion_artifact_type: str | None = None
 
 
 @dataclass(slots=True)

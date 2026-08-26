@@ -29,6 +29,7 @@ from pydantic_graph import End
 from wolfharness.agents.base_agent import BaseAgent
 from wolfharness.agents.context import AgentContext
 from wolfharness.agents.events import (
+    ArtifactCompletionEvent,
     PartDeltaEvent,
     RunErrorEvent,
     RunFailedEvent,
@@ -42,6 +43,7 @@ from wolfharness.capabilities.background_task.notification import (
     _format_duration,
 )
 from wolfharness.capabilities.background_task.types import BackgroundTask, SessionTaskState
+from wolfharness.execution import MissionExecutionContext, mission_from_deps
 from wolfharness.orchestrator.core import EventEnvelope
 from wolfharness.skills.uri_resolver import ResolvedSkillURI
 from wolfharness.tools.exceptions import ToolError
@@ -111,6 +113,7 @@ class DelegationDeps(TypedDict, total=False):
     """
 
     delegation_depth: int
+    wolfharness_mission_context: MissionExecutionContext
 
 
 def _generate_task_id(description: str) -> str:
@@ -144,6 +147,8 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
         *,
         force_retrieval: bool | str | ForceRetrievalMode | None = False,
         max_concurrent_tasks: int = 10,
+        mission_timeout_seconds: float = 1800,
+        max_model_requests: int = 100,
         max_retrieval_retries: int = 3,
         notification_debounce_ms: float = 500,
         notification_deliver_timeout: float = 5.0,
@@ -171,6 +176,10 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
                   agent to call ``background_output``. Works with any model.
             max_concurrent_tasks: Maximum number of background tasks that may run
                 concurrently. Additional tasks queue until a slot is released.
+            mission_timeout_seconds: One execution deadline shared by the delegated
+                child Session tree.
+            max_model_requests: Maximum model requests shared by the delegated
+                child Session tree.
             max_retrieval_retries: Maximum number of times ``after_node_run``
                 will intercept ``End`` to inject a retrieval prompt before
                 allowing the run to terminate. Prevents infinite loops when
@@ -191,6 +200,12 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
         ]
         self._force_retrieval = ForceRetrievalMode.coerce(force_retrieval)
         self._max_retrieval_retries = max_retrieval_retries
+        if mission_timeout_seconds <= 0:
+            raise ValueError("mission_timeout_seconds must be greater than zero")
+        if max_model_requests < 1:
+            raise ValueError("max_model_requests must be at least one")
+        self._mission_timeout_seconds = mission_timeout_seconds
+        self._max_model_requests = max_model_requests
         self._notification_debounce_ms = notification_debounce_ms
         self._notification_deliver_timeout = notification_deliver_timeout
 
@@ -331,7 +346,10 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
         Returns:
             A new ``SessionTaskState`` instance.
         """
-        task_manager = BackgroundTaskManager(max_concurrent_tasks=self._max_concurrent_tasks)
+        task_manager = BackgroundTaskManager(
+            timeout_seconds=self._mission_timeout_seconds,
+            max_concurrent_tasks=self._max_concurrent_tasks,
+        )
 
         # Placeholder no-op deliver callback — replaced in normal path
         async def _noop_deliver(*_args: object) -> None:
@@ -677,6 +695,7 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
         agent: str,
         message: str,
         expected_output: str = "",
+        expected_artifact_type: str | None = None,
         load_skills: list[str] | None = None,
         title: str | None = None,
         async_mode: bool = False,
@@ -695,6 +714,7 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
             agent: The agent to execute the task
             message: The task instructions for the agent
             expected_output: Description of the expected output
+            expected_artifact_type: Exact persisted Artifact type required for typed completion.
             load_skills: Optional list of skill names to load for the subagent
             title: Optional title for the subtask
             async_mode: When true, run in background and return task_id immediately
@@ -770,6 +790,13 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
         tool_call_id = ctx.tool_call_id
 
         if async_mode:
+            mission = MissionExecutionContext.create(
+                root_session_id=parent_session_id,
+                progress_session_id=parent_session_id,
+                timeout_seconds=self._mission_timeout_seconds,
+                max_model_requests=self._max_model_requests,
+            )
+            new_deps["wolfharness_mission_context"] = mission
             return await self._task_async(
                 ctx=agent_ctx,
                 mode=mode,
@@ -782,6 +809,7 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
                 tool_call_id=tool_call_id,
                 title=title,
                 load_skills=load_skills or [],
+                expected_artifact_type=expected_artifact_type,
             )
 
         # Synchronous mode - stream with SubAgentEvent wrapping
@@ -915,6 +943,7 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
         tool_call_id: str | None,
         title: str | None = None,
         load_skills: list[str] | None = None,
+        expected_artifact_type: str | None = None,
     ) -> str:
         """Execute a task asynchronously in the background.
 
@@ -935,6 +964,7 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
             tool_call_id: ID of the tool call that triggered this task
             title: Optional title for the subtask
             load_skills: Optional list of skill names to load for the subagent
+            expected_artifact_type: Exact persisted Artifact type required for completion.
 
         Returns:
             Formatted text with task_id, session_id, description, and status
@@ -964,8 +994,10 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
             prompt=formatted_prompt,
             parent_session_id=parent_session_id,
             child_session_id=child_session_id,
+            mission=mission_from_deps(new_deps),
             load_skills=load_skills or [],
             output_file=output_path,
+            expected_artifact_type=expected_artifact_type,
         )
         state.task_manager.register_task(task_model)
 
@@ -1049,6 +1081,32 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
 
                         # Write to filesystem only
                         match event:
+                            case ArtifactCompletionEvent(
+                                mission_id=event_mission_id,
+                                session_id=event_session_id,
+                                artifact_uri=artifact_uri,
+                                artifact_type=artifact_type,
+                            ):
+                                mission = task_model.mission
+                                if (
+                                    mission is None
+                                    or event_mission_id != mission.mission_id
+                                    or event_session_id != child_session_id
+                                ):
+                                    continue
+                                if (
+                                    expected_artifact_type is not None
+                                    and artifact_type != expected_artifact_type
+                                ):
+                                    task_error = (
+                                        f"Expected {expected_artifact_type}, got {artifact_type}"
+                                    )
+                                    break
+                                task_model.completion_artifact_uri = artifact_uri
+                                task_model.completion_artifact_type = artifact_type
+                                fs.pipe(output_path, artifact_uri.encode())
+                                if expected_artifact_type is not None:
+                                    break
                             case ToolCallStartEvent(
                                 tool_name="attempt_completion",
                                 raw_input=args,
@@ -1066,6 +1124,15 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
                                     fs.pipe(output_path, result_text.encode())
                                 break
                             case StreamCompleteEvent(message=final_message):
+                                if (
+                                    expected_artifact_type is not None
+                                    and task_model.completion_artifact_uri is None
+                                ):
+                                    task_error = (
+                                        "Delegated Session ended without the required "
+                                        f"{expected_artifact_type} Artifact completion"
+                                    )
+                                    break
                                 final_content = ""
                                 if final_message and final_message.content:
                                     final_content = str(final_message.content)
@@ -1142,6 +1209,8 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
                 error_content = f"# Task Failed\n\n{error_msg}"
                 fs.pipe(output_path, error_content.encode())
                 raise
+            finally:
+                await session_pool.close_session(child_session_id)
 
         # Build the completion callback before starting the task so it is
         # installed atomically — a fast task could complete before we reach
@@ -1306,6 +1375,15 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
         duration = _format_duration(task_model.started_at, task_model.completed_at)
 
         if task_model.status == "completed":
+            if task_model.completion_artifact_uri is not None:
+                duration_line = f"\nDuration: {duration}" if duration else ""
+                return (
+                    f"Task Result\n\nTask ID: {task_model.id}\n"
+                    f"Description: {task_model.description}{duration_line}\n"
+                    f"Session ID: {task_model.child_session_id}\n"
+                    f"Artifact Type: {task_model.completion_artifact_type}\n"
+                    f"Artifact URI: {task_model.completion_artifact_uri}"
+                )
             result_text = task_model.result
             if result_text is None and task_model.output_file:
                 try:

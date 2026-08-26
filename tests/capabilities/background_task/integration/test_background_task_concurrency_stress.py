@@ -78,6 +78,7 @@ def _make_mock_pool(
     pool.teams = {}
     pool.sessions = None
     mock_session_pool = MagicMock()
+    mock_session_pool.close_session = AsyncMock()
 
     async def _get_or_create_session_agent(agent_name: str, agent_type: str):
         return nodes.get(agent_name, next(iter(nodes.values())))

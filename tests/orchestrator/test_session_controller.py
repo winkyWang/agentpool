@@ -22,6 +22,7 @@ from wolfharness.orchestrator.core import (
     SessionState,
 )
 from wolfharness.orchestrator.run import RunHandle
+from wolfharness.orchestrator.session_controller import _publish_state_update
 
 
 if TYPE_CHECKING:
@@ -31,6 +32,17 @@ if TYPE_CHECKING:
 pytestmark = pytest.mark.unit
 
 _L2_SKIP = pytest.mark.skip(reason="L2 migration: requires mock internals — remains L1 unit test")
+
+
+@pytest.mark.anyio
+async def test_state_update_publish_tolerates_channel_close_race() -> None:
+    """A channel closing after scheduling must not leak a task exception."""
+    comm = MagicMock()
+    comm.publish = AsyncMock(side_effect=RuntimeError("channel closed"))
+
+    await _publish_state_update(comm, MagicMock())
+
+    comm.publish.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

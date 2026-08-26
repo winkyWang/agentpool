@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 from pydantic_ai import TextPartDelta, ThinkingPartDelta, ToolCallPartDelta
 
 from wolfharness.agents.events import (
+    ArtifactCompletionEvent,
     CompactionEvent,
     ElicitationDeferredEvent,
     PartDeltaEvent,
@@ -103,6 +104,7 @@ def _is_immediate(event: Any) -> bool:
     match event:
         case (
             RunStartedEvent()
+            | ArtifactCompletionEvent()
             | RunErrorEvent()
             | RunFailedEvent()
             | StreamCompleteEvent()

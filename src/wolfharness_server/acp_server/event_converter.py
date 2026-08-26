@@ -58,6 +58,7 @@ from wolfharness.agents.events import (
     ElicitationDeferredEvent,
     FileContentItem,
     LocationContentItem,
+    MissionProgressEvent,
     PartDeltaEvent as AgentPoolPartDeltaEvent,
     PartStartEvent as AgentPoolPartStartEvent,
     PlanUpdateEvent,
@@ -552,6 +553,46 @@ class ACPEventConverter:
         from wolfharness_server.acp_server.syntax_detection import format_zed_code_block
 
         match event:
+            case MissionProgressEvent(
+                mission_id=mission_id,
+                phase=phase,
+                current=current,
+                total=total,
+                artifact_uri=artifact_uri,
+                message=message,
+            ):
+                tool_call_id = f"mission:{mission_id}"
+                state = self._get_or_create_tool_state(
+                    tool_call_id,
+                    "mission_progress",
+                    {"mission_id": mission_id},
+                )
+                title = message or phase.replace("_", " ")
+                if not state.started:
+                    state.started = True
+                    yield ToolCallStart(
+                        tool_call_id=tool_call_id,
+                        title=title,
+                        kind="other",
+                        raw_input={"mission_id": mission_id},
+                        status="pending",
+                    )
+                terminal = phase in {"result_ready", "technical_failure"}
+                yield ToolCallProgress(
+                    tool_call_id=tool_call_id,
+                    title=title,
+                    kind="other",
+                    status="completed" if terminal else "in_progress",
+                    raw_output={
+                        "phase": phase,
+                        "current": current,
+                        "total": total,
+                        "artifact_uri": artifact_uri,
+                    },
+                )
+                if terminal:
+                    self._cleanup_tool_state(tool_call_id)
+
             # Text output
             case (
                 PartStartEvent(part=TextPart(content=delta))

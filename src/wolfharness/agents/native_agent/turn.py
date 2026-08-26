@@ -29,6 +29,7 @@ from wolfharness.agents.events.events import (
     ToolCallCompleteEvent,
 )
 from wolfharness.agents.native_agent.helpers import extract_text_from_messages
+from wolfharness.execution import mission_from_deps
 from wolfharness.log import get_logger
 from wolfharness.messaging import ChatMessage
 from wolfharness.messaging.messages import TokenCost
@@ -273,6 +274,10 @@ class NativeTurn(HookAwareTurn, Turn):
                                 break
 
                             if isinstance(node, ModelRequestNode | CallToolsNode):
+                                if isinstance(node, ModelRequestNode):
+                                    mission = mission_from_deps(self._run_ctx.deps)
+                                    if mission is not None:
+                                        await mission.reserve_model_request()
                                 terminal_tool_completed = False
                                 # Cooperative cancellation is handled via run_ctx.cancelled
                                 # checked on every streaming chunk below.
@@ -342,6 +347,12 @@ class NativeTurn(HookAwareTurn, Turn):
                             # without a new model request) are skipped.
                             step_diff = diff_usage(agent_run.usage, prev_usage)
                             if step_diff.requests > 0:
+                                mission = mission_from_deps(self._run_ctx.deps)
+                                if mission is not None:
+                                    await mission.record_tokens(
+                                        input_tokens=step_diff.input_tokens,
+                                        output_tokens=step_diff.output_tokens,
+                                    )
                                 logger.info(
                                     "Emitting StepUsageEvent",
                                     step_index=step_index,
@@ -533,6 +544,7 @@ class NativeTurn(HookAwareTurn, Turn):
                 # returns. When cancelled via cancel(), the cancelled paths
                 # above already yielded StreamCompleteEvent(cancelled=True)
                 # and returned, so this code only runs on the success path.
+                new_messages = []
                 if self._message_history is not None:
                     # Only extract text from messages generated in THIS turn,
                     # not from the input history (which may contain previous

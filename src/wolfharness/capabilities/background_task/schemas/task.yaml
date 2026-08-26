@@ -66,6 +66,15 @@ parameters:
         - The specific work to be performed *only* within this sub-task.
         - The exact format and content of the expected return value.
         No deviations or additional work beyond this scope are permitted.
+    expected_artifact_type:
+      type:
+        - string
+        - "null"
+      description: |
+        Exact immutable Artifact type required for typed completion. When set,
+        the task completes only after the delegated Session publishes the
+        corresponding ArtifactCompletionEvent.
+      default: null
     async_mode:
       type: boolean
       description: |-

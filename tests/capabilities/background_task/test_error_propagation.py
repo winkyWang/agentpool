@@ -59,6 +59,7 @@ def _make_mock_pool() -> MagicMock:
     pool.sessions = None
 
     mock_session_pool = MagicMock()
+    mock_session_pool.close_session = AsyncMock()
     mock_session_pool.event_bus = MagicMock()
     mock_session_pool.event_bus.subscribe = AsyncMock(return_value=asyncio.Queue())
     mock_session_pool.event_bus.unsubscribe = AsyncMock()

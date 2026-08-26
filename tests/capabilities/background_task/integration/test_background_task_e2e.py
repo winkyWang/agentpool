@@ -74,7 +74,7 @@ def mock_pool_with_agent() -> AgentPool:
     pool.file_ops = MagicMock()
 
     # Set up a mock session_pool for the SessionPool-only code path
-    mock_session_pool = MagicMock()
+    mock_session_pool = MagicMock(close_session=AsyncMock())
 
     async def _empty_stream(*args, **kwargs):
         return
@@ -228,7 +228,7 @@ async def test_sync_task_delegation_with_streaming_result(mock_pool_with_agent: 
             message=ChatMessage(content="Hydraulic pump failure detected", role="assistant")
         )
 
-    mock_pool_with_agent.session_pool = MagicMock()
+    mock_pool_with_agent.session_pool = MagicMock(close_session=AsyncMock())
     mock_pool_with_agent.session_pool.run_stream = _session_stream
     mock_pool_with_agent.session_pool.sessions = MagicMock()
     mock_pool_with_agent.session_pool.sessions.get_or_create_session_agent = AsyncMock(
@@ -599,7 +599,7 @@ async def test_async_task_with_session_pool_inject_prompt(
     agent_ctx.run_ctx = mock_run_ctx  # type: ignore[attr-defined]
 
     # Set up session_pool with followup mock
-    mock_session_pool = MagicMock()
+    mock_session_pool = MagicMock(close_session=AsyncMock())
     mock_session_pool.inject_prompt = AsyncMock()
     mock_session_pool.steer = AsyncMock()
     mock_session_pool.followup = AsyncMock(return_value=True)
@@ -675,7 +675,7 @@ async def test_task_with_session_pool_run_stream(mock_pool_with_agent: AgentPool
             message=ChatMessage(content="Session pool result", role="assistant")
         )
 
-    mock_session_pool = MagicMock()
+    mock_session_pool = MagicMock(close_session=AsyncMock())
     mock_session_pool.run_stream = MagicMock(return_value=_session_stream())
     mock_session_pool.sessions = MagicMock()
     mock_session_pool.sessions.get_or_create_session_agent = AsyncMock(

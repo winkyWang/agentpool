@@ -1013,6 +1013,33 @@ class StepUsageEvent:
     """Event type discriminator (all events use ``event_kind``, NOT ``event_type``)."""
 
 
+@dataclass(frozen=True, kw_only=True)
+class ArtifactCompletionEvent:
+    """Typed notice emitted only after an immutable Artifact is persisted."""
+
+    mission_id: str
+    session_id: str
+    artifact_uri: str
+    artifact_type: str
+    emitted_at: float = field(default_factory=time.time)
+    event_kind: Literal["artifact_completion"] = "artifact_completion"
+
+
+@dataclass(frozen=True, kw_only=True)
+class MissionProgressEvent:
+    """Domain-neutral progress routed from a mission child to its root Session."""
+
+    mission_id: str
+    source_session_id: str
+    phase: str
+    current: int | None = None
+    total: int | None = None
+    artifact_uri: str | None = None
+    message: str | None = None
+    emitted_at: float = field(default_factory=time.time)
+    event_kind: Literal["mission_progress"] = "mission_progress"
+
+
 type RichAgentStreamEvent[OutputDataT] = (
     AgentStreamEvent
     | StreamCompleteEvent[OutputDataT]
@@ -1036,6 +1063,8 @@ type RichAgentStreamEvent[OutputDataT] = (
     | MessageReplacementEvent
     | UserMessageInsertedEvent[Any]
     | StepUsageEvent
+    | ArtifactCompletionEvent
+    | MissionProgressEvent
 )
 
 

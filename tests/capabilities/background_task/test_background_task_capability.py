@@ -427,7 +427,15 @@ def test_task_tool_schema_preserves_all_parameters():
     tool = toolset.tools["task"]  # type: ignore[union-attr]
     params = tool.tool_def.parameters_json_schema
 
-    expected_props = {"agent", "load_skills", "message", "expected_output", "title", "async_mode"}
+    expected_props = {
+        "agent",
+        "load_skills",
+        "message",
+        "expected_artifact_type",
+        "expected_output",
+        "title",
+        "async_mode",
+    }
     actual_props = set(params.get("properties", {}).keys())
     assert expected_props == actual_props, (
         f"Schema properties mismatch. Expected: {expected_props}, Got: {actual_props}"
@@ -507,6 +515,7 @@ async def test_task_prepends_skills_content_to_prompt():
     mock_pool.session_pool.event_bus.subscribe = AsyncMock(return_value=asyncio.Queue())
     mock_pool.session_pool.event_bus.unsubscribe = AsyncMock()
     mock_pool.session_pool.send_message = AsyncMock(return_value=MagicMock())
+    mock_pool.session_pool.close_session = AsyncMock()
 
     mock_node = MagicMock()
     mock_node.name = "engineer"

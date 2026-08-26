@@ -27,11 +27,12 @@ import pytest
 
 from wolfharness.agents.base_agent import BaseAgent
 from wolfharness.agents.context import AgentContext
-from wolfharness.agents.events import RunErrorEvent
+from wolfharness.agents.events import ArtifactCompletionEvent, RunErrorEvent
 from wolfharness.capabilities.background_task.capability import (
     BackgroundTaskCapability,
     _generate_task_id,
 )
+from wolfharness.execution import MissionExecutionContext
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +74,7 @@ def _make_mock_pool() -> MagicMock:
     mock_session_pool.event_bus.subscribe = AsyncMock(return_value=MagicMock())
     mock_session_pool.event_bus.unsubscribe = AsyncMock()
     mock_session_pool.send_message = AsyncMock(return_value=MagicMock())
+    mock_session_pool.close_session = AsyncMock()
     mock_session_pool.steer = AsyncMock()
     mock_session_pool.sessions = MagicMock()
     mock_session_pool.sessions.get_or_create_session_agent = AsyncMock(return_value=mock_agent)
@@ -446,7 +448,60 @@ async def test_run_and_stream_writes_cancelled_on_cancelled_error():
 
 
 # ---------------------------------------------------------------------------
-# Test 6: Task ID collision overwrites silently
+# Test 6: typed Artifact completion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_run_and_stream_records_typed_artifact_completion() -> None:
+    capability = BackgroundTaskCapability(schemas=None)
+    pool = _make_mock_pool()
+    ctx = _make_agent_context(pool)
+    mission = MissionExecutionContext.create(
+        root_session_id="ses_parent_123",
+        timeout_seconds=30,
+        max_model_requests=10,
+    )
+    event = ArtifactCompletionEvent(
+        mission_id=mission.mission_id,
+        session_id="ses_child_456",
+        artifact_uri="scratchpad:///welding/team-result.json",
+        artifact_type="WeldingExperienceTeamResult",
+    )
+    pool.session_pool.event_bus.subscribe = AsyncMock(
+        return_value=_make_event_queue([event]),
+    )
+
+    with (
+        patch(
+            "wolfharness.capabilities.background_task.capability._generate_task_id",
+            return_value="bg_artifact01",
+        ),
+        patch(
+            "wolfharness.capabilities.background_task.capability.MissionExecutionContext.create",
+            return_value=mission,
+        ),
+    ):
+        await capability._task(
+            _wrap_in_run_context(ctx),
+            agent="test_agent",
+            message="test task",
+            expected_artifact_type="WeldingExperienceTeamResult",
+            async_mode=True,
+        )
+
+    await _wait_for_terminal(capability, ctx, "bg_artifact01")
+    state = capability._get_session_state(ctx)
+    task_model = state.task_manager.get_task("bg_artifact01")
+
+    assert task_model is not None
+    assert task_model.status == "completed"
+    assert task_model.completion_artifact_uri.endswith("team-result.json")
+    pool.session_pool.close_session.assert_awaited_once_with("ses_child_456")
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Task ID collision overwrites silently
 # ---------------------------------------------------------------------------
 
 

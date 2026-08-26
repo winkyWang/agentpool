@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 from datetime import UTC, datetime
 import logging
+import time
 import traceback
 from typing import TYPE_CHECKING, Any
 import uuid
@@ -60,8 +61,7 @@ class BackgroundTaskManager:
         self._cleanup_after_seconds = cleanup_after_seconds
         self._cancel_timeout_seconds = cancel_timeout_seconds
 
-        self._cleanup_tasks: set[asyncio.Task[None]] = set()
-        self._cleanup_scheduled: set[str] = set()
+        self._expires_at: dict[str, float] = {}
 
         # task_id → waiter_id  (at most one blocking waiter per task)
         self._blocking_waiters: dict[str, str] = {}
@@ -72,6 +72,7 @@ class BackgroundTaskManager:
 
     def register_task(self, task: BackgroundTask) -> None:
         """Add a task to the registry in ``pending`` state."""
+        self._prune_expired()
         existing = self._tasks.get(task.id)
         if existing is not None and existing.status not in TERMINAL_STATES:
             msg = f"Task {task.id!r} already registered and non-terminal (status={existing.status})"
@@ -105,9 +106,13 @@ class BackgroundTaskManager:
         with logfire.span("background_task.manager.start_task", task_id=task_id):
             existing_handle = self._handles.get(task_id)
             if existing_handle is not None and not existing_handle.task.done():
+                coro.close()
                 msg = f"Task {task_id!r} is already running"
                 raise ValueError(msg)
             atask = asyncio.create_task(self._execute_task(task_id, coro))
+            atask.add_done_callback(
+                lambda completed: coro.close() if completed.cancelled() else None
+            )
             handle = TaskHandle(task=atask, on_completed=on_completed)
             self._handles[task_id] = handle
 
@@ -230,8 +235,18 @@ class BackgroundTaskManager:
         inner coroutine, letting the coroutine's ``CancelledError`` handler
         observe the terminal status and write the correct output message.
         """
+        timeout_seconds = (
+            task_model.mission.remaining_seconds()
+            if task_model.mission is not None
+            else self._timeout_seconds
+        )
+        if timeout_seconds <= 0:
+            if task_model.mission is not None:
+                task_model.mission.cancel()
+            coro.close()
+            raise TimeoutError
         inner_task = asyncio.create_task(coro)
-        timeout_task = asyncio.create_task(asyncio.sleep(self._timeout_seconds))
+        timeout_task = asyncio.create_task(asyncio.sleep(timeout_seconds))
         try:
             _done, _pending = await asyncio.wait(
                 {inner_task, timeout_task},
@@ -258,8 +273,10 @@ class BackgroundTaskManager:
             # coroutine's CancelledError handler can distinguish the two cases.
             if task_model.status not in TERMINAL_STATES:
                 task_model.status = "timed_out"
-                task_model.error = f"Task timed out after {self._timeout_seconds}s"
+                task_model.error = f"Task timed out after {timeout_seconds:.3f}s"
                 task_model.completed_at = datetime.now(tz=UTC)
+            if task_model.mission is not None:
+                task_model.mission.cancel()
             inner_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await inner_task
@@ -287,6 +304,9 @@ class BackgroundTaskManager:
 
         if task_model.status in TERMINAL_STATES:
             return f"Task {task_id!r} is already {task_model.status}"
+
+        if task_model.mission is not None:
+            task_model.mission.cancel()
 
         # Pending — cancel directly without asyncio.Task.cancel().
         if task_model.status == "pending":
@@ -370,10 +390,12 @@ class BackgroundTaskManager:
 
     def get_task(self, task_id: str) -> BackgroundTask | None:
         """Return the task model, or ``None`` if not found."""
+        self._prune_expired()
         return self._tasks.get(task_id)
 
     def get_all_tasks(self) -> list[BackgroundTask]:
         """Return all tasks in the registry."""
+        self._prune_expired()
         return list(self._tasks.values())
 
     # ------------------------------------------------------------------
@@ -479,24 +501,21 @@ class BackgroundTaskManager:
     # ------------------------------------------------------------------
 
     def _schedule_cleanup(self, task_id: str) -> None:
-        """Schedule removal of a terminal task after the retention period."""
-        if task_id in self._cleanup_scheduled:
-            return
-        self._cleanup_scheduled.add(task_id)
+        """Record a retention deadline without creating a detached sleeper task."""
+        self._expires_at.setdefault(task_id, time.monotonic() + self._cleanup_after_seconds)
 
-        async def _cleanup() -> None:
-            await asyncio.sleep(self._cleanup_after_seconds)
+    def _prune_expired(self) -> None:
+        """Remove terminal tasks whose retention deadline has elapsed."""
+        now = time.monotonic()
+        expired = [task_id for task_id, deadline in self._expires_at.items() if deadline <= now]
+        for task_id in expired:
+            handle = self._handles.get(task_id)
+            if handle is not None and not handle.task.done():
+                continue
             self._tasks.pop(task_id, None)
             self._handles.pop(task_id, None)
-            self._cleanup_scheduled.discard(task_id)
-
-        with logfire.span(
-            "background_task.manager.schedule_cleanup",
-            task_id=task_id,
-        ):
-            cleanup_task = asyncio.create_task(_cleanup())
-            self._cleanup_tasks.add(cleanup_task)
-            cleanup_task.add_done_callback(self._cleanup_tasks.discard)
+            self._blocking_waiters.pop(task_id, None)
+            self._expires_at.pop(task_id, None)
 
     @logfire.instrument("background_task.manager.shutdown")
     async def shutdown(self) -> None:
@@ -512,12 +531,6 @@ class BackgroundTaskManager:
                 with contextlib.suppress(asyncio.CancelledError):
                     await handle.task
 
-        for cleanup_task in list(self._cleanup_tasks):
-            cleanup_task.cancel()
-        for cleanup_task in list(self._cleanup_tasks):
-            with contextlib.suppress(asyncio.CancelledError):
-                await cleanup_task
-
         self._tasks.clear()
         self._handles.clear()
-        self._cleanup_tasks.clear()
+        self._expires_at.clear()

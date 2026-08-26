@@ -283,6 +283,8 @@ class NotificationBatcher:
             if task.status == "completed":
                 lines.append(f"{i}. **{task.description}** — completed{duration_str}")
                 lines.append(f"   ID: `{task.id}`")
+                if task.completion_artifact_uri is not None:
+                    lines.append(f"   Artifact: `{task.completion_artifact_uri}`")
             elif task.status in ("error", "timed_out"):
                 error_brief = (task.error or "unknown error")[:80]
                 lines.append(f"{i}. **{task.description}** — {task.status}{duration_str}")

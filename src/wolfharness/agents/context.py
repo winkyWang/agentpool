@@ -624,6 +624,51 @@ class AgentContext[TDeps = Any](NodeContext[TDeps]):
                 "report_progress called with no active run context or event_bus — event dropped"
             )
 
+    async def report_mission_progress(
+        self,
+        *,
+        phase: str,
+        current: int | None = None,
+        total: int | None = None,
+        artifact_uri: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        """Publish domain-neutral progress to the mission root Session."""
+        from wolfharness.agents.events import MissionProgressEvent
+        from wolfharness.execution import mission_from_deps
+
+        run_ctx = self.run_ctx
+        mission = mission_from_deps(run_ctx.deps if run_ctx is not None else None)
+        if run_ctx is None or run_ctx.event_bus is None or mission is None:
+            raise RuntimeError("Mission progress requires an active mission context")
+        event = MissionProgressEvent(
+            mission_id=mission.mission_id,
+            source_session_id=run_ctx.session_id,
+            phase=phase,
+            current=current,
+            total=total,
+            artifact_uri=artifact_uri,
+            message=message,
+        )
+        await run_ctx.event_bus.publish(mission.progress_session_id, event)
+
+    async def complete_artifact(self, *, artifact_uri: str, artifact_type: str) -> None:
+        """Publish a typed completion after a domain tool persists its Artifact."""
+        from wolfharness.agents.events import ArtifactCompletionEvent
+        from wolfharness.execution import mission_from_deps
+
+        run_ctx = self.run_ctx
+        mission = mission_from_deps(run_ctx.deps if run_ctx is not None else None)
+        if run_ctx is None or run_ctx.event_bus is None or mission is None:
+            raise RuntimeError("Artifact completion requires an active mission context")
+        event = ArtifactCompletionEvent(
+            mission_id=mission.mission_id,
+            session_id=run_ctx.session_id,
+            artifact_uri=artifact_uri,
+            artifact_type=artifact_type,
+        )
+        await run_ctx.event_bus.publish(run_ctx.session_id, event)
+
     @property
     def events(self) -> StreamEventEmitter:
         """Get event emitter with context automatically injected."""

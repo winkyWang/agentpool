@@ -6,9 +6,9 @@ These tests verify that previously-fixed bugs remain fixed:
 - P0: ``register_task`` raises ``ValueError`` on duplicate non-terminal ID
 - P1: No ghost blocking waiters after caller cleanup (try/finally in background_output)
 - P1: ``finally`` block exceptions do NOT replace original exceptions (shielded cleanup)
-- P1: ``shutdown`` cancels and clears all cleanup tasks
+- P1: ``shutdown`` clears lazy retention metadata
 - P1: ``shutdown`` uses ``cancel_task`` flow (on_completed IS called)
-- P1: ``_schedule_cleanup`` is idempotent (tracks via ``_cleanup_scheduled`` set)
+- P1: terminal retention is lazy and creates no detached sleeper tasks
 """
 
 from __future__ import annotations
@@ -296,17 +296,13 @@ async def test_unsubscribe_exception_in_finally_replaces_original() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 6: shutdown does not cancel cleanup tasks (P1)
+# Test 6: shutdown clears retention metadata
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-async def test_shutdown_does_not_cancel_cleanup_tasks() -> None:
-    """VERIFIES P1 FIX: ``shutdown`` cancels and clears all cleanup tasks.
-
-    ``shutdown`` now cancels all pending ``_cleanup_tasks``, awaits them,
-    and clears the set.  No cleanup tasks remain after shutdown.
-    """
+async def test_shutdown_clears_retention_metadata() -> None:
+    """Shutdown clears lazy retention metadata without detached tasks."""
     manager = BackgroundTaskManager(
         timeout_seconds=10,
         cleanup_after_seconds=0.1,
@@ -321,13 +317,10 @@ async def test_shutdown_does_not_cancel_cleanup_tasks() -> None:
         assert result is not None
         assert result.status == "completed"
 
-        # Immediately call shutdown — cleanup tasks are still pending.
+        # Immediately call shutdown while the retention deadline is pending.
         await manager.shutdown()
 
-        # _cleanup_tasks should be empty (shutdown cancels and clears them).
-        assert len(manager._cleanup_tasks) == 0, (
-            f"Cleanup tasks should be cleared after shutdown, got {len(manager._cleanup_tasks)} remaining"
-        )
+        assert manager._expires_at == {}
     finally:
         # shutdown already called above; calling again is safe.
         await manager.shutdown()
@@ -377,23 +370,13 @@ async def test_shutdown_bypasses_cancel_task_flow() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 8: _schedule_cleanup called multiple times (P1)
+# Test 8: retention scheduling is idempotent
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
 async def test_schedule_cleanup_called_multiple_times() -> None:
-    """VERIFIES P1 FIX: ``_schedule_cleanup`` is idempotent via ``_cleanup_scheduled`` set.
-
-    When a pending task is cancelled, ``cancel_task`` calls
-    ``_schedule_cleanup``.  Later, ``_execute_task``'s ``finally`` block
-    also calls ``_schedule_cleanup``.  With the fix, the second call is
-    a no-op because the task_id is already in ``_cleanup_scheduled``.
-
-    This test creates two tasks (bg_blocker + bg_queued). Each task_id
-    gets exactly 1 cleanup task (no duplicates). Total: 2 cleanup tasks.
-    Without the fix, bg_queued would get 2 (duplicate), total: 3.
-    """
+    """Repeated scheduling stores one lazy retention deadline per task."""
     manager = BackgroundTaskManager(
         max_concurrent_tasks=1,
         timeout_seconds=30,
@@ -427,24 +410,13 @@ async def test_schedule_cleanup_called_multiple_times() -> None:
         # The blocker's _execute_task also calls _schedule_cleanup (#3).
         await asyncio.sleep(0.3)
 
-        # With the fix, exactly 2 cleanup tasks exist (one per task_id).
-        # Without the fix, bg_queued would have 2 (duplicate), total 3.
-        assert len(manager._cleanup_tasks) == 2, (
-            f"Expected exactly 2 cleanup tasks (one per task_id), got {len(manager._cleanup_tasks)}. Duplicate cleanup tasks indicate _schedule_cleanup is not idempotent."
-        )
+        assert set(manager._expires_at) == {"bg_blocker", "bg_queued"}
 
-        # Wait for cleanup tasks to complete (cleanup_after_seconds=1.0).
+        # Lazy cleanup runs on the next manager query after retention expires.
         await asyncio.sleep(1.5)
-
-        # All cleanup tasks should have completed and been removed from the set.
-        assert len(manager._cleanup_tasks) == 0, (
-            f"Cleanup tasks should have completed and been removed, got {len(manager._cleanup_tasks)} remaining"
-        )
-
-        # The queued task should have been removed from _tasks after
-        # the first cleanup ran.
         assert manager.get_task("bg_queued") is None, (
             "Queued task should have been cleaned up from _tasks"
         )
+        assert manager._expires_at == {}
     finally:
         await manager.shutdown()

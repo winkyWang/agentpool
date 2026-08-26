@@ -1,6 +1,7 @@
 """Agent events."""
 
 from .events import (
+    ArtifactCompletionEvent,
     CommandCompleteEvent,
     CommandOutputEvent,
     CompactionEvent,
@@ -10,6 +11,7 @@ from .events import (
     FileContentItem,
     LocationContentItem,
     MessageReplacementEvent,
+    MissionProgressEvent,
     PlanUpdateEvent,
     PartStartEvent,
     PartDeltaEvent,
@@ -54,6 +56,7 @@ from .processors import (
 )
 
 __all__ = [
+    "ArtifactCompletionEvent",
     "BaseTTSEventHandler",
     "CommandCompleteEvent",
     "CommandOutputEvent",
@@ -65,6 +68,7 @@ __all__ = [
     "FileContentItem",
     "LocationContentItem",
     "MessageReplacementEvent",
+    "MissionProgressEvent",
     "OpenAITTSEventHandler",
     "PartDeltaEvent",
     "PartStartEvent",

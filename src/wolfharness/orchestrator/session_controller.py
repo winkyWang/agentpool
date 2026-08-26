@@ -44,6 +44,12 @@ logger = get_logger(__name__)
 DEFAULT_SESSION_TTL_SECONDS: Final[float] = 3600.0
 
 
+async def _publish_state_update(comm: CommChannel, event: Any) -> None:
+    """Publish a lifecycle update without leaking a task when close wins the race."""
+    with contextlib.suppress(RuntimeError):
+        await comm.publish(event)
+
+
 class SessionNotFoundError(Exception):
     """Raised when a session cannot be found for resume."""
 
@@ -322,8 +328,8 @@ class SessionState:
             state=new_state,
             stop_reason=None,
         )
-        with contextlib.suppress(Exception):
-            asyncio.get_running_loop().create_task(comm.publish(state_event))
+        with contextlib.suppress(RuntimeError):
+            asyncio.get_running_loop().create_task(_publish_state_update(comm, state_event))
 
     def revoke(self, message_id: str) -> bool:
         """Revoke a queued steer message in ``feedback_queue`` by ID.

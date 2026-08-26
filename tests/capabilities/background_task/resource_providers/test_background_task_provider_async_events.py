@@ -88,7 +88,7 @@ def _make_mock_pool(nodes: dict[str, MagicMock] | None = None) -> AgentPool:
     pool.teams = {}
     pool.sessions = None
 
-    mock_session_pool = MagicMock()
+    mock_session_pool = MagicMock(close_session=AsyncMock())
 
     def _run_stream_proxy(child_session_id: str, formatted_prompt: str, **kwargs: Any):
         for node in nodes.values():
