@@ -356,9 +356,13 @@ class DynamicContextPruningCapability(AbstractCapability[Any]):
     def get_instructions(self) -> AgentInstructions[Any] | None:
         """Return system-prompt instructions describing pruning tools.
 
-        Returns a static string that documents the available pruning
-        tools, the numbered ID system, and the decompress tool.
+        Model-facing instructions are part of the same contract as the
+        model-facing toolset.  When the capability is disabled or its tools
+        are not exposed, returning instructions would advertise tools the
+        model cannot call.
         """
+        if not self._config.enabled or not self._config.expose_tools:
+            return None
         return _INSTRUCTIONS_TEXT
 
     def get_toolset(self) -> AgentToolset[Any] | None:
@@ -628,9 +632,10 @@ class DynamicContextPruningCapability(AbstractCapability[Any]):
         # so meta-tool returns are already cleaned up.
         messages = self._auto_prune_meta_tools(messages, state)
 
-        # Build tool_id_list always; inject <prunable-tools> list (INFO-gated).
+        # Build tool_id_list for runtime bookkeeping.  The numbered list is
+        # model-facing protocol, so expose it only alongside the DCP tools.
         prunable_text = build_prunable_list(messages, state, effective_config)
-        if level >= WatermarkLevel.INFO and prunable_text:
+        if self._config.expose_tools and level >= WatermarkLevel.INFO and prunable_text:
             messages = inject_prunable_list(messages, prunable_text, self._config.inject_role)
             logger.debug(
                 "DynamicContextPruning Phase 0.5: injected prunable list with "
@@ -753,7 +758,7 @@ class DynamicContextPruningCapability(AbstractCapability[Any]):
             self._config.nudge_step_frequency > 0
             and state.nudge_step_counter >= self._config.nudge_step_frequency
         )
-        if turn_trigger or step_trigger:
+        if self._config.expose_tools and (turn_trigger or step_trigger):
             nudge_text = build_nudge_text(state, effective_config)
             session_id = self._get_session_id(ctx)
             steer_id: str | None = None

@@ -1628,33 +1628,43 @@ async def test_tool_call_return_pairing_intact_after_pruning() -> None:
 
 
 async def test_expose_tools_false_no_tools_registered() -> None:
-    """Test that expose_tools=False means no tools in toolset, pipeline still runs.
+    """Test that hidden tools also hide their model-facing protocol.
 
     Given: A capability with expose_tools=False.
     When: get_toolset() is called and before_model_request runs.
-    Then: Toolset is None; pipeline executes without errors.
+    Then: No toolset, instructions, numbered list, or nudge is exposed while
+    the automatic pipeline continues to run.
     """
     cap = _make_capability(
-        max_context_tokens=100_000,
+        max_context_tokens=100,
         expose_tools=False,
+        nudge_turn_frequency=1,
     )
 
-    # No toolset should be returned.
-    toolset = cap.get_toolset()
-    assert toolset is None
+    assert cap.get_toolset() is None
+    assert cap.get_instructions() is None
 
-    # Pipeline should still run.
     session_data = _make_session_data()
     ctx = _make_run_context(session_data=session_data)
+    await cap.before_run(ctx)
     messages = [
-        _make_request([UserPromptPart(content="Hello")]),
-        _make_response([TextPart(content="Hi")]),
-        _make_request([UserPromptPart(content="Bye")]),
+        _make_request([UserPromptPart(content="Read the source")]),
+        _make_response([_make_tool_call("read", {"path": "source.py"}, "tc_hidden")]),
+        _make_request([_make_tool_return("read", "important content " * 50, "tc_hidden")]),
     ]
     req_ctx = _make_request_context(messages)
 
     result = await cap.before_model_request(ctx, req_ctx)
     assert result is not None
+    rendered = "\n".join(
+        str(part.content)
+        for message in result.messages
+        for part in getattr(message, "parts", [])
+        if hasattr(part, "content")
+    )
+    assert "<prunable-tools>" not in rendered
+    assert "`distill`" not in rendered
+    assert session_data.metadata["dcp"].nudge_counter == 1
 
 
 # =============================================================================
@@ -1693,8 +1703,8 @@ async def test_dcp_disabled_returns_request_context_unchanged() -> None:
     # Toolset should also be None when disabled.
     assert cap.get_toolset() is None
 
-    # Instructions should still be available (static text).
-    assert cap.get_instructions() is not None
+    # A disabled capability must not advertise unavailable tools.
+    assert cap.get_instructions() is None
 
     # before_run should be a no-op.
     state_before = cap._fallback_state.current_turn
