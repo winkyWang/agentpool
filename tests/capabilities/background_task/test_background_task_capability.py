@@ -296,7 +296,7 @@ async def test_loop_breaker_default_max_is_3():
 
 
 async def test_before_run_resets_retry_count():
-    """before_run should reset _retrieval_retry_count to 0."""
+    """A new Run resets only the per-Run retry count."""
     capability = BackgroundTaskCapability(force_retrieval="tool_choice")
     mock_ctx = MagicMock()
     state = capability._get_session_state(mock_ctx)
@@ -304,24 +304,24 @@ async def test_before_run_resets_retry_count():
     state.pending_retrievals = {"bg_aaa"}
     await capability.before_run(mock_ctx)
     assert state.retrieval_retry_count == 0
-    assert state.pending_retrievals == set()
+    assert state.pending_retrievals == {"bg_aaa"}
 
 
 # ---- Per-run tracking tests ----
 
 
-async def test_before_run_clears_pending_retrievals():
-    """before_run should clear _pending_retrievals."""
+async def test_before_run_preserves_session_pending_retrievals():
+    """A child result awaiting retrieval survives across parent Runs."""
     capability = BackgroundTaskCapability(force_retrieval="tool_choice")
     mock_ctx = MagicMock()
     state = capability._get_session_state(mock_ctx)
     state.pending_retrievals = {"bg_aaa", "bg_bbb"}
     await capability.before_run(mock_ctx)
-    assert state.pending_retrievals == set()
+    assert state.pending_retrievals == {"bg_aaa", "bg_bbb"}
 
 
-def test_pending_retrievals_add_on_task_async():
-    """_task_async should add task_id to _pending_retrievals when force_retrieval is enabled."""
+def test_pending_retrievals_track_async_task_when_force_mode_enabled():
+    """Pending retrieval ownership is recorded when forcing is enabled."""
     capability = BackgroundTaskCapability(force_retrieval="tool_choice")
     mock_ctx = MagicMock()
     state = capability._get_session_state(mock_ctx)
@@ -333,15 +333,14 @@ def test_pending_retrievals_add_on_task_async():
     assert task_id in state.pending_retrievals
 
 
-def test_pending_retrievals_not_added_when_disabled():
-    """_task_async should NOT add task_id when force_retrieval is disabled."""
+def test_pending_retrievals_track_async_task_when_force_mode_disabled():
+    """Force mode controls prompting, not ownership of an async result."""
     capability = BackgroundTaskCapability()
     mock_ctx = MagicMock()
     state = capability._get_session_state(mock_ctx)
     task_id = "bg_test456"
-    if capability._force_retrieval is not ForceRetrievalMode.disabled:
-        state.pending_retrievals.add(task_id)
-    assert task_id not in state.pending_retrievals
+    state.pending_retrievals.add(task_id)
+    assert task_id in state.pending_retrievals
 
 
 def test_background_output_discards_from_pending():

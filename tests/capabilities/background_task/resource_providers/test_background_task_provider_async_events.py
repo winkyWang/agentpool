@@ -37,17 +37,32 @@ from wolfharness.capabilities.background_task.capability import (
     BackgroundTaskCapability,
 )
 from wolfharness.delegation import AgentPool
+from wolfharness.lifecycle.types import DeliveryMode
 
 
 pytestmark = pytest.mark.anyio
 
 
-async def _wait_until_called(mock_obj: Any, timeout: float = 3.0, interval: float = 0.05) -> None:
+def _completion_calls(session_pool: Any) -> list[Any]:
+    return [
+        call
+        for call in session_pool.send_message.call_args_list
+        if len(call.args) >= 2 and "BACKGROUND TASK" in str(call.args[1])
+    ]
+
+
+async def _wait_for_completion(
+    session_pool: Any,
+    timeout: float = 3.0,
+    interval: float = 0.05,
+) -> list[Any]:
     elapsed = 0.0
-    while mock_obj.call_count == 0 and elapsed < timeout:
+    while not _completion_calls(session_pool) and elapsed < timeout:
         await asyncio.sleep(interval)
         elapsed += interval
-    assert mock_obj.call_count > 0, f"Mock was not called within {timeout}s"
+    calls = _completion_calls(session_pool)
+    assert calls, f"Completion notification was not routed within {timeout}s"
+    return calls
 
 
 def _wrap_in_run_context(agent_ctx):
@@ -118,6 +133,8 @@ def _make_mock_pool(nodes: dict[str, MagicMock] | None = None) -> AgentPool:
         return queue
 
     async def _send_message(session_id: str, prompt: str, input_provider=None, **kwargs: Any):
+        if kwargs.get("source") == "accepted":
+            return MagicMock()
         queue = _queues.get(session_id)
         if queue is None:
             queue = asyncio.Queue(maxsize=100)
@@ -150,9 +167,7 @@ def _make_mock_pool(nodes: dict[str, MagicMock] | None = None) -> AgentPool:
         return MagicMock()
 
     mock_session_pool.send_message = AsyncMock(side_effect=_send_message)
-    mock_session_pool.inject_prompt = AsyncMock()
     mock_session_pool.steer = AsyncMock()
-    mock_session_pool.followup = AsyncMock(return_value=True)
     mock_session_pool.event_bus = MagicMock()
     mock_session_pool.event_bus.subscribe = AsyncMock(side_effect=_subscribe)
     mock_session_pool.event_bus.unsubscribe = AsyncMock()
@@ -576,13 +591,13 @@ async def test_async_task_emits_spawn_session_start():
 
 
 # ---------------------------------------------------------------------------
-# Test: async task completion callback calls inject_prompt
+# Test: async task completion callback routes a Session message
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-async def test_async_task_completion_callback_injects_prompt():
-    """Verify that task completion still calls session_pool.inject_prompt()."""
+async def test_async_task_completion_callback_routes_session_message():
+    """Verify that completion is routed independently of the launching Run."""
     capability = BackgroundTaskCapability(schemas=None)
     pool = _make_mock_pool()
     ctx = _make_agent_context(pool=pool)
@@ -607,11 +622,8 @@ async def test_async_task_completion_callback_injects_prompt():
         )
 
     # Wait for background task and callback to complete + 500ms debounce
-    await _wait_until_called(pool.session_pool.followup)
-
-    # Verify followup was called (not steer)
-    pool.session_pool.followup.assert_awaited()
-
-    call_args = pool.session_pool.followup.call_args
-    assert call_args is not None
+    calls = await _wait_for_completion(pool.session_pool)
+    assert len(calls) == 1
+    call_args = calls[0]
     assert call_args[0][0] == "ses_parent_123"
+    assert call_args.kwargs["mode"] is DeliveryMode.QUEUE

@@ -3,10 +3,11 @@
 Core rules:
 - When a background task completes and ``background_output(block=True)`` is
   actively waiting, the result is returned via that call — no duplicate
-  notification via ``followup()``.
+  notification is routed to the parent Session.
 - When a background task completes with **no** blocking waiter, the
   ``NotificationBatcher`` debounces and batches the notification, then
-  delivers it via ``session_pool.followup()`` (never ``steer()``).
+  delivers it through ``session_pool.send_message()``. The Session router
+  forwards it to an active Run or starts a new Run when the Session is idle.
 - Notifications use ``[BACKGROUND TASK RESULT READY]`` /
   ``[ALL BACKGROUND TASKS COMPLETE]`` / ``[BACKGROUND TASK ERROR]`` headers.
 - The batcher has a 500ms debounce window — no notification is delivered
@@ -38,22 +39,38 @@ from wolfharness.capabilities.background_task.capability import (
 from wolfharness.capabilities.background_task.manager import BackgroundTaskManager
 from wolfharness.capabilities.background_task.types import BackgroundTask, TaskHandle
 from wolfharness.delegation import AgentPool
+from wolfharness.lifecycle.types import DeliveryMode
 
 
 pytestmark = pytest.mark.anyio
 
 
-async def _wait_until_called(mock_obj: Any, timeout: float = 3.0, interval: float = 0.05) -> None:
-    """Poll until a Mock has been called at least once, or timeout.
+def _notification_calls(session_pool: Any) -> list[Any]:
+    """Return only parent-session completion deliveries.
 
-    More reliable than fixed ``asyncio.sleep`` under CI load where the
-    event loop may be busy and debounce timers fire late.
+    ``send_message`` also starts child Sessions, so raw call counts do not
+    express whether the completion notification was routed.
     """
+    return [
+        call
+        for call in session_pool.send_message.call_args_list
+        if len(call.args) >= 2 and "BACKGROUND TASK" in str(call.args[1])
+    ]
+
+
+async def _wait_for_notification(
+    session_pool: Any,
+    timeout: float = 3.0,
+    interval: float = 0.05,
+) -> list[Any]:
+    """Wait until the Session router receives a completion notification."""
     elapsed = 0.0
-    while mock_obj.call_count == 0 and elapsed < timeout:
+    while not _notification_calls(session_pool) and elapsed < timeout:
         await asyncio.sleep(interval)
         elapsed += interval
-    assert mock_obj.call_count > 0, f"Mock was not called within {timeout}s"
+    calls = _notification_calls(session_pool)
+    assert calls, f"Completion notification was not routed within {timeout}s"
+    return calls
 
 
 def _wrap_in_run_context(agent_ctx):
@@ -112,9 +129,7 @@ def _make_mock_pool(nodes: dict[str, MagicMock] | None = None) -> AgentPool:
         side_effect=_get_or_create_session_agent,
     )
 
-    mock_session_pool.inject_prompt = AsyncMock()
     mock_session_pool.steer = AsyncMock()
-    mock_session_pool.followup = AsyncMock(return_value=True)
 
     async def _send_message(session_id: str, prompt: str, input_provider=None, **kwargs: Any):
         await asyncio.sleep(0.1)
@@ -140,13 +155,10 @@ def _make_agent_context(
 ) -> AgentContext:
     """Create a minimal AgentContext for testing.
 
-    The ``ctx.agent`` mock exposes ``inject_prompt`` so tests can
-    assert whether it was called.
-
     Sets ``ctx.run_ctx`` to a mock ``AgentRunContext`` with the attributes
     needed by the batching / notification code path:
     - ``session_id``: parent session ID
-    - ``_run_handle``: ``None`` (forces ``session_pool.followup()`` path)
+    - ``_run_handle``: ``None`` (proves delivery is Session-scoped)
     - ``child_done_events``: dict for event popping
     """
     agent = MagicMock(spec=BaseAgent)
@@ -187,14 +199,14 @@ async def _collect_stream_events(events: list[object]):
 
 
 # ---------------------------------------------------------------------------
-# Test: no followup when blocking waiter is present
+# Test: no Session notification when blocking waiter is present
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
 async def test_no_inject_when_blocking_waiter_present():
     """When background_output(block=True) is waiting, task completion must
-    NOT call followup — the result is returned through the blocking
+    NOT route a notification — the result is returned through the blocking
     call instead.
     """
     capability = BackgroundTaskCapability(schemas=None)
@@ -239,22 +251,22 @@ async def test_no_inject_when_blocking_waiter_present():
     # Result should be returned normally
     assert "Task Result" in output
 
-    # followup must NOT have been called (blocking waiter was present)
-    pool.session_pool.followup.assert_not_called()
+    # No parent notification is routed (the child-start send_message remains).
+    assert _notification_calls(pool.session_pool) == []
 
     # steer must NOT have been called either
     pool.session_pool.steer.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# Test: followup IS called when no blocking waiter (after debounce)
+# Test: Session notification is routed when no blocking waiter
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
 async def test_inject_when_no_blocking_waiter():
     """When no background_output(block=True) is waiting, task completion
-    must call followup to notify the lead agent after the 500ms debounce.
+    must route a Session message after the 500ms debounce.
     """
     capability = BackgroundTaskCapability(schemas=None)
     pool = _make_mock_pool()
@@ -283,16 +295,17 @@ async def test_inject_when_no_blocking_waiter():
         )
 
     # Wait for background task to complete + 500ms debounce
-    await _wait_until_called(pool.session_pool.followup)
+    calls = await _wait_for_notification(pool.session_pool)
 
-    # followup SHOULD have been called (no blocking waiter)
-    pool.session_pool.followup.assert_called_once()
-    call_args = pool.session_pool.followup.call_args
+    assert len(calls) == 1
+    call_args = calls[0]
     notice = call_args[0][1]  # second positional arg is the notice
     assert "bg_noblock99" in notice
     assert "[BACKGROUND TASK RESULT READY]" in notice
+    assert call_args.kwargs["mode"] is DeliveryMode.QUEUE
+    assert call_args.kwargs["source"] == "accepted"
 
-    # steer must NOT have been called (followup is used, not steer)
+    # Completion routing must not be confused with advisory steering.
     pool.session_pool.steer.assert_not_called()
 
 
@@ -304,7 +317,7 @@ async def test_inject_when_no_blocking_waiter():
 @pytest.mark.unit
 async def test_nonblocking_output_does_not_suppress_inject():
     """A non-blocking background_output call must NOT register as a waiter,
-    so followup still fires on completion after the debounce.
+    so Session delivery still fires on completion after the debounce.
     """
     capability = BackgroundTaskCapability(schemas=None)
     pool = _make_mock_pool()
@@ -342,10 +355,8 @@ async def test_nonblocking_output_does_not_suppress_inject():
     assert "Task Result" in status or "Task Error" in status or "running" in status.lower()
 
     # Wait for task to finish + 500ms debounce
-    await _wait_until_called(pool.session_pool.followup)
-
-    # followup should have been called
-    pool.session_pool.followup.assert_called_once()
+    calls = await _wait_for_notification(pool.session_pool)
+    assert len(calls) == 1
 
     # steer must NOT have been called
     pool.session_pool.steer.assert_not_called()
@@ -402,17 +413,16 @@ async def test_waiter_unregistered_after_blocking_returns():
 
 
 # ---------------------------------------------------------------------------
-# Test: followup queues and triggers auto-resume when parent turn is idle
+# Test: Session routing starts a new Run when the parent is idle
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-async def test_inject_prompt_queues_and_triggers_auto_resume():
-    """When the parent turn has ended, followup should queue the notice
-    and trigger auto-resume so the lead agent receives the completion message.
+async def test_session_router_receives_completion_after_parent_run_ends():
+    """When the parent Run has ended, Session routing receives the notice.
 
-    This reproduces the bug where the page never receives auto-resume events
-    after a background task completes.
+    A real ``SessionPool.send_message`` owns the active-Run/idle-Session
+    decision. The capability must not retain a dead Run handle.
     """
     capability = BackgroundTaskCapability(schemas=None)
     pool = _make_mock_pool()
@@ -420,10 +430,6 @@ async def test_inject_prompt_queues_and_triggers_auto_resume():
 
     wrapped_ctx = _wrap_in_run_context(ctx)
     await capability.before_run(wrapped_ctx)
-
-    # Simulate a session pool where followup returns False
-    # (message queued for next turn, auto-resume triggered)
-    pool.session_pool.followup = AsyncMock(return_value=False)
 
     mock_node = pool.nodes["worker"]
     complete_event = StreamCompleteEvent(
@@ -445,14 +451,11 @@ async def test_inject_prompt_queues_and_triggers_auto_resume():
         )
 
     # Wait for background task to complete + 500ms debounce
-    await _wait_until_called(pool.session_pool.followup)
-
-    # followup should have been called
-    pool.session_pool.followup.assert_called_once()
+    calls = await _wait_for_notification(pool.session_pool)
+    assert len(calls) == 1
 
     # Verify it was called with a non-empty parent session ID
-    call_args = pool.session_pool.followup.call_args
-    assert call_args is not None
+    call_args = calls[0]
     parent_session_id = call_args[0][0]
     assert parent_session_id, "parent_session_id should not be empty"
 
@@ -461,38 +464,26 @@ async def test_inject_prompt_queues_and_triggers_auto_resume():
     assert "bg_autoresume01" in notice
     assert "[BACKGROUND TASK RESULT READY]" in notice
 
-    # followup returned False, meaning the message was queued and
-    # auto-resume should have been triggered.  If auto-resume is broken,
-    # the queued message will never be processed.
-    # This test documents the expected behavior; a follow-up integration
-    # test with a real SessionPool can verify the full auto-resume cycle.
+    assert call_args.kwargs["mode"] is DeliveryMode.QUEUE
 
     # steer must NOT have been called
     pool.session_pool.steer.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# Test: auto-resume is triggered when followup returns False
+# Test: completion delivery does not depend on the launching Run
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-async def test_auto_resume_triggered_when_inject_prompt_returns_false():
-    """When followup returns False (message queued), auto-resume must be
-    triggered so the lead agent processes the queued completion notice.
-
-    This reproduces the bug where the page never receives auto-resume events
-    after a background task completes.
-    """
+async def test_completion_delivery_uses_parent_session_identity():
+    """A completed child is delivered through its durable parent Session."""
     capability = BackgroundTaskCapability(schemas=None)
     pool = _make_mock_pool()
     ctx = _make_agent_context(pool=pool)
 
     wrapped_ctx = _wrap_in_run_context(ctx)
     await capability.before_run(wrapped_ctx)
-
-    # Simulate followup returning False (queued, auto-resume triggered)
-    pool.session_pool.followup = AsyncMock(return_value=False)
 
     mock_node = pool.nodes["worker"]
     complete_event = StreamCompleteEvent(
@@ -514,13 +505,11 @@ async def test_auto_resume_triggered_when_inject_prompt_returns_false():
         )
 
     # Wait for background task to complete + 500ms debounce
-    await _wait_until_called(pool.session_pool.followup)
-
-    # followup should have been called
-    pool.session_pool.followup.assert_called_once()
+    calls = await _wait_for_notification(pool.session_pool)
+    assert len(calls) == 1
 
     # Verify parent_session_id is not empty
-    call_args = pool.session_pool.followup.call_args
+    call_args = calls[0]
     parent_session_id = call_args[0][0]
     assert parent_session_id, "parent_session_id should not be empty"
 
@@ -529,21 +518,19 @@ async def test_auto_resume_triggered_when_inject_prompt_returns_false():
     assert "bg_autoresume02" in notice
     assert "[BACKGROUND TASK RESULT READY]" in notice
 
-    # followup returned False, so auto-resume should have been triggered.
-    # In a real SessionPool, this means _trigger_auto_resume was scheduled.
-    # The batcher's deliver_callback handles this via session_pool.followup().
+    assert call_args.kwargs["mode"] is DeliveryMode.QUEUE
 
     # steer must NOT have been called
     pool.session_pool.steer.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# Test: followup is safe when agent has no run context
+# Test: notification is safe when agent has no run context
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-async def test_inject_prompt_safe_when_no_run_context():
+async def test_notification_safe_when_no_run_context():
     """When the agent's run context is None (ephemeral state path),
     no notification should be delivered — the no-op deliver callback is used.
     The test verifies this does not raise an exception.
@@ -580,8 +567,7 @@ async def test_inject_prompt_safe_when_no_run_context():
     await asyncio.sleep(1.0)
 
     # With no run_ctx, the ephemeral state uses a no-op deliver callback.
-    # followup should NOT have been called (no real delivery path).
-    pool.session_pool.followup.assert_not_called()
+    assert _notification_calls(pool.session_pool) == []
 
     # steer must NOT have been called either
     pool.session_pool.steer.assert_not_called()
@@ -672,15 +658,13 @@ async def test_debounce_window_no_notification_before_timeout():
     # Wait 200ms — less than the 500ms debounce
     await asyncio.sleep(0.2)
 
-    # followup should NOT have been called yet (debounce window not expired)
-    pool.session_pool.followup.assert_not_called()
+    assert _notification_calls(pool.session_pool) == []
 
     # Wait for the debounce to expire
-    await _wait_until_called(pool.session_pool.followup)
+    calls = await _wait_for_notification(pool.session_pool)
 
-    # Now followup SHOULD have been called exactly once
-    pool.session_pool.followup.assert_called_once()
-    notice = pool.session_pool.followup.call_args[0][1]
+    assert len(calls) == 1
+    notice = calls[0][0][1]
     assert "bg_debounce01" in notice
     assert "[BACKGROUND TASK RESULT READY]" in notice
 
@@ -702,6 +686,7 @@ async def test_multiple_tasks_batched_in_debounce_window():
     node2 = _make_mock_node(name="worker2", description="Worker 2")
     pool = _make_mock_pool(nodes={"worker1": node1, "worker2": node2})
     ctx = _make_agent_context(pool=pool)
+    ctx.create_child_session = AsyncMock(side_effect=["ses_child_1", "ses_child_2"])
 
     wrapped_ctx = _wrap_in_run_context(ctx)
     await capability.before_run(wrapped_ctx)
@@ -749,13 +734,12 @@ async def test_multiple_tasks_batched_in_debounce_window():
         task_ids.append(match2.group(1))
 
     # Wait for tasks to complete + debounce to expire
-    await _wait_until_called(pool.session_pool.followup)
+    calls = await _wait_for_notification(pool.session_pool)
 
-    # followup should have been called exactly once (single batched notification)
-    pool.session_pool.followup.assert_called_once()
+    assert len(calls) == 1
 
     # Verify both task IDs are in the notice
-    notice = pool.session_pool.followup.call_args[0][1]
+    notice = calls[0][0][1]
     assert "bg_batch01" in notice
     assert "bg_batch02" in notice
 

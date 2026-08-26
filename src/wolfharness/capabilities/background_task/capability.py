@@ -281,8 +281,8 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
     def _get_session_state(self, ctx: RunContext[AgentContext] | AgentContext) -> SessionTaskState:
         """Get or create per-session ``SessionTaskState``.
 
-        Extracts ``AgentRunContext`` from ``ctx`` and uses its ``run_id``
-        (a stable UUID string) as the key in ``_session_states``.  When
+        Extracts ``AgentRunContext`` from ``ctx`` and uses its durable
+        ``session_id`` as the key in ``_session_states``.  When
         ``run_ctx`` is ``None`` (e.g. during instruction resolution before
         a run starts), falls back to an ephemeral state keyed by ``id(ctx)``.
 
@@ -305,7 +305,7 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
 
         # Normal path: run_ctx is available
         if run_ctx is not None:
-            session_key = run_ctx.run_id
+            session_key = run_ctx.session_id
             state = self._session_states.get(session_key)
             if state is not None:
                 return state
@@ -313,11 +313,27 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
             # Clean up any ephemeral state for this context
             self._ephemeral_states.pop(id_key, None)
 
-            # Extract session_pool for fallback notification delivery
+            # Extract the Session-level router for durable notification delivery.
             session_pool = agent_ctx.pool.session_pool if agent_ctx.pool is not None else None
 
             state = self._create_session_state(run_ctx=run_ctx, session_pool=session_pool)
             self._session_states[session_key] = state
+            if session_pool is not None and hasattr(session_pool, "register_session_cleanup"):
+
+                async def _cleanup_session_state() -> None:
+                    # A Session can launch another background-task generation
+                    # after the previous generation has been consumed.  Cleanup
+                    # callbacks registered for an older generation must never
+                    # tear down the newer state.
+                    if self._session_states.get(session_key) is not state:
+                        return
+                    owned_state = self._session_states.pop(session_key)
+                    with contextlib.suppress(Exception):
+                        await owned_state.batcher.shutdown()
+                    with contextlib.suppress(Exception):
+                        await owned_state.task_manager.shutdown()
+
+                session_pool.register_session_cleanup(session_key, _cleanup_session_state)
             return state
 
         # Ephemeral path: run_ctx is None — use id-keyed fallback
@@ -339,9 +355,9 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
         Args:
             run_ctx: The ``AgentRunContext`` for this session, or ``None``
                 if not yet available (ephemeral state).
-            session_pool: Optional ``SessionPool`` for fallback notification
-                delivery.  Only used in the normal path where ``run_ctx``
-                is not ``None``.
+            session_pool: Optional ``SessionPool`` for durable Session-scoped
+                notification delivery. Only used in the normal path where
+                ``run_ctx`` is not ``None``.
 
         Returns:
             A new ``SessionTaskState`` instance.
@@ -377,18 +393,20 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
     ) -> Callable[[str, list[BackgroundTask], str], Awaitable[None]]:
         """Create a deliver callback for the notification batcher.
 
-        Uses ``weakref.ref(run_ctx)`` to avoid strong references that
-        would prevent session cleanup.  The callback:
+        Uses ``weakref.ref(run_ctx)`` only for the child-done safety event.
+        Notification delivery itself is routed through the durable
+        ``SessionPool`` so it can start a new Run after the launching Run has
+        already ended.  The callback:
 
-        1. Calls ``followup()`` FIRST to queue the batched notice for
-           the next turn (never ``steer()`` which does mid-turn injection).
+        1. Calls ``SessionPool.send_message()`` with queued delivery so an
+           active Run receives a follow-up and an idle Session starts a new Run.
         2. THEN pops and sets ``child_done_events`` per-task as a safety
            net (the immediate pop in ``_on_task_completed`` is the
            primary unblock path).
 
         Args:
             run_ctx: The ``AgentRunContext`` for this session.
-            session_pool: Optional ``SessionPool`` for fallback delivery.
+            session_pool: Optional ``SessionPool`` for durable delivery.
 
         Returns:
             An async callback function for ``NotificationBatcher.deliver_callback``.
@@ -399,31 +417,32 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
             parent_session_id: str, tasks: list[BackgroundTask], notice: str
         ) -> None:
             rc = ctx_ref()
-            if rc is None:
-                return  # Dead session
 
-            # 1. Queue notification via followup() (always next-turn, never mid-turn)
-            delivered = False
-            if rc._run_handle is not None:
-                delivered = rc._run_handle.followup(notice) is not None
-            elif session_pool is not None:
-                result = await session_pool.followup(parent_session_id, notice)
-                delivered = result is not None
-
-            if not delivered:
+            # 1. Use the Session-level router.  It owns both active-Run
+            # follow-up and idle-Session Run creation.
+            if session_pool is None:
                 logger.debug(
-                    "deliver_callback could not queue followup for session %s "
-                    "(%d tasks) — no active run handle or session pool",
+                    "deliver_callback has no session pool for session %s (%d tasks)",
                     parent_session_id,
                     len(tasks),
                 )
+            else:
+                from wolfharness.lifecycle.types import DeliveryMode
+
+                await session_pool.send_message(
+                    parent_session_id,
+                    notice,
+                    mode=DeliveryMode.QUEUE,
+                    source="accepted",
+                )
 
             # 2. Pop+set child_done_events per-task (safety net for batched path)
-            for task in tasks:
-                if task.child_session_id is not None:
-                    event = rc.child_done_events.pop(task.child_session_id, None)
-                    if event is not None:
-                        event.set()
+            if rc is not None:
+                for task in tasks:
+                    if task.child_session_id is not None:
+                        event = rc.child_done_events.pop(task.child_session_id, None)
+                        if event is not None:
+                            event.set()
 
         return _deliver
 
@@ -556,7 +575,6 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
         ``_run_and_stream``'s finally block.
         """
         state = self._get_session_state(ctx)
-        state.pending_retrievals.clear()
         state.retrieval_retry_count = 0
         await state.batcher.start()
 
@@ -566,12 +584,12 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
         *,
         result: AgentRunResult[AgentContext],
     ) -> AgentRunResult[AgentContext]:
-        """Clean up per-run session state after the agent run ends.
+        """Release state only after its Session-owned work was consumed.
 
-        Evicts the ``_session_states`` entry keyed by ``run_id`` and the
-        corresponding ``id(ctx.deps)`` from ``_ephemeral_states``, then
-        tears down the state's batcher and task manager so their timers
-        and handles do not leak across runs.
+        A model Run is only one turn inside a durable Session.  Active or
+        unconsumed background tasks must survive ``after_run`` so completion
+        notification can create the next Run.  Session closure remains the
+        authoritative cancellation boundary.
 
         Args:
             ctx: The pydantic-ai run context.
@@ -582,19 +600,31 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
         """
         agent_ctx = ctx.deps
         run_ctx = agent_ctx.run_ctx
-        if run_ctx is not None:
-            state = self._session_states.pop(run_ctx.run_id, None)
-            # Drop any ephemeral fallback state keyed by this context object
-            # so an id() reuse cannot serve a stale state.
-            self._ephemeral_states.pop(id(agent_ctx), None)
-        else:
+        if run_ctx is None:
             state = self._ephemeral_states.pop(id(agent_ctx), None)
+            if state is not None:
+                with contextlib.suppress(Exception):
+                    await state.batcher.shutdown()
+                with contextlib.suppress(Exception):
+                    await state.task_manager.shutdown()
+            return result
 
-        if state is not None:
-            with contextlib.suppress(Exception):
-                await state.batcher.shutdown()
-            with contextlib.suppress(Exception):
-                await state.task_manager.shutdown()
+        self._ephemeral_states.pop(id(agent_ctx), None)
+        session_key = run_ctx.session_id
+        state = self._session_states.get(session_key)
+        if state is None:
+            return result
+
+        tasks = state.task_manager.get_all_tasks()
+        has_active = any(task.status not in TERMINAL_STATES for task in tasks)
+        if has_active or state.pending_retrievals:
+            return result
+
+        self._session_states.pop(session_key, None)
+        with contextlib.suppress(Exception):
+            await state.batcher.shutdown()
+        with contextlib.suppress(Exception):
+            await state.task_manager.shutdown()
 
         return result
 
@@ -975,9 +1005,10 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
 
         state = self._get_session_state(ctx)
 
-        # Track for force_retrieval: this task must be retrieved before the run ends
-        if self._force_retrieval is not ForceRetrievalMode.disabled:
-            state.pending_retrievals.add(task_id)
+        # Retrieval is a Session-level ownership acknowledgement.  Force mode
+        # controls model prompting only; every async task remains retrievable
+        # until its terminal output is consumed.
+        state.pending_retrievals.add(task_id)
 
         # Create the task directory on internal filesystem
         fs = ctx.internal_fs
@@ -1250,8 +1281,8 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
                 )
                 return
 
-            # Submit to batcher — it will format, debounce, and deliver via
-            # the deliver_callback (which calls followup() + child_done_events pop).
+            # Submit to the batcher. Delivery is routed through the durable
+            # parent Session, then child_done_events are released as a safety net.
             try:
                 state.batcher.submit(task)
             except ValueError:
@@ -1303,15 +1334,13 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
         agent_ctx = ctx.deps
         state = self._get_session_state(ctx)
 
-        # Mark this task as retrieved (no-op if force_retrieval is disabled)
-        state.pending_retrievals.discard(task_id)
-
         task_model = state.task_manager.get_task(task_id)
         if task_model is None:
             return f"Task {task_id!r} not found"
 
         # If task is in a terminal state, return result/error/status
         if task_model.status in TERMINAL_STATES:
+            state.pending_retrievals.discard(task_id)
             return self._format_terminal_task_output(agent_ctx, task_model)
 
         # Running/pending task: status-only unless blocking
@@ -1357,6 +1386,7 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
                 f"background_cancel to cancel."
             )
 
+        state.pending_retrievals.discard(task_id)
         return self._format_terminal_task_output(agent_ctx, task_model)
 
     def _format_terminal_task_output(self, ctx: AgentContext, task_model: BackgroundTask) -> str:

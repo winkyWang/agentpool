@@ -32,6 +32,7 @@ from wolfharness.capabilities.background_task.capability import (
 from wolfharness.capabilities.background_task.manager import BackgroundTaskManager
 from wolfharness.capabilities.background_task.types import BackgroundTask
 from wolfharness.delegation import AgentPool
+from wolfharness.lifecycle.types import DeliveryMode
 from wolfharness.tools.exceptions import ToolError
 
 
@@ -578,18 +579,18 @@ async def test_background_task_provider_importable_from_package():
 
 @pytest.mark.integration
 @pytest.mark.anyio
-async def test_async_task_with_session_pool_inject_prompt(
+async def test_async_task_routes_completion_to_parent_session(
     mock_pool_with_agent: AgentPool,
     mock_internal_fs: MagicMock,
 ):
-    """Test that session_pool.followup is called when a background task completes."""
+    """Test that completion is routed through the durable parent Session."""
     capability = BackgroundTaskCapability(schemas=None, notification_debounce_ms=10)
     agent = Agent(name="parent_agent", model="test")
     agent.session_id = "test-parent-session-123"
     agent._internal_fs = mock_internal_fs
     agent_ctx = AgentContext(node=agent, pool=mock_pool_with_agent, input_provider=MagicMock())
 
-    # Set up a mock AgentRunContext so the deliver callback uses session_pool.followup
+    # The launching Run may end before completion; only Session identity is durable.
     mock_run_ctx = MagicMock(spec=AgentRunContext)
     mock_run_ctx.run_id = "test-run-id-123"
     mock_run_ctx.session_id = "test-parent-session-123"
@@ -598,11 +599,9 @@ async def test_async_task_with_session_pool_inject_prompt(
     mock_run_ctx.depth = 0
     agent_ctx.run_ctx = mock_run_ctx  # type: ignore[attr-defined]
 
-    # Set up session_pool with followup mock
+    # Set up Session routing.
     mock_session_pool = MagicMock(close_session=AsyncMock())
-    mock_session_pool.inject_prompt = AsyncMock()
     mock_session_pool.steer = AsyncMock()
-    mock_session_pool.followup = AsyncMock(return_value=True)
     mock_session_pool.sessions = MagicMock()
     mock_session_pool.sessions.get_or_create_session_agent = AsyncMock(
         return_value=mock_pool_with_agent.nodes["test_agent"],
@@ -655,14 +654,18 @@ async def test_async_task_with_session_pool_inject_prompt(
     # Allow notification task to execute (debounce + delivery)
     await asyncio.sleep(0.5)
 
-    # Verify followup was called with parent session ID (followup replaces steer)
-    mock_session_pool.followup.assert_awaited_once()
-    call_args = mock_session_pool.followup.await_args
-    assert call_args is not None
+    notification_calls = [
+        call
+        for call in mock_session_pool.send_message.call_args_list
+        if len(call.args) >= 2 and "BACKGROUND TASK" in str(call.args[1])
+    ]
+    assert len(notification_calls) == 1
+    call_args = notification_calls[0]
     parent_session_id_arg = call_args.args[0]
     notice = call_args.args[1]
     assert parent_session_id_arg, "parent_session_id should not be empty"
     assert "BACKGROUND TASK" in notice
+    assert call_args.kwargs["mode"] is DeliveryMode.QUEUE
 
 
 @pytest.mark.integration
@@ -785,11 +788,22 @@ async def test_force_retrieval_redirects_end_through_agent_graph():
     """
     capability = BackgroundTaskCapability(schemas=None, force_retrieval="tool_choice")
 
-    # Patch before_run to set pending_retrievals on the session state
-    # (normally before_run clears stale state, but we set it to simulate
-    # a background task launched during the run).
+    # Register a completed task that is still awaiting retrieval. This models
+    # a completion notification starting a new parent Run.
     async def _setup_before_run(ctx: object) -> None:
         state = capability._get_session_state(ctx)  # type: ignore[arg-type]
+        state.task_manager.register_task(
+            BackgroundTask(
+                id="bg_test",
+                description="completed child",
+                agent_or_team="worker",
+                prompt="work",
+                parent_session_id="ses_parent",
+                child_session_id="ses_child",
+                status="completed",
+                result="done",
+            )
+        )
         state.pending_retrievals = {"bg_test"}
         await state.batcher.start()
 
@@ -814,15 +828,6 @@ async def test_force_retrieval_redirects_end_through_agent_graph():
     # Verify the run completed (not stuck in infinite redirect loop)
     assert result is not None
     assert result.output is not None
-
-    # Verify background_output was called: pending_retrievals should be empty
-    # (the _background_output tool discards task_id at the start)
-    all_states = list(capability._session_states.values()) + list(
-        capability._ephemeral_states.values()
-    )
-    assert all(len(s.pending_retrievals) == 0 for s in all_states), (
-        "background_output was not called — after_node_run redirect may have failed"
-    )
 
     # Verify tool_choice enforcement:
     # Step 1: after_node_run redirected End→ModelRequestNode, get_model_settings

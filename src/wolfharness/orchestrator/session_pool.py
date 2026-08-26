@@ -28,7 +28,7 @@ from wolfharness.orchestrator.session_pool_config import SessionPoolConfig
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
     from wolfharness.agents.base_agent import BaseAgent
     from wolfharness.agents.native_agent import Agent
@@ -115,7 +115,26 @@ class SessionPool(
         self._message_cache: OrderedDict[str, list[ChatMessage[Any]]] = OrderedDict()
         self._message_cache_maxsize: int = self._config.message_cache_maxsize
         self._elicitation_registries: dict[str, Any] = {}
+        self._session_cleanup_callbacks: dict[
+            str,
+            list[Callable[[], Awaitable[None]]],
+        ] = {}
         self._subagent_inactivity_timeout_seconds = subagent_inactivity_timeout_seconds
+
+    def register_session_cleanup(
+        self,
+        session_id: str,
+        callback: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Register runtime cleanup owned by one durable Session.
+
+        Capabilities with work that outlives an individual model Run use this
+        hook to bind that work to the enclosing Session lifecycle.  Callbacks
+        execute once, before the SessionController closes the Session tree.
+        """
+        callbacks = self._session_cleanup_callbacks.setdefault(session_id, [])
+        if callback not in callbacks:
+            callbacks.append(callback)
 
     async def start(self) -> None:
         """Start the session pool and background tasks."""
@@ -915,6 +934,18 @@ class SessionPool(
         Args:
             session_id: The session to close.
         """
+        callbacks = self._session_cleanup_callbacks.pop(session_id, [])
+        for callback in callbacks:
+            try:
+                await callback()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Session-owned runtime cleanup failed",
+                    session_id=session_id,
+                )
+
         try:
             async with asyncio.timeout(15):
                 await self.sessions.close_session(session_id)

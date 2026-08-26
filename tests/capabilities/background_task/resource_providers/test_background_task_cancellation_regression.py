@@ -36,12 +36,26 @@ from wolfharness.delegation import AgentPool
 pytestmark = pytest.mark.anyio
 
 
-async def _wait_until_called(mock_obj: Any, timeout: float = 3.0, interval: float = 0.05) -> None:
+def _completion_calls(session_pool: Any) -> list[Any]:
+    return [
+        call
+        for call in session_pool.send_message.call_args_list
+        if len(call.args) >= 2 and "BACKGROUND TASK" in str(call.args[1])
+    ]
+
+
+async def _wait_for_completion(
+    session_pool: Any,
+    timeout: float = 3.0,
+    interval: float = 0.05,
+) -> list[Any]:
     elapsed = 0.0
-    while mock_obj.call_count == 0 and elapsed < timeout:
+    while not _completion_calls(session_pool) and elapsed < timeout:
         await asyncio.sleep(interval)
         elapsed += interval
-    assert mock_obj.call_count > 0, f"Mock was not called within {timeout}s"
+    calls = _completion_calls(session_pool)
+    assert calls, f"Completion notification was not routed within {timeout}s"
+    return calls
 
 
 def _wrap_in_run_context(agent_ctx):
@@ -599,19 +613,15 @@ class TestBlockingOutputDoesNotCancelOtherTasks:
         )
 
         # Wait for task 2 + 500ms debounce
-        await _wait_until_called(pool.session_pool.followup)
+        completion_calls = await _wait_for_completion(pool.session_pool)
 
-        # Task 2 must have had its completion callback fired
-        # (followup called because no blocking waiter was present)
+        # Task 2 must have had its completion callback fired.
         task_2 = _get_tm(capability, ctx).get_task("bg_waiter02")
         assert task_2 is not None
         assert task_2.status == "completed", f"waiter-2 expected completed, got {task_2.status}"
 
-        # followup should have been called for task 2 (no blocking waiter)
-        followup_calls = pool.session_pool.followup.call_args_list
-        # At least one followup call should mention task 2
-        task_2_notified = any("bg_waiter02" in str(call) for call in followup_calls)
-        assert task_2_notified, "followup should have been called for waiter-2 completion"
+        task_2_notified = any("bg_waiter02" in str(call) for call in completion_calls)
+        assert task_2_notified, "waiter-2 completion should be routed to its parent Session"
 
 
 # ===========================================================================

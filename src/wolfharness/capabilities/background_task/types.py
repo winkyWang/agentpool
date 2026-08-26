@@ -86,9 +86,9 @@ class SessionTaskState:
     """Per-session runtime state for background task capability.
 
     Stores session-scoped references to the ``BackgroundTaskManager``,
-    ``NotificationBatcher``, and transient tracking fields.  Each run
-    gets its own instance, keyed by ``AgentRunContext.run_id`` (a stable
-    UUID string) in a plain ``dict``.
+    ``NotificationBatcher``, and retrieval tracking fields.  Model Runs may
+    end and restart while the same durable Session continues to own this
+    state.
     """
 
     task_manager: BackgroundTaskManager

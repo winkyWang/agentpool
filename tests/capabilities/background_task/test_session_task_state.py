@@ -2,19 +2,19 @@
 
 Covers:
 1. SessionTaskState lazy creation and reuse
-2. Per-session isolation between different AgentRunContexts
-3. WeakKeyDictionary GC behavior
+2. Per-session isolation between different durable Sessions
+3. Cross-Run state reuse within one Session
 4. retrieval_retry_count isolation
 5. Closure capture in _on_task_completed
-6. before_run() resets per-turn fields only
+6. before_run() preserves pending retrieval ownership
 7. Notification suppression with child_done_events still popped
-8. Separated delivery: child_done_events per-task, followup once per batch
-9. Dead session skip (weakref dereferences to None)
-10. Fallback to session_pool.followup() when _run_handle is None
+8. Separated delivery: child_done_events per-task, Session message once per batch
+9. Dead Run context does not block Session-routed notification
+10. SessionPool queued delivery starts the next Run
 11. Ephemeral state with no-op deliver_callback
 12. deliver_callback uses weakref.ref(run_ctx) — no strong reference
 13. Cross-turn notification persistence
-14. followup() called BEFORE child_done_events.pop()
+14. queued Session delivery happens before child_done_events.pop()
 15. get_model_settings closure uses per-session pending_retrievals
 16. _background_cancel uses get_all_tasks() public API
 """
@@ -80,6 +80,7 @@ def _make_mock_pool(nodes: dict[str, MagicMock] | None = None) -> Any:
     pool.sessions = None
     mock_session_pool = MagicMock()
     mock_session_pool.close_session = AsyncMock()
+    mock_session_pool.register_session_cleanup = MagicMock()
 
     async def _get_or_create_session_agent(agent_name: str, agent_type: str):
         return nodes.get(agent_name, next(iter(nodes.values())))
@@ -227,8 +228,8 @@ async def test_per_session_isolation():
     capability = BackgroundTaskCapability(schemas=None)
     pool = _make_mock_pool()
 
-    run_ctx_a = _make_real_run_ctx()
-    run_ctx_b = _make_real_run_ctx()
+    run_ctx_a = _MockRunContext(session_id="ses_test_a")
+    run_ctx_b = _MockRunContext(session_id="ses_test_b")
 
     ctx_a = _make_agent_context(pool=pool, run_ctx=run_ctx_a)
     ctx_b = _make_agent_context(pool=pool, run_ctx=run_ctx_b)
@@ -242,17 +243,16 @@ async def test_per_session_isolation():
 
 
 # ---------------------------------------------------------------------------
-# 3. Session state keyed by run_id — different run_ctx objects with same run_id reuse state
+# 3. Session state keyed by session_id across model Runs
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-async def test_weakkeydict_gc_behavior():
-    """Session state is keyed by run_id, not by object identity.
+async def test_session_state_survives_across_run_ids():
+    """Session state is keyed by durable Session identity.
 
-    Two different run_ctx objects with the same run_id resolve to the same
-    SessionTaskState.  This replaces the old WeakKeyDictionary GC behavior —
-    we now use a plain dict keyed by the stable UUID ``run_id``.
+    Two different Run contexts for one Session resolve to the same state;
+    another Session gets an independent owner.
     """
     capability = BackgroundTaskCapability(schemas=None)
 
@@ -277,20 +277,19 @@ async def test_weakkeydict_gc_behavior():
     state = capability._get_session_state(ctx)
     assert state is not None
 
-    # Verify it's in the dict, keyed by run_id
-    assert run_ctx.run_id in capability._session_states
+    assert run_ctx.session_id in capability._session_states
 
-    # A second run_ctx with the SAME run_id should reuse the same state
-    run_ctx_2 = _MockRunContext(session_id="ses_test_001", run_id=run_ctx.run_id)
+    # A later Run in the same Session reuses background ownership.
+    run_ctx_2 = _MockRunContext(session_id="ses_test_001", run_id="run_later")
     ctx_2 = _SimpleCtx(pool, run_ctx_2)
     state_2 = capability._get_session_state(ctx_2)
-    assert state_2 is state, "Same run_id must resolve to same SessionTaskState"
+    assert state_2 is state, "Same session_id must resolve to the same SessionTaskState"
 
-    # A third run_ctx with a DIFFERENT run_id should get a new state
-    run_ctx_3 = _MockRunContext(session_id="ses_test_002", run_id="run_different")
+    # A different Session gets a new owner even if Run IDs are unrelated.
+    run_ctx_3 = _MockRunContext(session_id="ses_test_002", run_id=run_ctx.run_id)
     ctx_3 = _SimpleCtx(pool, run_ctx_3)
     state_3 = capability._get_session_state(ctx_3)
-    assert state_3 is not state, "Different run_id must get different SessionTaskState"
+    assert state_3 is not state, "Different session_id must get different SessionTaskState"
 
     # Manual cleanup (no GC magic — caller is responsible for lifecycle)
     del ctx, ctx_2, ctx_3, run_ctx, run_ctx_2, run_ctx_3, state, state_2, state_3
@@ -311,8 +310,8 @@ async def test_retrieval_retry_count_isolation():
     capability = BackgroundTaskCapability(schemas=None, force_retrieval="directive")
     pool = _make_mock_pool()
 
-    run_ctx_a = _make_real_run_ctx()
-    run_ctx_b = _make_real_run_ctx()
+    run_ctx_a = _MockRunContext(session_id="ses_retry_a")
+    run_ctx_b = _MockRunContext(session_id="ses_retry_b")
 
     ctx_a = _make_agent_context(pool=pool, run_ctx=run_ctx_a)
     ctx_b = _make_agent_context(pool=pool, run_ctx=run_ctx_b)
@@ -390,15 +389,13 @@ async def test_closure_uses_captured_state():
 
 
 # ---------------------------------------------------------------------------
-# 6. before_run() only resets per-turn fields — task_manager and batcher persist
+# 6. before_run() resets only retry count; retrieval ownership persists
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
 async def test_before_run_resets_only_per_turn_fields():
-    """before_run() resets pending_retrievals and retrieval_retry_count, but preserves
-    task_manager and batcher.
-    """
+    """before_run() preserves pending retrievals and runtime owners."""
     capability = BackgroundTaskCapability(schemas=None)
     pool = _make_mock_pool()
     run_ctx = _make_real_run_ctx()
@@ -420,8 +417,7 @@ async def test_before_run_resets_only_per_turn_fields():
     # takes the else branch and finds the same state via ctx.run_ctx
     await capability.before_run(ctx)
 
-    # Per-turn fields must be reset
-    assert len(state.pending_retrievals) == 0, "pending_retrievals must be cleared"
+    assert state.pending_retrievals == {"bg_task_1", "bg_task_2"}
     assert state.retrieval_retry_count == 0, "retrieval_retry_count must be reset"
 
     # Persistent fields must survive
@@ -503,25 +499,19 @@ async def test_notification_suppression_still_pops_child_done_events():
 
 
 # ---------------------------------------------------------------------------
-# 8. Separated delivery — child_done_events popped per-task, followup called once
+# 8. Separated delivery — child_done_events popped per-task, Session routed once
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-async def test_separated_delivery_child_events_per_task_followup_once():
-    """child_done_events is popped per-task in the closure, while followup()
-    is called once per batch in the deliver callback.
-    """
+async def test_separated_delivery_child_events_per_task_session_message_once():
+    """Child events are per-task while Session delivery is once per batch."""
     capability = BackgroundTaskCapability(schemas=None)
     pool = _make_mock_pool()
     run_ctx = _make_real_run_ctx()
     ctx = _make_agent_context(pool=pool, run_ctx=run_ctx)
 
     state = capability._get_session_state(ctx)
-
-    # Set up a run handle with followup
-    mock_handle = _make_mock_run_handle()
-    run_ctx._run_handle = mock_handle
 
     # Create two completed tasks
     task1 = _make_completed_task(task_id="bg_sep01", child_session_id="ses_child_a")
@@ -553,22 +543,19 @@ async def test_separated_delivery_child_events_per_task_followup_once():
     # Manually call the deliver callback with both tasks as a batch
     await deliver_callback("ses_parent_123", [task1, task2], "notice text")
 
-    # followup must be called exactly once (for the batch)
-    assert mock_handle.followup.call_count == 1, (
-        "followup must be called once per batch, not per task"
+    assert pool.session_pool.send_message.call_count == 1, (
+        "Session delivery must be called once per batch, not per task"
     )
 
 
 # ---------------------------------------------------------------------------
-# 9. Dead session skip — weak ref dereferences to None, callback skips silently
+# 9. Dead Run context still delivers through the durable Session
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
 async def test_dead_session_skip():
-    """When run_ctx weak ref dereferences to None, the deliver callback skips silently
-    without calling followup (no crash, no fallback).
-    """
+    """A dead launching Run does not suppress Session-routed notification."""
     capability = BackgroundTaskCapability(schemas=None)
     pool = _make_mock_pool()
 
@@ -583,25 +570,21 @@ async def test_dead_session_skip():
     del disposable_ctx
     gc.collect()
 
-    # Calling the callback should not crash — it should silently return
     task = _make_completed_task()
     await callback("ses_parent", [task], "notice")
 
-    # followup was never called because the weak ref is dead
     disposable_handle.followup.assert_not_called()
-    pool.session_pool.followup.assert_not_called()
+    pool.session_pool.send_message.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
-# 10. Fallback to session_pool.followup() when _run_handle is None
+# 10. SessionPool starts or queues the next Run when no RunHandle exists
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-async def test_fallback_to_session_pool_followup_when_no_run_handle():
-    """When _run_handle is None but run_ctx is alive via weak ref, the deliver
-    callback falls back to session_pool.followup() (NOT steer()).
-    """
+async def test_session_pool_delivery_when_no_run_handle():
+    """An idle parent is notified through the Session-level message router."""
     capability = BackgroundTaskCapability(schemas=None)
     pool = _make_mock_pool()
     run_ctx = _make_real_run_ctx()
@@ -614,9 +597,8 @@ async def test_fallback_to_session_pool_followup_when_no_run_handle():
     task = _make_completed_task(task_id="bg_fallback01")
     await deliver_callback("ses_parent_123", [task], "notice text")
 
-    # session_pool.followup must be called
-    pool.session_pool.followup.assert_called_once()
-    call_args = pool.session_pool.followup.call_args
+    pool.session_pool.send_message.assert_called_once()
+    call_args = pool.session_pool.send_message.call_args
     assert call_args[0][0] == "ses_parent_123"
     assert "notice text" in call_args[0][1]
 
@@ -723,20 +705,85 @@ async def test_cross_turn_notification_persistence():
     assert state_turn2.task_manager is state_turn1.task_manager
 
 
+@pytest.mark.unit
+async def test_after_run_preserves_unconsumed_background_task_for_next_run():
+    """Ending one model Run must not cancel Session-owned background work."""
+    capability = BackgroundTaskCapability(schemas=None)
+    pool = _make_mock_pool()
+    first_run = _MockRunContext(session_id="ses_durable", run_id="run_first")
+    first_ctx = _make_agent_context(pool=pool, run_ctx=first_run)
+    state = capability._get_session_state(first_ctx)
+
+    task = BackgroundTask(
+        id="bg_durable01",
+        description="durable work",
+        agent_or_team="worker",
+        prompt="work",
+        parent_session_id="ses_durable",
+        child_session_id="ses_child_durable",
+        status="running",
+    )
+    state.task_manager.register_task(task)
+    state.pending_retrievals.add(task.id)
+
+    wrapped_first = MagicMock()
+    wrapped_first.deps = first_ctx
+    result = MagicMock()
+    assert await capability.after_run(wrapped_first, result=result) is result
+    assert capability._session_states["ses_durable"] is state
+    assert state.task_manager.get_task(task.id) is task
+
+    second_run = _MockRunContext(session_id="ses_durable", run_id="run_second")
+    second_ctx = _make_agent_context(pool=pool, run_ctx=second_run)
+    assert capability._get_session_state(second_ctx) is state
+
+    task.status = "completed"
+    wrapped_second = MagicMock()
+    wrapped_second.deps = second_ctx
+    await capability.after_run(wrapped_second, result=result)
+    assert capability._session_states["ses_durable"] is state
+
+    state.pending_retrievals.discard(task.id)
+    await capability.after_run(wrapped_second, result=result)
+    assert "ses_durable" not in capability._session_states
+
+
+@pytest.mark.unit
+async def test_old_session_cleanup_callback_cannot_close_new_task_generation():
+    """A stale callback must not tear down newer state for the same Session."""
+    capability = BackgroundTaskCapability(schemas=None)
+    pool = _make_mock_pool()
+    run_ctx = _MockRunContext(session_id="ses_reused", run_id="run_first")
+    ctx = _make_agent_context(pool=pool, run_ctx=run_ctx)
+
+    first_state = capability._get_session_state(ctx)
+    first_cleanup = pool.session_pool.register_session_cleanup.call_args.args[1]
+
+    wrapped = MagicMock()
+    wrapped.deps = ctx
+    await capability.after_run(wrapped, result=MagicMock())
+    assert "ses_reused" not in capability._session_states
+
+    next_run_ctx = _MockRunContext(session_id="ses_reused", run_id="run_second")
+    next_ctx = _make_agent_context(pool=pool, run_ctx=next_run_ctx)
+    second_state = capability._get_session_state(next_ctx)
+    assert second_state is not first_state
+
+    await first_cleanup()
+    assert capability._session_states["ses_reused"] is second_state
+
+
 # ---------------------------------------------------------------------------
-# 14. followup() called BEFORE child_done_events.pop() in deliver callback
+# 14. Session delivery happens before child_done_events.pop()
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-async def test_followup_called_before_child_done_events_pop():
-    """In the deliver callback, followup() is called BEFORE child_done_events.pop()."""
+async def test_session_delivery_before_child_done_events_pop():
+    """Session delivery happens before child_done_events are released."""
     capability = BackgroundTaskCapability(schemas=None)
     pool = _make_mock_pool()
     run_ctx = _make_real_run_ctx()
-
-    mock_handle = _make_mock_run_handle()
-    run_ctx._run_handle = mock_handle
 
     # Set up a child_done_event
     child_sid = "ses_child_order"
@@ -746,14 +793,11 @@ async def test_followup_called_before_child_done_events_pop():
     # Track call order
     call_order: list[str] = []
 
-    # Wrap followup to track when it's called
-    original_followup = mock_handle.followup
+    async def tracking_send_message(*_args: Any, **_kwargs: Any) -> str:
+        call_order.append("send_message")
+        return "msg_notice"
 
-    def tracking_followup(msg: str) -> bool:
-        call_order.append("followup")
-        return original_followup(msg)
-
-    mock_handle.followup = tracking_followup
+    pool.session_pool.send_message = AsyncMock(side_effect=tracking_send_message)
 
     # Use a custom dict subclass to track pop calls (dict.pop is read-only)
     class _TrackingDict(dict):  # type: ignore[type-arg]
@@ -770,13 +814,12 @@ async def test_followup_called_before_child_done_events_pop():
     task = _make_completed_task(task_id="bg_order01", child_session_id=child_sid)
     await deliver_callback("ses_parent", [task], "notice")
 
-    # followup must be called BEFORE pop
-    assert "followup" in call_order, "followup must be called"
+    assert "send_message" in call_order, "Session delivery must be called"
     assert "pop" in call_order, "child_done_events.pop must be called"
-    followup_idx = call_order.index("followup")
+    followup_idx = call_order.index("send_message")
     pop_idx = call_order.index("pop")
     assert followup_idx < pop_idx, (
-        f"followup must be called BEFORE child_done_events.pop, got order: {call_order}"
+        f"Session delivery must happen before child_done_events.pop, got order: {call_order}"
     )
 
 
@@ -793,8 +836,8 @@ async def test_get_model_settings_uses_per_session_pending_retrievals():
     capability = BackgroundTaskCapability(schemas=None, force_retrieval="tool_choice")
     pool = _make_mock_pool()
 
-    run_ctx_a = _make_real_run_ctx()
-    run_ctx_b = _make_real_run_ctx()
+    run_ctx_a = _MockRunContext(session_id="ses_settings_a")
+    run_ctx_b = _MockRunContext(session_id="ses_settings_b")
 
     ctx_a = _make_agent_context(pool=pool, run_ctx=run_ctx_a)
     ctx_b = _make_agent_context(pool=pool, run_ctx=run_ctx_b)

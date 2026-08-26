@@ -259,6 +259,23 @@ async def test_close_session_no_active_run(
 
 
 @pytest.mark.anyio
+async def test_close_session_runs_registered_runtime_cleanup_once(
+    session_pool: SessionPool,
+    minimal_pool: AgentPool,
+) -> None:
+    """Session-owned asynchronous resources are released before close completes."""
+    agent = MockAgent()
+    await _setup_session(session_pool.sessions, "sess-runtime", agent, minimal_pool)
+    cleanup = AsyncMock()
+    session_pool.register_session_cleanup("sess-runtime", cleanup)
+
+    await session_pool.close_session("sess-runtime")
+    await session_pool.close_session("sess-runtime")
+
+    cleanup.assert_awaited_once()
+
+
+@pytest.mark.anyio
 async def test_close_session_acquires_request_lock(
     session_pool: SessionPool,
     minimal_pool: AgentPool,
