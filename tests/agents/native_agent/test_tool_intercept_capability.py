@@ -29,6 +29,7 @@ import pytest
 
 from wolfharness import Agent
 from wolfharness.agents.native_agent.tool_intercept import ToolInterceptCapability
+from wolfharness.execution import MISSION_CONTEXT_KEY, MissionExecutionContext
 from wolfharness.hooks import AgentHooks, CallableHook
 from wolfharness.hooks.base import HookResult
 
@@ -231,6 +232,45 @@ async def test_wrap_tool_execute_maps_declared_tool_result_failure(
         await cap.wrap_tool_execute(
             ctx, call=call, tool_def=tool_def, args={}, handler=failing_handler
         )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure_kind", ["exception", "tool_failed", "tool_result"])
+async def test_wrap_tool_execute_records_mission_tool_failure_once(
+    mock_hook_manager: MagicMock,
+    failure_kind: str,
+) -> None:
+    """Every failed tool boundary contributes exactly one mission failure."""
+    from wolfharness.tools.base import ToolResult
+
+    cap = make_capability(mock_hook_manager)
+    mission = MissionExecutionContext.create(
+        root_session_id="ses_root",
+        timeout_seconds=30,
+        max_model_requests=10,
+    )
+    deps = MockDeps()
+    deps.data = {MISSION_CONTEXT_KEY: mission}
+    ctx = make_run_context(deps)
+
+    async def failing_handler(args: dict[str, Any]) -> Any:
+        del args
+        if failure_kind == "exception":
+            raise RuntimeError("ordinary failure")
+        if failure_kind == "tool_failed":
+            raise ToolFailed("declared by provider")
+        return ToolResult(content="declared result failure", is_error=True)
+
+    with pytest.raises(ToolFailed):
+        await cap.wrap_tool_execute(
+            ctx,
+            call=make_tool_call("failing_tool"),
+            tool_def=make_tool_def("failing_tool"),
+            args={},
+            handler=failing_handler,
+        )
+
+    assert mission.usage_snapshot().tool_failures == 1
 
 
 # ============================================================================

@@ -26,6 +26,7 @@ from pydantic_ai import ModelRetry
 from pydantic_ai.capabilities.abstract import AbstractCapability
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ToolFailed, ToolRetryError
 
+from wolfharness.execution import mission_from_deps
 from wolfharness.log import get_logger
 
 
@@ -143,7 +144,6 @@ class ToolInterceptCapability(AbstractCapability[Any]):
             # _run_execute_hooks and the framework's retry/defer/approval logic.
             CallDeferred,
             ApprovalRequired,
-            ToolFailed,
             ToolRetryError,
             ModelRetry,
             # AgentPool control-flow exceptions — must propagate to
@@ -152,7 +152,15 @@ class ToolInterceptCapability(AbstractCapability[Any]):
             ToolSkippedError,
         ):
             raise
+        except ToolFailed:
+            mission = mission_from_deps(ctx.deps)
+            if mission is not None:
+                await mission.record_tool_failure()
+            raise
         except Exception as exc:
+            mission = mission_from_deps(ctx.deps)
+            if mission is not None:
+                await mission.record_tool_failure()
             logger.warning(
                 "Tool execution failed",
                 tool_name=call.tool_name,
@@ -164,6 +172,9 @@ class ToolInterceptCapability(AbstractCapability[Any]):
         # Convert AgentPool ToolResult to pydantic-ai ToolReturn
         if isinstance(result, ToolResult):
             if result.is_error:
+                mission = mission_from_deps(ctx.deps)
+                if mission is not None:
+                    await mission.record_tool_failure()
                 raise ToolFailed(str(result.content))
             from pydantic_ai.messages import ToolReturn
 
