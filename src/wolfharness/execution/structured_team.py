@@ -17,6 +17,7 @@ from wolfharness.agents.events import (
     RunErrorEvent,
     RunFailedEvent,
     StreamCompleteEvent,
+    ToolCallCompleteEvent,
 )
 from wolfharness.capabilities.file_team_state import FileTeamState
 from wolfharness.execution.mission import MissionExecutionContext, with_mission_context
@@ -359,6 +360,10 @@ class StructuredTeamExecutionService:
                 raise StructuredTeamExecutionError(event.message)
             if isinstance(event, RunFailedEvent):
                 raise StructuredTeamExecutionError(str(event.exception))
+            if isinstance(event, ToolCallCompleteEvent) and event.is_error:
+                raise StructuredTeamExecutionError(
+                    f"Tool {event.tool_name!r} failed: {event.tool_result}"
+                )
             if isinstance(event, StreamCompleteEvent):
                 raise StructuredTeamExecutionError(
                     "Member ended without a typed Artifact completion"

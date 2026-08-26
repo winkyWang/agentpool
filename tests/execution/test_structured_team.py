@@ -6,7 +6,11 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
-from wolfharness.agents.events import ArtifactCompletionEvent, StreamCompleteEvent
+from wolfharness.agents.events import (
+    ArtifactCompletionEvent,
+    StreamCompleteEvent,
+    ToolCallCompleteEvent,
+)
 from wolfharness.execution import (
     StructuredTeamExecutionService,
     TeamExecutionPlan,
@@ -23,7 +27,13 @@ class _Sessions:
 
 
 class _SessionPool:
-    def __init__(self, *, expected_members: int, typed_completion: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        expected_members: int,
+        typed_completion: bool = True,
+        tool_error: str | None = None,
+    ) -> None:
         self.event_bus = EventBus()
         self.sessions = _Sessions()
         self.closed_sessions: list[str] = []
@@ -32,6 +42,7 @@ class _SessionPool:
         self._expected_members = expected_members
         self._all_started = asyncio.Event()
         self._typed_completion = typed_completion
+        self._tool_error = tool_error
         self._background_tasks: set[asyncio.Task[None]] = set()
 
     async def create_child_session(self, **_kwargs: Any) -> SimpleNamespace:
@@ -48,7 +59,18 @@ class _SessionPool:
         async def finish() -> None:
             await self._all_started.wait()
             await asyncio.sleep(0.05)
-            if self._typed_completion:
+            if self._tool_error is not None:
+                event = ToolCallCompleteEvent(
+                    tool_name="persist_fragment",
+                    tool_call_id="tool-call-1",
+                    tool_input={"artifact_uri": "scratchpad:///assignment.json"},
+                    tool_result=self._tool_error,
+                    agent_name="evidence-explorer",
+                    message_id=f"message-{session_id}",
+                    is_error=True,
+                    session_id=session_id,
+                )
+            elif self._typed_completion:
                 event: object = ArtifactCompletionEvent(
                     mission_id=mission.mission_id,
                     session_id=session_id,
@@ -131,4 +153,25 @@ async def test_structured_team_rejects_final_text_without_typed_completion(tmp_p
     assert completion.outcome == "technical_failure"
     assert completion.artifact_uri is None
     assert "without a typed Artifact completion" in (completion.error or "")
+    assert pool.closed_sessions == ["member-session-1"]
+
+
+async def test_structured_team_preserves_member_tool_failure_diagnostic(tmp_path) -> None:
+    pool = _SessionPool(
+        expected_members=1,
+        tool_error="database query contract rejected backing='without'",
+    )
+    service = StructuredTeamExecutionService(
+        session_pool=pool,  # type: ignore[arg-type]
+        team_state_base_dir=tmp_path,
+    )
+
+    report = await service.execute(plan=_plan(1), mission=_mission())
+
+    completion = report.completions[0]
+    assert completion.outcome == "technical_failure"
+    assert completion.error == (
+        "StructuredTeamExecutionError: Tool 'persist_fragment' failed: "
+        "database query contract rejected backing='without'"
+    )
     assert pool.closed_sessions == ["member-session-1"]
