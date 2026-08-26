@@ -59,9 +59,17 @@
   },
   {
     "payload": {
-      "rawOutput": "ls: cannot access '/nonexistent': No such file or directory\n\n\nError: Command failed\nExit code: 2",
+      "content": [
+        {
+          "content": {
+            "text": "Error: ls: cannot access '/nonexistent': No such file or directory\n\n\nError: Command failed\nExit code: 2",
+            "type": "text"
+          },
+          "type": "content"
+        }
+      ],
       "sessionUpdate": "tool_call_update",
-      "status": "completed",
+      "status": "failed",
       "toolCallId": "pyd_ai_tool_call_id__bash"
     },
     "type": "tool_call_update"
@@ -71,15 +79,14 @@
       "content": [
         {
           "content": {
-            "text": "ls: cannot access '/nonexistent': No such file or directory\n\n\nError: Command failed\nExit code: 2",
+            "text": "Error: ls: cannot access '/nonexistent': No such file or directory\n\n\nError: Command failed\nExit code: 2",
             "type": "text"
           },
           "type": "content"
         }
       ],
-      "rawOutput": "ls: cannot access '/nonexistent': No such file or directory\n\n\nError: Command failed\nExit code: 2",
       "sessionUpdate": "tool_call_update",
-      "status": "completed",
+      "status": "failed",
       "toolCallId": "pyd_ai_tool_call_id__bash"
     },
     "type": "tool_call_update"
