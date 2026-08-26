@@ -5,6 +5,7 @@ from .mission import (
     MissionBudgetExceededError,
     MissionExecutionContext,
     MissionUsageSnapshot,
+    inherited_run_deps,
     mission_from_deps,
     with_mission_context,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "TeamExecutionReport",
     "TeamMemberCompletion",
     "TeamMemberDispatch",
+    "inherited_run_deps",
     "mission_from_deps",
     "with_mission_context",
 ]

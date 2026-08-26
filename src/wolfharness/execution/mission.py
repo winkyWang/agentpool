@@ -118,11 +118,28 @@ class MissionExecutionContext:
 
 
 def mission_from_deps(deps: Any) -> MissionExecutionContext | None:
-    """Read the propagated mission from Agent dependencies."""
-    if not isinstance(deps, Mapping):
+    """Read the mission through runtime and delegated dependency layers."""
+    mapping = inherited_run_deps(deps)
+    if mapping is None:
         return None
-    mission = deps.get(MISSION_CONTEXT_KEY)
+    mission = mapping.get(MISSION_CONTEXT_KEY)
     return mission if isinstance(mission, MissionExecutionContext) else None
+
+
+def inherited_run_deps(deps: Any) -> Mapping[str, Any] | None:
+    """Resolve caller-supplied Run data without discarding runtime services."""
+    current = deps
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, Mapping):
+            return current
+        inherited = getattr(current, "inherited_run_deps", None)
+        if inherited is not None:
+            current = inherited
+            continue
+        current = getattr(current, "data", None)
+    return None
 
 
 def with_mission_context(

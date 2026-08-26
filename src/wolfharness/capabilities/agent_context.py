@@ -18,6 +18,8 @@ import warnings
 
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from wolfharness.capabilities.delegation import DelegationService
     from wolfharness.capabilities.extension_registry import ExtensionRegistry
     from wolfharness.host.context import HostContext, RunScope
@@ -53,6 +55,13 @@ class AgentContextDeps:
     extension_registry: ExtensionRegistry | None = None
     team_mode_config: TeamModeConfig | None = None
     agent_name: str = ""
+    inherited_run_deps: Mapping[str, Any] | None = None
+    """Mission and delegation data supplied when the Session Run was created.
+
+    Runtime service handles and caller-supplied execution data occupy different
+    layers. Keeping the latter here prevents runtime-context injection from
+    replacing the mission shared by a delegated Session tree.
+    """
 
 
 def resolve_agent_context_from_deps(

@@ -43,7 +43,11 @@ from wolfharness.capabilities.background_task.notification import (
     _format_duration,
 )
 from wolfharness.capabilities.background_task.types import BackgroundTask, SessionTaskState
-from wolfharness.execution import MissionExecutionContext, mission_from_deps
+from wolfharness.execution import (
+    MissionExecutionContext,
+    inherited_run_deps,
+    mission_from_deps,
+)
 from wolfharness.orchestrator.core import EventEnvelope
 from wolfharness.skills.uri_resolver import ResolvedSkillURI
 from wolfharness.tools.exceptions import ToolError
@@ -772,20 +776,19 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
                 source_type = "team_parallel"
 
         # Handle delegation depth
-        current_depth = 0
-        if isinstance(agent_ctx.data, dict):
-            current_depth = int(agent_ctx.data.get("delegation_depth", 0))
+        parent_deps = inherited_run_deps(agent_ctx.data)
+        current_depth = int(parent_deps.get("delegation_depth", 0)) if parent_deps else 0
 
         if current_depth >= MAX_DELEGATION_DEPTH:
             return f"Error: Max delegation depth ({MAX_DELEGATION_DEPTH}) reached."
 
         # Prepare dependencies with incremented depth
         new_deps: DelegationDeps = {"delegation_depth": current_depth + 1}
-        if isinstance(agent_ctx.data, dict):
+        if parent_deps is not None:
             # Spread merge: result may contain arbitrary keys from ctx.data
             # beyond the DelegationDeps known fields. TypedDict captures the
             # known structure; the spread result is still a valid DelegationDeps.
-            new_deps = {**agent_ctx.data, **new_deps}  # pyright: ignore[reportAssignmentType]
+            new_deps = {**parent_deps, **new_deps}  # pyright: ignore[reportAssignmentType]
 
         # Fetch and format skill instructions
         skills_content = ""

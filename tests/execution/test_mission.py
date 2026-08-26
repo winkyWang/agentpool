@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -61,3 +62,12 @@ def test_mission_context_is_propagated_by_identity() -> None:
 
     assert mission_from_deps(deps) is mission
     assert deps["domain"] == "welding"
+
+
+def test_mission_context_resolves_through_runtime_dependency_layers() -> None:
+    mission = _mission()
+    delegated = with_mission_context({"delegation_depth": 1}, mission)
+    runtime_services = SimpleNamespace(inherited_run_deps=delegated)
+    agent_context = SimpleNamespace(data=runtime_services)
+
+    assert mission_from_deps(agent_context) is mission

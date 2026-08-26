@@ -15,6 +15,7 @@ from wolfharness.agents.context import AgentRunContext
 from wolfharness.capabilities.agent_context import AgentContextDeps
 from wolfharness.capabilities.delegation import DelegationService
 from wolfharness.capabilities.runloop_delegation import RunLoopDelegationService
+from wolfharness.execution import MissionExecutionContext, mission_from_deps
 from wolfharness.host.context import HostContext, RunScope
 from wolfharness.host.registry import AgentRegistry
 from wolfharness.orchestrator.run import RunHandle
@@ -44,9 +45,10 @@ def _make_host_context() -> HostContext:
 def _make_run_handle(
     host_context: HostContext | None = None,
     agent_registry: AgentRegistry | None = None,
+    deps: object | None = None,
 ) -> RunHandle:
     """Build a RunHandle with minimal fields for testing injection."""
-    run_ctx = AgentRunContext(session_id="test-session")
+    run_ctx = AgentRunContext(session_id="test-session", deps=deps)
     return RunHandle(
         run_id="test-run",
         session_id="test-session",
@@ -142,6 +144,49 @@ def test_inject_creates_fresh_context_per_call() -> None:
     ctx2: AgentContextDeps = handle.run_ctx.deps
 
     assert ctx1 is not ctx2
+
+
+def test_inject_preserves_mission_from_delegated_run_dependencies() -> None:
+    """Runtime service injection must not replace delegated mission ownership."""
+    host = _make_host_context()
+    registry = AgentRegistry()
+    mission = MissionExecutionContext.create(
+        root_session_id="root-session",
+        timeout_seconds=30,
+        max_model_requests=5,
+    )
+    inherited = {
+        "delegation_depth": 1,
+        "wolfharness_mission_context": mission,
+    }
+    handle = _make_run_handle(
+        host_context=host,
+        agent_registry=registry,
+        deps=inherited,
+    )
+
+    handle._inject_agent_context()
+
+    assert isinstance(handle.run_ctx.deps, AgentContextDeps)
+    assert handle.run_ctx.deps.inherited_run_deps is inherited
+    assert mission_from_deps(handle.run_ctx.deps) is mission
+
+
+def test_repeated_injection_preserves_inherited_run_dependencies() -> None:
+    host = _make_host_context()
+    registry = AgentRegistry()
+    inherited = {"delegation_depth": 2}
+    handle = _make_run_handle(
+        host_context=host,
+        agent_registry=registry,
+        deps=inherited,
+    )
+
+    handle._inject_agent_context()
+    handle._inject_agent_context()
+
+    assert isinstance(handle.run_ctx.deps, AgentContextDeps)
+    assert handle.run_ctx.deps.inherited_run_deps is inherited
 
 
 def test_delegation_service_lists_agents() -> None:

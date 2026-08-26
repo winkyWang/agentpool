@@ -8,6 +8,7 @@ conversation history, message routing) is owned by ``SessionState``.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 import contextlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Self
@@ -326,6 +327,9 @@ class RunHandle:
             host=self._host_context,
             session_id=self.session_id,
         )
+        inherited_run_deps = self.run_ctx.deps
+        if isinstance(inherited_run_deps, AgentContextDeps):
+            inherited_run_deps = inherited_run_deps.inherited_run_deps
         ctx = AgentContextDeps(
             agent_registry=registry,
             delegation=delegation,
@@ -336,6 +340,9 @@ class RunHandle:
                 self._host_context.extension_registry if self._host_context is not None else None
             ),
             agent_name=self.agent.name if self.agent is not None else self.agent_type,
+            inherited_run_deps=(
+                inherited_run_deps if isinstance(inherited_run_deps, Mapping) else None
+            ),
         )
         self.run_ctx.deps = ctx
 
