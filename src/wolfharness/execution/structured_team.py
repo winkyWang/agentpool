@@ -23,6 +23,9 @@ from wolfharness.capabilities.file_team_state import FileTeamState
 from wolfharness.execution.mission import MissionExecutionContext, with_mission_context
 
 
+_PROGRESS_HEARTBEAT_SECONDS = 30.0
+
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -40,6 +43,7 @@ class TeamMemberDispatch:
     input_artifact_uri: str
     expected_artifact_type: str
     instruction: str
+    progress_phase: str = "team_member_running"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -226,6 +230,7 @@ class StructuredTeamExecutionService:
                     mission=mission,
                     session_id=child_session_id,
                     expected_artifact_type=dispatch.expected_artifact_type,
+                    progress_phase=dispatch.progress_phase,
                 )
                 await self._publish_progress(
                     mission=mission,
@@ -332,6 +337,8 @@ class StructuredTeamExecutionService:
             raise ValueError("member_name values must be unique")
         if plan.lead_member_name in member_names:
             raise ValueError("lead_member_name must not duplicate a member_name")
+        if any(not dispatch.progress_phase.strip() for dispatch in plan.dispatches):
+            raise ValueError("progress_phase values must not be blank")
 
     async def _wait_for_completion(
         self,
@@ -340,13 +347,24 @@ class StructuredTeamExecutionService:
         mission: MissionExecutionContext,
         session_id: str,
         expected_artifact_type: str,
+        progress_phase: str,
     ) -> ArtifactCompletionEvent:
         while True:
             remaining = mission.remaining_seconds()
             if mission.cancelled or remaining <= 0:
                 raise TimeoutError("Mission ended before member completion")
-            async with asyncio.timeout(remaining):
-                envelope = await queue.get()
+            try:
+                async with asyncio.timeout(
+                    min(remaining, _PROGRESS_HEARTBEAT_SECONDS),
+                ):
+                    envelope = await queue.get()
+            except TimeoutError:
+                await self._publish_progress(
+                    mission=mission,
+                    source_session_id=session_id,
+                    phase=progress_phase,
+                )
+                continue
             event = envelope.event
             if isinstance(event, ArtifactCompletionEvent):
                 if event.mission_id != mission.mission_id or event.session_id != session_id:

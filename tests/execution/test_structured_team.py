@@ -8,6 +8,7 @@ from typing import Any
 
 from wolfharness.agents.events import (
     ArtifactCompletionEvent,
+    MissionProgressEvent,
     StreamCompleteEvent,
     ToolCallCompleteEvent,
 )
@@ -18,6 +19,7 @@ from wolfharness.execution import (
     mission_from_deps,
 )
 from wolfharness.execution.mission import MissionExecutionContext
+import wolfharness.execution.structured_team as structured_team_module
 from wolfharness.orchestrator.event_bus import EventBus
 
 
@@ -175,3 +177,52 @@ async def test_structured_team_preserves_member_tool_failure_diagnostic(tmp_path
         "database query contract rejected backing='without'"
     )
     assert pool.closed_sessions == ["member-session-1"]
+
+
+async def test_structured_team_emits_scoped_progress_while_member_runs(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        structured_team_module,
+        "_PROGRESS_HEARTBEAT_SECONDS",
+        0.01,
+    )
+    pool = _SessionPool(expected_members=1)
+    progress_queue = await pool.event_bus.subscribe(
+        "root-session",
+        scope="session",
+        replay=False,
+    )
+    service = StructuredTeamExecutionService(
+        session_pool=pool,  # type: ignore[arg-type]
+        team_state_base_dir=tmp_path,
+    )
+    plan = _plan(1)
+    dispatch = plan.dispatches[0]
+    plan = TeamExecutionPlan(
+        name=plan.name,
+        parent_session_id=plan.parent_session_id,
+        lead_member_name=plan.lead_member_name,
+        max_parallel_members=plan.max_parallel_members,
+        dispatches=(
+            TeamMemberDispatch(
+                dispatch_id=dispatch.dispatch_id,
+                member_name=dispatch.member_name,
+                agent_name=dispatch.agent_name,
+                input_artifact_uri=dispatch.input_artifact_uri,
+                expected_artifact_type=dispatch.expected_artifact_type,
+                instruction=dispatch.instruction,
+                progress_phase="evidence_audit_running",
+            ),
+        ),
+    )
+
+    await service.execute(plan=plan, mission=_mission())
+
+    progress_events: list[MissionProgressEvent] = []
+    while not progress_queue.empty():
+        event = (await progress_queue.get()).event
+        if isinstance(event, MissionProgressEvent):
+            progress_events.append(event)
+    assert any(event.phase == "evidence_audit_running" for event in progress_events)
