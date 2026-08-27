@@ -7,15 +7,12 @@ from wolfharness.capabilities.artifact_completion import (
 )
 
 
-def test_artifact_completion_forces_exact_protocol_tools() -> None:
+def test_artifact_completion_requires_an_exposed_protocol_tool() -> None:
     capability = ArtifactCompletionCapability(
         tool_names=["read_assignment", "record_artifact"],
     )
 
-    assert capability.get_model_settings()["tool_choice"] == [
-        "read_assignment",
-        "record_artifact",
-    ]
+    assert capability.get_model_settings()["tool_choice"] == "required"
 
 
 @pytest.mark.parametrize(

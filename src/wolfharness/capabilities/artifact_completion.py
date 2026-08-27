@@ -12,9 +12,10 @@ class ArtifactCompletionCapability(AbstractCapability[Any]):
     """Require every model response to select an Artifact-workflow tool.
 
     Structured workers must inspect immutable inputs and persist a typed output;
-    free-text completion has no protocol meaning. Restricting model choice to the
-    configured preparation and persistence tools prevents an unbounded narrative
-    response while leaving all semantic decisions to the model.
+    free-text completion has no protocol meaning. Requiring a tool call uses the
+    OpenAI-compatible protocol understood by proxy and self-hosted providers;
+    the configured names remain the capability's declared worker contract and
+    are validated against the worker's exposed tool surface by its manifest.
     """
 
     def __init__(self, tool_names: list[str]) -> None:
@@ -28,8 +29,8 @@ class ArtifactCompletionCapability(AbstractCapability[Any]):
         self._tool_names = tuple(tool_names)
 
     def get_model_settings(self) -> ModelSettings:
-        """Force one configured protocol tool on every model response."""
-        return ModelSettings(tool_choice=list(self._tool_names))
+        """Force one exposed protocol tool on every model response."""
+        return ModelSettings(tool_choice="required")
 
 
 __all__ = ["ArtifactCompletionCapability"]
