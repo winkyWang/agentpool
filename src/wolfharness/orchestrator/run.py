@@ -22,8 +22,10 @@ from wolfharness.agents.events import (
     RunFailedEvent,
     RunStartedEvent,
     StreamCompleteEvent,
+    ToolCallCompleteEvent,
     UserMessageInsertedEvent,
 )
+from wolfharness.execution.mission import mission_from_deps
 from wolfharness.lifecycle import RunOutcome
 from wolfharness.log import get_logger
 from wolfharness.messaging import ChatMessage
@@ -600,6 +602,13 @@ class RunHandle:
             try:
                 async with contextlib.aclosing(turn.execute()) as event_gen:
                     async for event in event_gen:
+                        # Count the typed boundary event once. Tool handlers do
+                        # not own accounting because argument validation can
+                        # fail before a handler is entered.
+                        if isinstance(event, ToolCallCompleteEvent) and event.is_error:
+                            mission = mission_from_deps(self.run_ctx.deps)
+                            if mission is not None:
+                                await mission.record_tool_failure()
                         if event_bus is not None and not comm.publishes_to_event_bus:
                             await event_bus.publish(self.session_id, event)
                         await self._safe_publish(comm, event)

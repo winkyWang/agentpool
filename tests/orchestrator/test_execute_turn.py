@@ -10,10 +10,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from wolfharness.agents.context import AgentRunContext
 from wolfharness.agents.events.events import (
     RunErrorEvent,
     StreamCompleteEvent,
+    ToolCallCompleteEvent,
 )
+from wolfharness.execution import MissionExecutionContext, with_mission_context
 from wolfharness.messaging.messagenode import ChatMessage
 
 
@@ -132,4 +135,64 @@ async def test_execute_turn_breaks_on_stream_complete() -> None:
 
     complete_events = [e for e in events if isinstance(e, StreamCompleteEvent)]
     assert len(complete_events) == 1
+    assert handle._current_turn_failed is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_execute_turn_counts_error_event_once_without_ending_run() -> None:
+    """A failed tool event is usage data, not a Run terminal event."""
+    from wolfharness.orchestrator.run import RunHandle
+
+    tool_error = ToolCallCompleteEvent(
+        tool_name="record_review",
+        tool_call_id="tool-call-1",
+        tool_input={},
+        tool_result="Invalid JSON: expected ',' or ']'",
+        agent_name="reviewer",
+        message_id="message-1",
+        is_error=True,
+        session_id="member-session",
+    )
+    complete_event = StreamCompleteEvent(
+        message=ChatMessage(content="corrected", role="assistant"),
+    )
+
+    async def mock_execute():
+        yield tool_error
+        yield complete_event
+
+    mock_turn = MagicMock()
+    mock_turn.execute = mock_execute
+    mock_turn._final_message = ChatMessage(content="corrected", role="assistant")
+
+    mock_agent = MagicMock()
+    mock_agent.create_turn = MagicMock(return_value=mock_turn)
+    mock_agent.conversation = MagicMock()
+
+    mission = MissionExecutionContext.create(
+        root_session_id="root-session",
+        timeout_seconds=30,
+        max_model_requests=5,
+    )
+    handle = RunHandle(
+        run_id="test-run",
+        session_id="member-session",
+        agent_type="native",
+        agent=mock_agent,
+        event_bus=None,
+        session=None,
+        run_ctx=AgentRunContext(
+            session_id="member-session",
+            deps=with_mission_context({}, mission),
+        ),
+    )
+
+    events = [
+        event
+        async for event in handle._execute_turn(mock_agent, None, _make_mock_session(), ["test"])
+    ]
+
+    assert events == [tool_error, complete_event]
+    assert mission.usage_snapshot().tool_failures == 1
     assert handle._current_turn_failed is False

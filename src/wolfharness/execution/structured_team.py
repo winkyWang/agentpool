@@ -17,7 +17,6 @@ from wolfharness.agents.events import (
     RunErrorEvent,
     RunFailedEvent,
     StreamCompleteEvent,
-    ToolCallCompleteEvent,
 )
 from wolfharness.capabilities.file_team_state import FileTeamState
 from wolfharness.execution.mission import MissionExecutionContext, with_mission_context
@@ -378,10 +377,9 @@ class StructuredTeamExecutionService:
                 raise StructuredTeamExecutionError(event.message)
             if isinstance(event, RunFailedEvent):
                 raise StructuredTeamExecutionError(str(event.exception))
-            if isinstance(event, ToolCallCompleteEvent) and event.is_error:
-                raise StructuredTeamExecutionError(
-                    f"Tool {event.tool_name!r} failed: {event.tool_result}"
-                )
+            # A failed tool completion is deliberately non-terminal here.
+            # PydanticAI uses the same event for RetryPromptPart feedback and
+            # continues the current Run so the model can correct its call.
             if isinstance(event, StreamCompleteEvent):
                 raise StructuredTeamExecutionError(
                     "Member ended without a typed Artifact completion"

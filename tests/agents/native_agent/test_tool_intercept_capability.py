@@ -236,11 +236,11 @@ async def test_wrap_tool_execute_maps_declared_tool_result_failure(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("failure_kind", ["exception", "tool_failed", "tool_result"])
-async def test_wrap_tool_execute_records_mission_tool_failure_once(
+async def test_wrap_tool_execute_leaves_failure_accounting_to_emitted_event(
     mock_hook_manager: MagicMock,
     failure_kind: str,
 ) -> None:
-    """Every failed tool boundary contributes exactly one mission failure."""
+    """The RunHandle owns failure accounting from the emitted typed event."""
     from wolfharness.tools.base import ToolResult
 
     cap = make_capability(mock_hook_manager)
@@ -270,7 +270,7 @@ async def test_wrap_tool_execute_records_mission_tool_failure_once(
             handler=failing_handler,
         )
 
-    assert mission.usage_snapshot().tool_failures == 1
+    assert mission.usage_snapshot().tool_failures == 0
 
 
 # ============================================================================

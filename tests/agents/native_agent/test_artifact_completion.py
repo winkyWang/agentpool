@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
+from pydantic_ai.messages import ModelRequest, RetryPromptPart
+from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 from pydantic_ai.models.test import TestModel
 import pytest
 
@@ -97,5 +99,70 @@ async def test_successful_artifact_tool_commits_event_and_ends_without_extra_req
     event_bus.publish.assert_awaited_once()
     published_session_id, published_event = event_bus.publish.await_args.args
     assert published_session_id == "member-session"
+    assert isinstance(published_event, ArtifactCompletionEvent)
+    assert published_event.artifact_uri == "scratchpad:///artifact.yaml"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_invalid_tool_arguments_are_corrected_within_the_same_run() -> None:
+    """PydanticAI feeds argument validation errors back before typed completion."""
+    event_bus = MagicMock()
+    event_bus.publish = AsyncMock()
+    mission = _mission()
+    run_ctx = AgentRunContext(
+        session_id="member-session",
+        event_bus=event_bus,
+        deps=with_mission_context({}, mission),
+    )
+
+    def persist_artifact(artifact_uri: str) -> str:
+        """Persist an Artifact after its arguments pass validation."""
+        run_ctx.pending_artifact_completion = ArtifactCompletionEvent(
+            mission_id=mission.mission_id,
+            session_id=run_ctx.session_id,
+            artifact_uri=artifact_uri,
+            artifact_type="EvidenceFragment",
+        )
+        return "persisted"
+
+    async def respond(messages, _info):
+        retry_seen = any(
+            isinstance(message, ModelRequest)
+            and any(isinstance(part, RetryPromptPart) for part in message.parts)
+            for message in messages
+        )
+        args = (
+            {"artifact_uri": "scratchpad:///artifact.yaml"}
+            if retry_seen
+            else '{"artifact_uri":"scratchpad:///artifact.yaml"'
+        )
+        yield {
+            0: DeltaToolCall(
+                name="persist_artifact",
+                json_args=args,
+                tool_call_id="persist-artifact-call",
+            )
+        }
+
+    agent = Agent(
+        name="artifact-member",
+        model=FunctionModel(stream_function=respond),
+        tools=[persist_artifact],
+    )
+    async with agent:
+        turn = NativeTurn(
+            agent=agent,
+            prompts=["Persist the Artifact"],
+            run_ctx=run_ctx,
+            message_history=[],
+        )
+        events = [event async for event in turn.execute()]
+
+    tool_events = [event for event in events if isinstance(event, ToolCallCompleteEvent)]
+    assert [event.is_error for event in tool_events] == [True, False]
+    assert mission.usage_snapshot().model_requests == 2
+    event_bus.publish.assert_awaited_once()
+    published_event = event_bus.publish.await_args.args[1]
     assert isinstance(published_event, ArtifactCompletionEvent)
     assert published_event.artifact_uri == "scratchpad:///artifact.yaml"
