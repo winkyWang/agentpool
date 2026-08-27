@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from upathtools.filesystems import IsolatedMemoryFileSystem, OverlayFileSystem
 
     from wolfharness import Agent
-    from wolfharness.agents.events import StreamEventEmitter
+    from wolfharness.agents.events import ArtifactCompletionEvent, StreamEventEmitter
     from wolfharness.agents.native_agent.checkpoint import CheckpointManager
     from wolfharness.agents.native_agent.elicitation_bridge import ElicitationFutureRegistry
     from wolfharness.orchestrator.core import EventBus
@@ -126,6 +126,9 @@ class AgentRunContext:
 
     terminal_tool_name: str | None = None
     """Name of the terminal tool that completed the run."""
+
+    pending_artifact_completion: ArtifactCompletionEvent | None = None
+    """Persisted Artifact completion awaiting a successful tool return."""
 
     checkpointed: bool = False
     """Whether the run has been checkpointed (deferred tools pending)."""
@@ -653,7 +656,7 @@ class AgentContext[TDeps = Any](NodeContext[TDeps]):
         await run_ctx.event_bus.publish(mission.progress_session_id, event)
 
     async def complete_artifact(self, *, artifact_uri: str, artifact_type: str) -> None:
-        """Publish a typed completion after a domain tool persists its Artifact."""
+        """Stage typed completion for commit after the persistence tool succeeds."""
         from wolfharness.agents.events import ArtifactCompletionEvent
         from wolfharness.execution import mission_from_deps
 
@@ -661,13 +664,15 @@ class AgentContext[TDeps = Any](NodeContext[TDeps]):
         mission = mission_from_deps(run_ctx.deps if run_ctx is not None else None)
         if run_ctx is None or run_ctx.event_bus is None or mission is None:
             raise RuntimeError("Artifact completion requires an active mission context")
+        if run_ctx.pending_artifact_completion is not None:
+            raise RuntimeError("A Run may complete exactly one persisted Artifact")
         event = ArtifactCompletionEvent(
             mission_id=mission.mission_id,
             session_id=run_ctx.session_id,
             artifact_uri=artifact_uri,
             artifact_type=artifact_type,
         )
-        await run_ctx.event_bus.publish(run_ctx.session_id, event)
+        run_ctx.pending_artifact_completion = event
 
     @property
     def events(self) -> StreamEventEmitter:

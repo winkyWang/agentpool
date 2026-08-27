@@ -299,14 +299,39 @@ class NativeTurn(HookAwareTurn, Turn):
                                                     mapped,
                                                     ToolCallCompleteEvent,
                                                 )
-                                                and mapped.tool_name in terminal_tool_names
                                             ):
-                                                self._run_ctx.terminal_tool_name = mapped.tool_name
-                                                self._run_ctx.terminal_tool_result = (
-                                                    mapped.tool_result
+                                                artifact_completion = (
+                                                    self._run_ctx.pending_artifact_completion
                                                 )
-                                                terminal_tool_completed = True
-                                                break
+                                                if mapped.is_error:
+                                                    self._run_ctx.pending_artifact_completion = None
+                                                elif artifact_completion is not None:
+                                                    if self._run_ctx.event_bus is None:
+                                                        raise RuntimeError(
+                                                            "Artifact completion "
+                                                            "requires an EventBus",
+                                                        )
+                                                    await self._run_ctx.event_bus.publish(
+                                                        self._run_ctx.session_id,
+                                                        artifact_completion,
+                                                    )
+                                                    self._run_ctx.pending_artifact_completion = None
+                                                if (
+                                                    not mapped.is_error
+                                                    and (
+                                                        mapped.tool_name
+                                                        in terminal_tool_names
+                                                        or artifact_completion is not None
+                                                    )
+                                                ):
+                                                    self._run_ctx.terminal_tool_name = (
+                                                        mapped.tool_name
+                                                    )
+                                                    self._run_ctx.terminal_tool_result = (
+                                                        mapped.tool_result
+                                                    )
+                                                    terminal_tool_completed = True
+                                                    break
                                 finally:
                                     self._agent._iteration_task = None
 
