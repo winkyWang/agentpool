@@ -29,8 +29,8 @@ class ArtifactCompletionCapability(AbstractCapability[Any]):
         self._tool_names = tuple(tool_names)
 
     def get_model_settings(self) -> ModelSettings:
-        """Force one exposed protocol tool on every model response."""
-        return ModelSettings(tool_choice="required")
+        """Force a protocol tool without spending the response on hidden thought."""
+        return ModelSettings(tool_choice="required", thinking=False)
 
 
 __all__ = ["ArtifactCompletionCapability"]

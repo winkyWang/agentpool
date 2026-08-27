@@ -12,7 +12,9 @@ def test_artifact_completion_requires_an_exposed_protocol_tool() -> None:
         tool_names=["read_assignment", "record_artifact"],
     )
 
-    assert capability.get_model_settings()["tool_choice"] == "required"
+    settings = capability.get_model_settings()
+    assert settings["tool_choice"] == "required"
+    assert settings["thinking"] is False
 
 
 @pytest.mark.parametrize(

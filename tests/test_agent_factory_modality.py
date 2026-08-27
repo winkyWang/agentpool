@@ -378,6 +378,16 @@ def test_model_config_names_string_config() -> None:
     assert names == ["openai:gpt-4o"]
 
 
+def test_string_model_config_exposes_provider_neutral_thinking() -> None:
+    """String model aliases must preserve the unified reasoning setting."""
+    config = StringModelConfig(
+        identifier="openai-chat:dashscope/glm-5.2",
+        thinking="low",
+    )
+
+    assert config.get_model_settings()["thinking"] == "low"
+
+
 def test_model_config_names_openai_config() -> None:
     """OpenAIModelConfig should return its identifier."""
     config = OpenAIModelConfig(identifier="gpt-5-pro")
