@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import sys
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1944,16 +1946,31 @@ class TestErrorHandling:
         assert "viking_set_tags error (RuntimeError): invalid tag" in result.return_value
 
     @pytest.mark.asyncio
-    async def test_ensure_client_lazy_init(self) -> None:
+    async def test_ensure_client_lazy_init(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_client: AsyncMock,
+    ) -> None:
         """_ensure_client lazily initializes the SDK client when not set."""
+        client_factory = MagicMock(return_value=mock_client)
+        monkeypatch.setitem(
+            sys.modules,
+            "openviking_sdk",
+            SimpleNamespace(AsyncHTTPClient=client_factory),
+        )
         cap = VikingCapability(mode="all", url="https://dummy.example.com")
-        # _ensure_client should create a client (lazy init), not raise.
         client = await cap._ensure_client()
-        assert client is not None
-        # Second call returns the same client (no re-init).
+        assert client is mock_client
+        client_factory.assert_called_once_with(
+            url="https://dummy.example.com",
+            api_key=None,
+            account=None,
+            user=None,
+            timeout=60.0,
+        )
+        mock_client.initialize.assert_awaited_once()
         client2 = await cap._ensure_client()
         assert client is client2
-        # Clean up
         await cap.__aexit__(None, None, None)
 
 

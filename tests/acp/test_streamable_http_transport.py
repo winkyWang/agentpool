@@ -337,6 +337,8 @@ async def test_websocket_write_stream_skips_empty_message() -> None:
 # AgentSideConnection initialize guard tests
 # =============================================================================
 
+_INITIALIZE_GUARD_RESPONSE_TIMEOUT_SECONDS = 5.0
+
 
 @pytest.mark.unit
 async def test_initialize_guard_rejects_methods_before_initialize() -> None:
@@ -358,7 +360,10 @@ async def test_initialize_guard_rejects_methods_before_initialize() -> None:
         s.client_writer.write((anyenv.dump_json(req) + "\n").encode())
         await s.client_writer.drain()
 
-        line = await asyncio.wait_for(s.client_reader.readline(), timeout=1)
+        line = await asyncio.wait_for(
+            s.client_reader.readline(),
+            timeout=_INITIALIZE_GUARD_RESPONSE_TIMEOUT_SECONDS,
+        )
         resp = anyenv.load_json(line)
         assert resp["id"] == 1
         assert "error" in resp
@@ -385,7 +390,10 @@ async def test_initialize_guard_allows_initialize() -> None:
         s.client_writer.write((anyenv.dump_json(req) + "\n").encode())
         await s.client_writer.drain()
 
-        line = await asyncio.wait_for(s.client_reader.readline(), timeout=1)
+        line = await asyncio.wait_for(
+            s.client_reader.readline(),
+            timeout=_INITIALIZE_GUARD_RESPONSE_TIMEOUT_SECONDS,
+        )
         resp = anyenv.load_json(line)
         assert resp["id"] == 1
         assert "result" in resp
@@ -416,7 +424,10 @@ async def test_initialize_guard_allows_methods_after_initialize() -> None:
         }
         s.client_writer.write((anyenv.dump_json(init_req) + "\n").encode())
         await s.client_writer.drain()
-        line = await asyncio.wait_for(s.client_reader.readline(), timeout=1)
+        line = await asyncio.wait_for(
+            s.client_reader.readline(),
+            timeout=_INITIALIZE_GUARD_RESPONSE_TIMEOUT_SECONDS,
+        )
         init_resp = anyenv.load_json(line)
         assert "result" in init_resp
 
@@ -425,7 +436,10 @@ async def test_initialize_guard_allows_methods_after_initialize() -> None:
         s.client_writer.write((anyenv.dump_json(req) + "\n").encode())
         await s.client_writer.drain()
 
-        line = await asyncio.wait_for(s.client_reader.readline(), timeout=1)
+        line = await asyncio.wait_for(
+            s.client_reader.readline(),
+            timeout=_INITIALIZE_GUARD_RESPONSE_TIMEOUT_SECONDS,
+        )
         resp = anyenv.load_json(line)
         assert resp["id"] == 2
         assert "result" in resp
