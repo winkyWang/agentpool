@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 from pydantic import ConfigDict, Field, ImportString
 from pydantic_ai import ModelSettings as PyAIModelSettings
 from pydantic_ai.models.test import TestModel
-from pydantic_ai.settings import ThinkingLevel
 from schemez import Schema
 from tokonomics.model_names import ModelId
 from tokonomics.model_names.anthropic import AnthropicModelName
@@ -286,12 +285,6 @@ class StringModelConfig(BaseModelConfig):
     )
     """Extra body to send to the model."""
 
-    thinking: ThinkingLevel | None = Field(
-        default=None,
-        title="Thinking",
-    )
-    """Provider-neutral reasoning setting for the inferred model."""
-
     def get_model_settings(self) -> PyAIModelSettings:
         """Get model settings in pydantic-ai format."""
         from pydantic_ai.settings import ModelSettings
@@ -309,7 +302,6 @@ class StringModelConfig(BaseModelConfig):
             "stop_sequences": self.stop_sequences,
             "extra_headers": self.extra_headers,
             "extra_body": self.extra_body,
-            "thinking": self.thinking,
         }
         return ModelSettings(**{k: v for k, v in settings.items() if v is not None})  # type: ignore[typeddict-item, no-any-return]
 

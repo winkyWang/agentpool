@@ -18,7 +18,11 @@ class ArtifactCompletionCapability(AbstractCapability[Any]):
     are validated against the worker's exposed tool surface by its manifest.
     """
 
-    def __init__(self, tool_names: list[str]) -> None:
+    def __init__(
+        self,
+        tool_names: list[str],
+        model_settings: dict[str, Any] | None = None,
+    ) -> None:
         """Bind the exact tools that constitute one Artifact worker protocol."""
         if not tool_names:
             raise ValueError("artifact completion requires at least one tool name")
@@ -26,11 +30,17 @@ class ArtifactCompletionCapability(AbstractCapability[Any]):
             raise ValueError("artifact completion tool names must be unique")
         if any(not name.strip() for name in tool_names):
             raise ValueError("artifact completion tool names must not be blank")
+        settings = dict(model_settings or {})
+        if "tool_choice" in settings:
+            raise ValueError(
+                "artifact completion owns tool_choice; model_settings must not override it",
+            )
         self._tool_names = tuple(tool_names)
+        self._model_settings = settings
 
     def get_model_settings(self) -> ModelSettings:
         """Force a protocol tool without spending the response on hidden thought."""
-        return ModelSettings(tool_choice="required", thinking=False)
+        return ModelSettings(tool_choice="required", **self._model_settings)
 
 
 __all__ = ["ArtifactCompletionCapability"]
