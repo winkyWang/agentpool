@@ -612,15 +612,21 @@ class RunHandle:
                         # not own accounting because argument validation can
                         # fail before a handler is entered.
                         if isinstance(event, ToolCallCompleteEvent) and event.is_error:
+                            error = str(event.tool_result)[:2_000]
                             mission = mission_from_deps(self.run_ctx.deps)
                             if mission is not None:
-                                await mission.record_tool_failure()
+                                await mission.record_tool_failure(
+                                    session_id=self.session_id,
+                                    agent_name=event.agent_name,
+                                    tool_name=event.tool_name,
+                                    error=error,
+                                )
                             logger.warning(
                                 "Agent tool call failed: session=%s agent=%s tool=%s result=%s",
                                 self.session_id,
                                 event.agent_name,
                                 event.tool_name,
-                                str(event.tool_result)[:2_000],
+                                error,
                             )
                         if event_bus is not None and not comm.publishes_to_event_bus:
                             await event_bus.publish(self.session_id, event)

@@ -20,7 +20,11 @@ from wolfharness.agents.events import (
     ToolCallCompleteEvent,
 )
 from wolfharness.capabilities.file_team_state import FileTeamState
-from wolfharness.execution.mission import MissionExecutionContext, with_mission_context
+from wolfharness.execution.mission import (
+    MissionExecutionContext,
+    MissionToolFailure,
+    with_mission_context,
+)
 
 
 _PROGRESS_HEARTBEAT_SECONDS = 30.0
@@ -85,6 +89,7 @@ class TeamExecutionReport:
     input_tokens: int
     output_tokens: int
     tool_failures: int
+    tool_failure_details: tuple[MissionToolFailure, ...]
 
 
 class StructuredTeamExecutionError(RuntimeError):
@@ -186,6 +191,7 @@ class StructuredTeamExecutionService:
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             tool_failures=usage.tool_failures,
+            tool_failure_details=usage.tool_failure_details,
         )
 
     async def _execute_member(

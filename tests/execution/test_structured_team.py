@@ -179,6 +179,33 @@ async def test_structured_team_allows_same_run_tool_correction(tmp_path) -> None
     assert pool.closed_sessions == ["member-session-1"]
 
 
+async def test_structured_team_report_preserves_mission_tool_failure_details(
+    tmp_path,
+) -> None:
+    mission = _mission()
+    await mission.record_tool_failure(
+        session_id="author-session",
+        agent_name="author",
+        tool_name="generate_draft",
+        error="candidate selection was invalid",
+    )
+    pool = _SessionPool(expected_members=1)
+    service = StructuredTeamExecutionService(
+        session_pool=pool,  # type: ignore[arg-type]
+        team_state_base_dir=tmp_path,
+    )
+
+    report = await service.execute(plan=_plan(1), mission=mission)
+
+    assert report.tool_failures == 1
+    assert len(report.tool_failure_details) == 1
+    detail = report.tool_failure_details[0]
+    assert detail.session_id == "author-session"
+    assert detail.agent_name == "author"
+    assert detail.tool_name == "generate_draft"
+    assert detail.error == "candidate selection was invalid"
+
+
 async def test_structured_team_fails_when_run_ends_after_uncorrected_tool_error(
     tmp_path,
 ) -> None:

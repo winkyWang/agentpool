@@ -20,6 +20,16 @@ class MissionBudgetExceededError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class MissionToolFailure:
+    """One failed tool call observed at the typed runtime boundary."""
+
+    session_id: str
+    agent_name: str
+    tool_name: str
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
 class MissionUsageSnapshot:
     """Immutable aggregate of model usage across a mission Session tree."""
 
@@ -27,6 +37,7 @@ class MissionUsageSnapshot:
     input_tokens: int = 0
     output_tokens: int = 0
     tool_failures: int = 0
+    tool_failure_details: tuple[MissionToolFailure, ...] = ()
 
 
 @dataclass(slots=True)
@@ -45,6 +56,10 @@ class MissionExecutionContext:
     _input_tokens: int = 0
     _output_tokens: int = 0
     _tool_failures: int = 0
+    _tool_failure_details: list[MissionToolFailure] = field(
+        default_factory=list,
+        repr=False,
+    )
 
     @classmethod
     def create(
@@ -102,10 +117,25 @@ class MissionExecutionContext:
             self._input_tokens += max(0, input_tokens)
             self._output_tokens += max(0, output_tokens)
 
-    async def record_tool_failure(self) -> None:
+    async def record_tool_failure(
+        self,
+        *,
+        session_id: str,
+        agent_name: str,
+        tool_name: str,
+        error: str,
+    ) -> None:
         """Record a failed tool invocation within the mission."""
         async with self._usage_lock:
             self._tool_failures += 1
+            self._tool_failure_details.append(
+                MissionToolFailure(
+                    session_id=session_id,
+                    agent_name=agent_name,
+                    tool_name=tool_name,
+                    error=error,
+                ),
+            )
 
     def usage_snapshot(self) -> MissionUsageSnapshot:
         """Return a consistent event-loop-local usage snapshot."""
@@ -114,6 +144,7 @@ class MissionExecutionContext:
             input_tokens=self._input_tokens,
             output_tokens=self._output_tokens,
             tool_failures=self._tool_failures,
+            tool_failure_details=tuple(self._tool_failure_details),
         )
 
 

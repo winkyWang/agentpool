@@ -200,7 +200,13 @@ async def test_execute_turn_counts_and_logs_error_event_once_without_ending_run(
         ]
 
     assert events == [tool_error, complete_event]
-    assert mission.usage_snapshot().tool_failures == 1
+    usage = mission.usage_snapshot()
+    assert usage.tool_failures == 1
+    assert len(usage.tool_failure_details) == 1
+    assert usage.tool_failure_details[0].session_id == "member-session"
+    assert usage.tool_failure_details[0].agent_name == "reviewer"
+    assert usage.tool_failure_details[0].tool_name == "record_review"
+    assert usage.tool_failure_details[0].error == "Invalid JSON: expected ',' or ']'"
     assert handle._current_turn_failed is False
     warning.assert_called_once_with(
         "Agent tool call failed: session=%s agent=%s tool=%s result=%s",
