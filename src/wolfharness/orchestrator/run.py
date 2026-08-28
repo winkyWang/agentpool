@@ -615,6 +615,13 @@ class RunHandle:
                             mission = mission_from_deps(self.run_ctx.deps)
                             if mission is not None:
                                 await mission.record_tool_failure()
+                            logger.warning(
+                                "Agent tool call failed: session=%s agent=%s tool=%s result=%s",
+                                self.session_id,
+                                event.agent_name,
+                                event.tool_name,
+                                str(event.tool_result)[:2_000],
+                            )
                         if event_bus is not None and not comm.publishes_to_event_bus:
                             await event_bus.publish(self.session_id, event)
                         await self._safe_publish(comm, event)

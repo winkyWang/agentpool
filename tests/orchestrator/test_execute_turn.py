@@ -6,7 +6,7 @@ just like StreamCompleteEvent. No trailing StreamCompleteEvent follows.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -140,7 +140,7 @@ async def test_execute_turn_breaks_on_stream_complete() -> None:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_execute_turn_counts_error_event_once_without_ending_run() -> None:
+async def test_execute_turn_counts_and_logs_error_event_once_without_ending_run() -> None:
     """A failed tool event is usage data, not a Run terminal event."""
     from wolfharness.orchestrator.run import RunHandle
 
@@ -188,11 +188,24 @@ async def test_execute_turn_counts_error_event_once_without_ending_run() -> None
         ),
     )
 
-    events = [
-        event
-        async for event in handle._execute_turn(mock_agent, None, _make_mock_session(), ["test"])
-    ]
+    with patch("wolfharness.orchestrator.run.logger.warning") as warning:
+        events = [
+            event
+            async for event in handle._execute_turn(
+                mock_agent,
+                None,
+                _make_mock_session(),
+                ["test"],
+            )
+        ]
 
     assert events == [tool_error, complete_event]
     assert mission.usage_snapshot().tool_failures == 1
     assert handle._current_turn_failed is False
+    warning.assert_called_once_with(
+        "Agent tool call failed: session=%s agent=%s tool=%s result=%s",
+        "member-session",
+        "reviewer",
+        "record_review",
+        "Invalid JSON: expected ',' or ']'",
+    )
