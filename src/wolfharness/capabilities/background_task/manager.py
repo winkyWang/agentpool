@@ -17,6 +17,7 @@ from wolfharness.capabilities.background_task.types import (
     BackgroundTask,
     TaskHandle,
     TaskStatus,
+    TerminationRequest,
 )
 
 
@@ -149,7 +150,7 @@ class BackgroundTaskManager:
             task_model.started_at = datetime.now(tz=UTC)
 
             try:
-                result = await self._run_with_timeout(task_model, coro)
+                result = await self._run_with_timeout(task_id, task_model, coro)
                 # Status may have been changed to "cancelling" by another task
                 # during the await, so we can't let mypy narrow it to "running".
                 current_status: TaskStatus = task_model.status
@@ -165,7 +166,7 @@ class BackgroundTaskManager:
             except TimeoutError:
                 if task_model.status not in TERMINAL_STATES:
                     task_model.status = "timed_out"
-                    task_model.error = f"Task timed out after {self._timeout_seconds}s"
+                    task_model.error = "Task timed out after its execution deadline"
                     task_model.completed_at = datetime.now(tz=UTC)
             except (ValueError, RuntimeError, TypeError, KeyError, AttributeError) as exc:
                 if task_model.status not in TERMINAL_STATES:
@@ -223,17 +224,15 @@ class BackgroundTaskManager:
 
     async def _run_with_timeout(
         self,
+        task_id: str,
         task_model: BackgroundTask,
         coro: Coroutine[Any, Any, None],
     ) -> Any:
-        """Run ``coro`` under ``self._timeout_seconds``, distinguishing timeout from cancel.
+        """Run ``coro`` under the mission deadline and await timeout cleanup.
 
-        ``asyncio.wait_for`` cancels the inner coroutine *before* raising
-        ``TimeoutError``, so a cancelled coroutine cannot tell whether the
-        cancellation came from a timeout or an explicit ``cancel_task`` call.
-        This helper marks the task model ``timed_out`` *before* cancelling the
-        inner coroutine, letting the coroutine's ``CancelledError`` handler
-        observe the terminal status and write the correct output message.
+        A runtime-only termination request lets the owned coroutine distinguish
+        timeout from explicit cancellation without publishing a terminal task
+        state before child resources have been released.
         """
         timeout_seconds = (
             task_model.mission.remaining_seconds()
@@ -269,12 +268,13 @@ class BackgroundTaskManager:
                     await timeout_task
 
         if inner_task not in _done:
-            # Timeout fired first — mark timed_out BEFORE cancelling so the
-            # coroutine's CancelledError handler can distinguish the two cases.
-            if task_model.status not in TERMINAL_STATES:
-                task_model.status = "timed_out"
-                task_model.error = f"Task timed out after {timeout_seconds:.3f}s"
-                task_model.completed_at = datetime.now(tz=UTC)
+            # Keep the externally visible task non-terminal until the inner
+            # coroutine has completed its cleanup.  The runtime-only request
+            # identifies timeout cancellation without publishing a false
+            # terminal state while resources are still live.
+            handle = self._handles.get(task_id)
+            if handle is not None:
+                handle.termination_request = "timeout"
             if task_model.mission is not None:
                 task_model.mission.cancel()
             inner_task.cancel()
@@ -332,6 +332,7 @@ class BackgroundTaskManager:
             self._schedule_cleanup(task_id)
             return f"Task {task_id!r} cancelled (no handle)"
 
+        handle.termination_request = "cancel"
         handle.task.cancel()
         try:
             await asyncio.wait_for(
@@ -339,19 +340,21 @@ class BackgroundTaskManager:
                 timeout=self._cancel_timeout_seconds,
             )
         except TimeoutError:
-            # Cancellation did not complete in time.
-            if task_model.status not in TERMINAL_STATES:
-                task_model.status = "error"
-                task_model.error = (
-                    f"Cancellation of task {task_id!r} timed out after "
-                    f"{self._cancel_timeout_seconds}s"
-                )
-                task_model.completed_at = datetime.now(tz=UTC)
-                handle.completion_event.set()
-                self._schedule_cleanup(task_id)
-            return f"Task {task_id!r} cancellation timed out; marked as error"
+            # The cancellation request is still active.  Do not publish a
+            # terminal state or completion event while the owned coroutine is
+            # still releasing resources; ``_execute_task`` remains the sole
+            # terminal publisher when cleanup eventually finishes.
+            return (
+                f"Task {task_id!r} cancellation is still in progress after "
+                f"{self._cancel_timeout_seconds}s"
+            )
         except asyncio.CancelledError:
-            # We ourselves were cancelled while waiting.
+            # A cancelled target task propagates through ``shield`` without
+            # cancelling this caller.  A genuinely cancelled caller must not
+            # publish a terminal state for work whose cleanup is still live.
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling():
+                raise
             if task_model.status not in TERMINAL_STATES:
                 task_model.status = "cancelled"
                 task_model.completed_at = datetime.now(tz=UTC)
@@ -397,6 +400,11 @@ class BackgroundTaskManager:
         """Return all tasks in the registry."""
         self._prune_expired()
         return list(self._tasks.values())
+
+    def termination_request(self, task_id: str) -> TerminationRequest | None:
+        """Return the runtime termination request for one active task."""
+        handle = self._handles.get(task_id)
+        return handle.termination_request if handle is not None else None
 
     # ------------------------------------------------------------------
     # Blocking-waiter tracking

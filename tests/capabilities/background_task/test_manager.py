@@ -7,6 +7,7 @@ import contextlib
 import time
 
 from wolfharness.capabilities.background_task import BackgroundTask, BackgroundTaskManager
+from wolfharness.execution import MissionExecutionContext
 
 
 # ---------------------------------------------------------------------------
@@ -418,8 +419,8 @@ async def test_cancel_pending_while_queued() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_cancel_timeout_marks_error() -> None:
-    """If cancellation does not complete in time, task is marked error."""
+async def test_cancel_timeout_does_not_publish_terminal_state_before_cleanup() -> None:
+    """A slow cancellation stays non-terminal until owned cleanup completes."""
     # Use a very short cancel timeout so the await times out.
     manager = BackgroundTaskManager(
         timeout_seconds=30,
@@ -429,20 +430,29 @@ async def test_cancel_timeout_marks_error() -> None:
     manager.register_task(task)
     # A coroutine that catches CancelledError and keeps running —
     # this simulates a task that won't honour cancellation promptly.
-    manager.start_task("t1", _uncancellable_coro())
+    cleanup_release = asyncio.Event()
+    manager.start_task("t1", _uncancellable_coro(cleanup_release))
 
     await asyncio.sleep(0.1)
     assert task.status == "running"
 
     msg = await manager.cancel_task("t1")
-    # Should indicate cancellation timed out.
-    assert "timed out" in msg or "error" in msg
+    assert "still in progress" in msg
+    handle = manager._handles["t1"]
+    assert task.status == "cancelling"
+    assert task.completed_at is None
+    assert not handle.completion_event.is_set()
 
-    # The task should be in a terminal state.
-    assert task.status in {"error", "cancelled"}
+    cleanup_release.set()
+    result = await manager.wait_for_task("t1", timeout_seconds=2)
+
+    assert result is task
+    assert task.status == "cancelled"
+    assert task.completed_at is not None
+    assert handle.completion_event.is_set()
 
 
-async def _uncancellable_coro() -> None:
+async def _uncancellable_coro(cleanup_release: asyncio.Event) -> None:
     """Coroutine that swallows CancelledError and sleeps again.
 
     This simulates poorly-behaved code that does not honour cancellation.
@@ -452,7 +462,46 @@ async def _uncancellable_coro() -> None:
     except asyncio.CancelledError:
         # Swallow and keep going.
         with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.sleep(100)
+            await cleanup_release.wait()
+
+
+async def test_mission_timeout_publishes_terminal_state_after_cleanup() -> None:
+    """Mission timeout becomes terminal only after coroutine cleanup finishes."""
+    manager = BackgroundTaskManager(timeout_seconds=5)
+    mission = MissionExecutionContext.create(
+        root_session_id="root-session",
+        timeout_seconds=0.05,
+        max_model_requests=1,
+    )
+    task = _make_task("timeout-cleanup", mission=mission)
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+
+    async def owned_work() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup_started.set()
+            await cleanup_release.wait()
+
+    manager.register_task(task)
+    manager.start_task(task.id, owned_work())
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+    handle = manager._handles[task.id]
+    assert task.status == "running"
+    assert task.completed_at is None
+    assert manager.termination_request(task.id) == "timeout"
+    assert mission.cancelled
+    assert not handle.completion_event.is_set()
+
+    cleanup_release.set()
+    result = await manager.wait_for_task(task.id, timeout_seconds=2)
+
+    assert result is task
+    assert task.status == "timed_out"
+    assert task.completed_at is not None
+    assert handle.completion_event.is_set()
 
 
 # ---------------------------------------------------------------------------

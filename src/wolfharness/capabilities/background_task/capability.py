@@ -1221,12 +1221,11 @@ class BackgroundTaskCapability(AbstractCapability[AgentContext]):
                 if task_error is not None:
                     raise RuntimeError(task_error)
             except asyncio.CancelledError:
-                # Distinguish timeout from explicit cancellation: the manager
-                # marks the task model ``timed_out`` *before* cancelling the
-                # coroutine (see ``BackgroundTaskManager._run_with_timeout``),
-                # so we can inspect the status here to pick the right message.
-                task = state.task_manager.get_task(task_id)
-                if task is not None and task.status == "timed_out":
+                # The manager keeps terminal state private until this
+                # coroutine has released the child Session.  Inspect the
+                # runtime termination request instead of publishing a
+                # premature ``timed_out`` task state.
+                if state.task_manager.termination_request(task_id) == "timeout":
                     timeout_msg = f"Task {task_id} ({mode}) timed out"
                     fs.pipe(output_path, f"# Task Timed Out\n\n{timeout_msg}".encode())
                 else:

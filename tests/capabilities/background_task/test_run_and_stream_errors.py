@@ -28,6 +28,7 @@ import pytest
 from wolfharness.agents.base_agent import BaseAgent
 from wolfharness.agents.context import AgentContext
 from wolfharness.agents.events import ArtifactCompletionEvent, RunErrorEvent
+from wolfharness.agents.events.events import StepErrorMetadata
 from wolfharness.capabilities.background_task.capability import (
     BackgroundTaskCapability,
     _generate_task_id,
@@ -389,6 +390,57 @@ async def test_run_and_stream_writes_error_on_run_error_event():
     assert b"Task Error" in content or b"subagent crashed" in content, (
         f"Expected 'Task Error' or 'subagent crashed' in output, got: {content}"
     )
+
+
+@pytest.mark.unit
+async def test_mission_budget_error_completes_after_child_session_cleanup() -> None:
+    """A typed budget error is delivered only after the child Session closes."""
+    capability = BackgroundTaskCapability(schemas=None)
+    pool = _make_mock_pool()
+    ctx = _make_agent_context(pool)
+    lifecycle: list[str] = []
+
+    async def close_child(_session_id: str) -> None:
+        lifecycle.append("child_closed")
+
+    pool.session_pool.close_session = AsyncMock(side_effect=close_child)
+    pool.session_pool.event_bus.subscribe = AsyncMock(
+        return_value=_make_event_queue([
+            RunErrorEvent(
+                message="Mission mission_test exhausted its 1 model-request budget",
+                code="mission_budget_exceeded",
+                step_error=StepErrorMetadata(
+                    node_type="ModelRequestNode",
+                    exception_type="MissionBudgetExceededError",
+                    exception_message=("Mission mission_test exhausted its 1 model-request budget"),
+                ),
+            )
+        ])
+    )
+
+    with patch(
+        "wolfharness.capabilities.background_task.capability._generate_task_id",
+        return_value="bg_budget01",
+    ):
+        await capability._task(
+            _wrap_in_run_context(ctx),
+            agent="test_agent",
+            message="test task",
+            expected_artifact_type="ExpectedArtifact",
+            async_mode=True,
+        )
+
+    state = capability._get_session_state(ctx)
+    handle = state.task_manager._handles["bg_budget01"]
+    await asyncio.wait_for(handle.completion_event.wait(), timeout=2)
+    lifecycle.append("completion_observed")
+    task_model = state.task_manager.get_task("bg_budget01")
+
+    assert task_model is not None
+    assert task_model.status == "error"
+    assert "exhausted its 1 model-request budget" in (task_model.error or "")
+    assert task_model.completion_artifact_uri is None
+    assert lifecycle == ["child_closed", "completion_observed"]
 
 
 # ---------------------------------------------------------------------------

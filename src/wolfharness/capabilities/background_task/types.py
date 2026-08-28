@@ -25,6 +25,9 @@ TaskStatus = Literal[
     "timed_out",
 ]
 
+TerminationRequest = Literal["cancel", "timeout"]
+"""Runtime request that is driving cooperative task termination."""
+
 
 @dataclass(slots=True)
 class BackgroundTask:
@@ -73,12 +76,18 @@ class TaskHandle:
     act (e.g., inject a prompt into the lead agent) while the blocking
     waiter is still registered, so it can skip the injection when
     appropriate.
+
+    ``termination_request`` records a runtime-only cancellation cause while
+    the owned coroutine is still cleaning up.  It must not be inferred from
+    the externally visible task status because terminal status is published
+    only after cleanup completes.
     """
 
     task: asyncio.Task[None]
     completion_event: asyncio.Event = field(default_factory=asyncio.Event)
     blocking_waiter_id: str | None = None
     on_completed: Callable[[], None] | None = None
+    termination_request: TerminationRequest | None = None
 
 
 @dataclass(slots=True)
