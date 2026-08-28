@@ -8,11 +8,11 @@ interactions:
       connection:
       - keep-alive
       content-length:
-      - '4702'
+      - '6638'
       content-type:
       - application/json
       host:
-      - api.ai.rootcloud.info
+      - 127.0.0.1:12903
     method: POST
     parsed_body:
       messages:
@@ -23,22 +23,24 @@ interactions:
           <available-skills>
           <skill name="example-skill" description="A simple example skill that demonstrates the basic structure and functionality. Use when you need to show how skills work or test skill loading." />
           <skill name="openspec-apply-change" description="Implement tasks from an OpenSpec change. Use when the user wants to start implementing, continue implementation, or work through tasks." />
-          <skill name="openspec-explore" description="Enter explore mode - a thinking partner for exploring ideas, investigating problems, and clarifying requirements. Use when the user wants to think through something before or during a change." />
           <skill name="openspec-archive-change" description="Archive a completed change in the experimental workflow. Use when the user wants to finalize and archive a change after implementation is complete." />
+          <skill name="openspec-explore" description="Enter explore mode - a thinking partner for exploring ideas, investigating problems, and clarifying requirements. Use when the user wants to think through something before or during a change." />
           <skill name="openspec-propose" description="Propose a new change with all artifacts generated in one step. Use when the user wants to quickly describe what they want to build and get a complete proposal with design, specs, and tasks ready for implementation." />
-          <skill name="systematic-debugging" description="Use when encountering any bug, test failure, or unexpected behavior, before proposing fixes" />
-          <skill name="metaskill" description="The meta-skill: create AI agent teams, individual agents, or custom skills for any project. Use when the user wants to generate a complete .claude/ agent team, create a single agent, or create a single skill." />
-          <skill name="uv-package-manager" description="Master the uv package manager for fast Python dependency management, virtual environments, and modern Python project workflows. Use when setting up Python projects, managing dependencies, or optimizing Python development workflows with uv." />
-          <skill name="darwin-skill" description="Darwin Skill (达尔文.skill): autonomous skill optimizer inspired by Karpathy&#x27;s autoresearch. Evaluates SKILL.md files using an 8-dimension rubric (structure + effectiveness), runs hill-climbing with git version control, validates improvements through test prompts, and generates visual result cards. Use when user mentions &quot;优化skill&quot;, &quot;skill评分&quot;, &quot;自动优化&quot;, &quot;auto optimize&quot;, &quot;skill质量检查&quot;, &quot;达尔文&quot;, &quot;darwin&quot;, &quot;帮我改改skill&quot;, &quot;skill怎么样&quot;, &quot;提升skill质量&quot;, &quot;skill review&quot;, &quot;skill打分&quot;." />
-          <skill name="brainstorm-okrs" description="Brainstorm team-level OKRs aligned with company objectives -- qualitative objectives with measurable key results. Use when setting quarterly OKRs, aligning team goals with company strategy, drafting objectives, or learning how to write effective OKRs." />
-          <skill name="code-review-expert" description="Expert code review of current git changes with a senior engineer lens. Detects SOLID violations, security risks, and proposes actionable improvements." />
           </available-skills>
+          You have access to resource management tools:
+          - list_resources: List available resources from connected MCP servers and local files (paginated, use offset to page through)
+          - read_resource: Read content from a resource by URI (supports text and binary content; large text is truncated)
+          - resource_exists: Check if a resource exists
+          - list_resource_templates: List URI templates for dynamic resource discovery (paginated, use offset to page through)
+          - complete_resource_template: Get completion suggestions for template parameters
+
+          URI schemes: mcp:// for MCP server resources, file:// for file-based resources
         role: system
       - content:
         - text: Say hello.
           type: text
         role: user
-      model: svc/deepseek-v4-flash
+      model: svc/deepseek-v4-flash-0731
       stream: true
       stream_options:
         include_usage: true
@@ -46,17 +48,22 @@ interactions:
       tools:
       - function:
           description: |-
-            Load a Claude Code Skill and return its instructions.
+            Load a skill's full instructions, activating its MCP servers and Python tools.
 
-            Args:
-                ctx: Agent context providing access to pool and skills
-                skill_name: Name of the skill to load, or a skill:// URI.
-                    Use skill:// URI to load a specific reference file:
-                    skill://skill-name/references/file.md
-                arguments: Optional space-separated arguments for substitution
+            Calling this tool loads the complete skill instructions (not the
+            truncated resource-surface content) and activates the skill's
+            declared MCP servers and Python tools, making them available for
+            subsequent tool calls.
 
-            Returns:
-                The full skill instructions for execution
+            Skill URI format:
+            - ``skill://skill-name`` -- load by flat URI
+            - ``skill://skill-name/references/file.md`` -- load a reference file
+            - Bare name (e.g. ``python-expert``) -- backward compatible
+
+            Argument substitution:
+            - ``$1``, ``$2``, ... -- replaced with the Nth argument
+            - ``$@`` -- replaced with all arguments
+            - ``$ARGUMENTS`` -- replaced with all arguments
           name: load_skill
           parameters:
             additionalProperties: false
@@ -66,12 +73,11 @@ interactions:
                 - type: string
                 - type: 'null'
                 default: null
-                description: Optional space-separated arguments for substitution
+                description: Optional space-separated arguments for substitution. Placeholders $1, $2, ... are replaced with
+                  the Nth argument; $@ and $ARGUMENTS are replaced with all arguments.
               skill_name:
-                description: |-
-                  Name of the skill to load, or a skill:// URI.
-                  Use skill:// URI to load a specific reference file:
-                  skill://skill-name/references/file.md
+                description: Skill name or skill:// URI to load. Use a bare name (e.g. 'python-expert') or a skill:// URI
+                  (e.g. 'skill://python-expert'). To load a reference file, use 'skill://skill-name/references/file.md'.
                 type: string
             required:
             - skill_name
@@ -79,65 +85,400 @@ interactions:
         type: function
       - function:
           description: |-
-            List all available skills.
+            List all available skills with descriptions and URI information.
 
-            Returns:
-                Formatted list of available skills with descriptions and URI information
+            Returns a formatted list of local and remote (MCP-provided) skills.
+            Local skills are listed first, followed by remote skills discovered
+            through child MCP capabilities. Remote skills are discovery-only --
+            they are not auto-injected into system prompts.
           name: list_skills
           parameters:
             additionalProperties: false
             properties: {}
             type: object
         type: function
-    uri: http://api.ai.rootcloud.info/v1/chat/completions
+      - function:
+          description: |-
+            List available resources from connected MCP servers and local files.
+
+            Results are paginated. Use ``offset`` to page through large result sets.
+          name: list_resources
+          parameters:
+            additionalProperties: false
+            properties:
+              limit:
+                default: 50
+                description: 'Maximum number of resources to return (default: 50)'
+                type: integer
+              offset:
+                default: 0
+                description: Number of resources to skip for pagination
+                type: integer
+            type: object
+        type: function
+      - function:
+          description: |-
+            Read content from a resource by URI.
+
+            Supports text and binary content. Routes by URI scheme; ``skill://``
+            URIs are additionally resolved as a non-advertised fallback via
+            ``resource_resolver.resolve_resource_content``.
+          name: read_resource
+          parameters:
+            additionalProperties: false
+            properties:
+              uri:
+                description: Resource URI to read, e.g. 'mcp://server/resource' or 'file://path/to/file'
+                type: string
+            required:
+            - uri
+            type: object
+          strict: true
+        type: function
+      - function:
+          description: |-
+            <summary>Check if a resource exists.
+
+            Routes by URI scheme:
+            ``skill://`` → skill providers, other URIs → resource providers.</summary>
+            <returns>
+            <description>True if any provider has the resource, False otherwise.</description>
+            </returns>
+          name: resource_exists
+          parameters:
+            additionalProperties: false
+            properties:
+              uri:
+                description: Resource URI to check
+                type: string
+            required:
+            - uri
+            type: object
+          strict: true
+        type: function
+      - function:
+          description: |-
+            List URI templates for dynamic resource discovery.
+
+            Results are paginated. Use ``offset`` to page through large result sets.
+          name: list_resource_templates
+          parameters:
+            additionalProperties: false
+            properties:
+              limit:
+                default: 50
+                description: 'Maximum number of templates to return (default: 50)'
+                type: integer
+              offset:
+                default: 0
+                description: Number of templates to skip for pagination
+                type: integer
+            type: object
+        type: function
+      - function:
+          description: Get completion suggestions for a resource template parameter.
+          name: complete_resource_template
+          parameters:
+            additionalProperties: false
+            properties:
+              argument_name:
+                description: The parameter name being completed
+                type: string
+              argument_value:
+                description: The current value of the parameter
+                type: string
+              uri_template:
+                description: The URI template to complete
+                type: string
+            required:
+            - uri_template
+            - argument_name
+            - argument_value
+            type: object
+          strict: true
+        type: function
+    uri: http://127.0.0.1:12903/v1/chat/completions
   response:
     body:
-      string: |+
-        data: {"id":"chatcmpl-94a6f7c7dc4f58b3","object":"chat.completion.chunk","created":1784396474,"model":"svc/deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
-
-        data: {"id":"chatcmpl-94a6f7c7dc4f58b3","created":1784396474,"model":"svc/deepseek-v4-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"The"}}]}
-
-        data: {"id":"chatcmpl-94a6f7c7dc4f58b3","created":1784396474,"model":"svc/deepseek-v4-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":" user wants me"}}]}
-
-        data: {"id":"chatcmpl-94a6f7c7dc4f58b3","created":1784396474,"model":"svc/deepseek-v4-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":" to say hello. Let me do"}}]}
-
-        data: {"id":"chatcmpl-94a6f7c7dc4f58b3","created":1784396474,"model":"svc/deepseek-v4-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":" that directly"}}]}
-
-        data: {"id":"chatcmpl-94a6f7c7dc4f58b3","created":1784396474,"model":"svc/deepseek-v4-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":" without"}}]}
-
-        data: {"id":"chatcmpl-94a6f7c7dc4f58b3","created":1784396474,"model":"svc/deepseek-v4-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":" needing"}}]}
-
-        data: {"id":"chatcmpl-94a6f7c7dc4f58b3","created":1784396474,"model":"svc/deepseek-v4-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":" any special"}}]}
-
-        data: {"id":"chatcmpl-94a6f7c7dc4f58b3","created":1784396474,"model":"svc/deepseek-v4-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":" tools.","content":"Hello! How"}}]}
-
-        data: {"id":"chatcmpl-94a6f7c7dc4f58b3","object":"chat.completion.chunk","created":1784396474,"model":"svc/deepseek-v4-flash","choices":[{"index":0,"delta":{"content":" can I help you today?"}}]}
-
-        data: {"id":"chatcmpl-94a6f7c7dc4f58b3","object":"chat.completion.chunk","created":1784396474,"model":"svc/deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
-
-        data: {"id":"chatcmpl-94a6f7c7dc4f58b3","created":1784396474,"model":"svc/deepseek-v4-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{}}],"usage":{"completion_tokens":30,"prompt_tokens":1135,"total_tokens":1165,"completion_tokens_details":{"reasoning_tokens":19}}}
-
-        data: [DONE]
-
+      string: "data: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"object\":\"chat.completion.chunk\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\ndata:
+        {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"The\"}}]}\n\ndata:
+        {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"
+        user asked me to say hello\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\".
+        This is a simple greeting\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"
+        request\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\".
+        I don\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"'t
+        need to use any tools\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"
+        for this. Let\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"
+        me just respond with a\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"
+        friendly greeting. I\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"'m
+        a\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"
+        test assistant\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"
+        for VCR\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"
+        cassette replay, but\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"
+        I\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"
+        can simply greet\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"
+        the user.\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"object\":\"chat.completion.chunk\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello!
+        \"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"object\":\"chat.completion.chunk\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\U0001F44B
+        How can I\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"object\":\"chat.completion.chunk\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"
+        help you today?\"}}]}\n\ndata: {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"object\":\"chat.completion.chunk\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata:
+        {\"id\":\"5557cce3cbba4d30867418dfb5dd3018\",\"created\":1787936492,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"completion_tokens\":67,\"prompt_tokens\":1694,\"total_tokens\":1761,\"completion_tokens_details\":{\"reasoning_tokens\":55,\"text_tokens\":12}}}\n\ndata:
+        [DONE]\n\n"
     headers:
       cache-control:
       - no-cache
-      connection:
-      - close
       content-security-policy:
       - frame-ancestors 'none'
       content-type:
       - text/event-stream; charset=utf-8
       req-arrive-time:
-      - '1784396474398'
+      - '1787936491834'
       req-cost-time:
-      - '163'
+      - '861'
       resp-start-time:
-      - '1784396474562'
+      - '1787936492696'
+      transfer-encoding:
+      - chunked
+    status:
+      code: 200
+      message: OK
+- request:
+    headers:
+      accept:
+      - application/json
+      accept-encoding:
+      - gzip, deflate, br
+      connection:
+      - keep-alive
+      content-length:
+      - '7050'
+      content-type:
+      - application/json
+      host:
+      - 127.0.0.1:12903
+    method: POST
+    parsed_body:
+      messages:
+      - content: |-
+          You are test_agent.
+
+          You are a helpful test assistant for VCR cassette replay.
+          <available-skills>
+          <skill name="example-skill" description="A simple example skill that demonstrates the basic structure and functionality. Use when you need to show how skills work or test skill loading." />
+          <skill name="openspec-apply-change" description="Implement tasks from an OpenSpec change. Use when the user wants to start implementing, continue implementation, or work through tasks." />
+          <skill name="openspec-archive-change" description="Archive a completed change in the experimental workflow. Use when the user wants to finalize and archive a change after implementation is complete." />
+          <skill name="openspec-explore" description="Enter explore mode - a thinking partner for exploring ideas, investigating problems, and clarifying requirements. Use when the user wants to think through something before or during a change." />
+          <skill name="openspec-propose" description="Propose a new change with all artifacts generated in one step. Use when the user wants to quickly describe what they want to build and get a complete proposal with design, specs, and tasks ready for implementation." />
+          </available-skills>
+          You have access to resource management tools:
+          - list_resources: List available resources from connected MCP servers and local files (paginated, use offset to page through)
+          - read_resource: Read content from a resource by URI (supports text and binary content; large text is truncated)
+          - resource_exists: Check if a resource exists
+          - list_resource_templates: List URI templates for dynamic resource discovery (paginated, use offset to page through)
+          - complete_resource_template: Get completion suggestions for template parameters
+
+          URI schemes: mcp:// for MCP server resources, file:// for file-based resources
+        role: system
+      - content:
+        - text: Say hello.
+          type: text
+        role: user
+      - content: "Hello! \U0001F44B How can I help you today?"
+        reasoning_content: The user asked me to say hello. This is a simple greeting request. I don't need to use any tools
+          for this. Let me just respond with a friendly greeting. I'm a test assistant for VCR cassette replay, but I can
+          simply greet the user.
+        role: assistant
+      - content:
+        - text: Say goodbye.
+          type: text
+        role: user
+      model: svc/deepseek-v4-flash-0731
+      stream: true
+      stream_options:
+        include_usage: true
+      tool_choice: auto
+      tools:
+      - function:
+          description: |-
+            Load a skill's full instructions, activating its MCP servers and Python tools.
+
+            Calling this tool loads the complete skill instructions (not the
+            truncated resource-surface content) and activates the skill's
+            declared MCP servers and Python tools, making them available for
+            subsequent tool calls.
+
+            Skill URI format:
+            - ``skill://skill-name`` -- load by flat URI
+            - ``skill://skill-name/references/file.md`` -- load a reference file
+            - Bare name (e.g. ``python-expert``) -- backward compatible
+
+            Argument substitution:
+            - ``$1``, ``$2``, ... -- replaced with the Nth argument
+            - ``$@`` -- replaced with all arguments
+            - ``$ARGUMENTS`` -- replaced with all arguments
+          name: load_skill
+          parameters:
+            additionalProperties: false
+            properties:
+              arguments:
+                anyOf:
+                - type: string
+                - type: 'null'
+                default: null
+                description: Optional space-separated arguments for substitution. Placeholders $1, $2, ... are replaced with
+                  the Nth argument; $@ and $ARGUMENTS are replaced with all arguments.
+              skill_name:
+                description: Skill name or skill:// URI to load. Use a bare name (e.g. 'python-expert') or a skill:// URI
+                  (e.g. 'skill://python-expert'). To load a reference file, use 'skill://skill-name/references/file.md'.
+                type: string
+            required:
+            - skill_name
+            type: object
+        type: function
+      - function:
+          description: |-
+            List all available skills with descriptions and URI information.
+
+            Returns a formatted list of local and remote (MCP-provided) skills.
+            Local skills are listed first, followed by remote skills discovered
+            through child MCP capabilities. Remote skills are discovery-only --
+            they are not auto-injected into system prompts.
+          name: list_skills
+          parameters:
+            additionalProperties: false
+            properties: {}
+            type: object
+        type: function
+      - function:
+          description: |-
+            List available resources from connected MCP servers and local files.
+
+            Results are paginated. Use ``offset`` to page through large result sets.
+          name: list_resources
+          parameters:
+            additionalProperties: false
+            properties:
+              limit:
+                default: 50
+                description: 'Maximum number of resources to return (default: 50)'
+                type: integer
+              offset:
+                default: 0
+                description: Number of resources to skip for pagination
+                type: integer
+            type: object
+        type: function
+      - function:
+          description: |-
+            Read content from a resource by URI.
+
+            Supports text and binary content. Routes by URI scheme; ``skill://``
+            URIs are additionally resolved as a non-advertised fallback via
+            ``resource_resolver.resolve_resource_content``.
+          name: read_resource
+          parameters:
+            additionalProperties: false
+            properties:
+              uri:
+                description: Resource URI to read, e.g. 'mcp://server/resource' or 'file://path/to/file'
+                type: string
+            required:
+            - uri
+            type: object
+          strict: true
+        type: function
+      - function:
+          description: |-
+            <summary>Check if a resource exists.
+
+            Routes by URI scheme:
+            ``skill://`` → skill providers, other URIs → resource providers.</summary>
+            <returns>
+            <description>True if any provider has the resource, False otherwise.</description>
+            </returns>
+          name: resource_exists
+          parameters:
+            additionalProperties: false
+            properties:
+              uri:
+                description: Resource URI to check
+                type: string
+            required:
+            - uri
+            type: object
+          strict: true
+        type: function
+      - function:
+          description: |-
+            List URI templates for dynamic resource discovery.
+
+            Results are paginated. Use ``offset`` to page through large result sets.
+          name: list_resource_templates
+          parameters:
+            additionalProperties: false
+            properties:
+              limit:
+                default: 50
+                description: 'Maximum number of templates to return (default: 50)'
+                type: integer
+              offset:
+                default: 0
+                description: Number of templates to skip for pagination
+                type: integer
+            type: object
+        type: function
+      - function:
+          description: Get completion suggestions for a resource template parameter.
+          name: complete_resource_template
+          parameters:
+            additionalProperties: false
+            properties:
+              argument_name:
+                description: The parameter name being completed
+                type: string
+              argument_value:
+                description: The current value of the parameter
+                type: string
+              uri_template:
+                description: The URI template to complete
+                type: string
+            required:
+            - uri_template
+            - argument_name
+            - argument_value
+            type: object
+          strict: true
+        type: function
+    uri: http://127.0.0.1:12903/v1/chat/completions
+  response:
+    body:
+      string: "data: {\"id\":\"39a7c429e750448b8f21f9d20558bfb6\",\"object\":\"chat.completion.chunk\",\"created\":1787936645,\"model\":\"svc/deepseek-v4-flash-0731\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\ndata:
+        {\"id\":\"39a7c429e750448b8f21f9d20558bfb6\",\"created\":1787936645,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"The\"}}]}\n\ndata:
+        {\"id\":\"39a7c429e750448b8f21f9d20558bfb6\",\"created\":1787936645,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"
+        user wants\"}}]}\n\ndata: {\"id\":\"39a7c429e750448b8f21f9d20558bfb6\",\"created\":1787936645,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"
+        me to say goodbye. Simple\"}}]}\n\ndata: {\"id\":\"39a7c429e750448b8f21f9d20558bfb6\",\"created\":1787936645,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"
+        request, no\"}}]}\n\ndata: {\"id\":\"39a7c429e750448b8f21f9d20558bfb6\",\"created\":1787936645,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"
+        tools needed.\"}}]}\n\ndata: {\"id\":\"39a7c429e750448b8f21f9d20558bfb6\",\"object\":\"chat.completion.chunk\",\"created\":1787936645,\"model\":\"svc/deepseek-v4-flash-0731\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Good\"}}]}\n\ndata:
+        {\"id\":\"39a7c429e750448b8f21f9d20558bfb6\",\"object\":\"chat.completion.chunk\",\"created\":1787936645,\"model\":\"svc/deepseek-v4-flash-0731\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"bye!
+        \U0001F44B Have\"}}]}\n\ndata: {\"id\":\"39a7c429e750448b8f21f9d20558bfb6\",\"object\":\"chat.completion.chunk\",\"created\":1787936645,\"model\":\"svc/deepseek-v4-flash-0731\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"
+        a great day!\"}}]}\n\ndata: {\"id\":\"39a7c429e750448b8f21f9d20558bfb6\",\"object\":\"chat.completion.chunk\",\"created\":1787936645,\"model\":\"svc/deepseek-v4-flash-0731\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata:
+        {\"id\":\"39a7c429e750448b8f21f9d20558bfb6\",\"created\":1787936645,\"model\":\"svc/deepseek-v4-flash-0731\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"completion_tokens\":27,\"prompt_tokens\":1767,\"total_tokens\":1794,\"completion_tokens_details\":{\"reasoning_tokens\":16,\"text_tokens\":11},\"prompt_tokens_details\":{\"cached_tokens\":1536}}}\n\ndata:
+        [DONE]\n\n"
+    headers:
+      cache-control:
+      - no-cache
+      content-security-policy:
+      - frame-ancestors 'none'
+      content-type:
+      - text/event-stream; charset=utf-8
+      req-arrive-time:
+      - '1787936644824'
+      req-cost-time:
+      - '608'
+      resp-start-time:
+      - '1787936645432'
       transfer-encoding:
       - chunked
     status:
       code: 200
       message: OK
 version: 1
-...

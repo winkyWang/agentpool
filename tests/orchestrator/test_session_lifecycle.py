@@ -336,41 +336,31 @@ def _make_session(session_id: str) -> SessionState:
 
 
 def _make_mock_run_handle(run_id: str = "run-1") -> MagicMock:
-    """Return a MagicMock simulating a RunHandle with close/cancel/complete_event."""
+    """Return a MagicMock simulating a RunHandle with typed shutdown."""
     rh = MagicMock(spec=RunHandle)
     rh.run_id = run_id
     rh.run_ctx = None
-    rh.close = MagicMock()
-    rh.cancel = MagicMock()
+    rh.shutdown = AsyncMock()
     rh.complete_event = asyncio.Event()
     return rh
 
 
 @pytest.mark.anyio
-async def test_flag_on_timeout_triggers_cancel(
-    controller_cs: SessionController, monkeypatch: pytest.MonkeyPatch
+async def test_active_run_shutdown_precedes_session_removal(
+    controller_cs: SessionController,
 ) -> None:
-    """When turn_lock acquisition times out, RunHandle.cancel() is called."""
-    monkeypatch.setenv("AGENTPOOL_USE_RUN_TURN", "true")
+    """An active Run must settle before its Session can be removed."""
     session = _make_session("sess-2")
     session.current_run_id = "run-2"
     controller_cs._sessions["sess-2"] = session
     run_handle = _make_mock_run_handle("run-2")
     controller_cs._runs["run-2"] = run_handle
-    held_lock = session.turn_lock
-    await held_lock.acquire()
-    original_timeout = asyncio.timeout
 
-    def fast_timeout(delay: float) -> asyncio.Timeout:
-        return original_timeout(0.05)
-
-    monkeypatch.setattr(asyncio, "timeout", fast_timeout)
     await controller_cs.close_session("sess-2")
-    run_handle.close.assert_called_once()
-    run_handle.cancel.assert_called_once()
+
+    run_handle.shutdown.assert_awaited_once()
     assert session.is_closing is True
     assert "sess-2" not in controller_cs._sessions
-    held_lock.release()
 
 
 @pytest.mark.anyio

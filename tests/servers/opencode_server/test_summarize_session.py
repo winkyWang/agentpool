@@ -141,20 +141,22 @@ async def test_summarize_routes_through_session_pool(
         )
     ]
 
-    # Mock session_pool.run_stream
-    mock_pool.session_pool.run_stream = AsyncMock(
-        return_value=[
-            PartStartEvent(index=0, part=TextPart(content="SessionPool summary")),
-            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta=" done")),
-            StreamCompleteEvent(
-                message=ChatMessage(
-                    content="SessionPool summary done",
-                    role="assistant",
-                    usage=RequestUsage(input_tokens=5, output_tokens=3),
-                )
-            ),
-        ]
-    )
+    # ``run_stream`` is an async-iterator factory, not an awaitable function.
+    # Preserve that protocol in the test double so the route cannot leak an
+    # unawaited AsyncMock coroutine.
+    async def mock_run_stream(*args: object, **kwargs: object):
+        yield PartStartEvent(index=0, part=TextPart(content="SessionPool summary"))
+        yield PartDeltaEvent(index=0, delta=TextPartDelta(content_delta=" done"))
+        yield StreamCompleteEvent(
+            message=ChatMessage(
+                content="SessionPool summary done",
+                role="assistant",
+                usage=RequestUsage(input_tokens=5, output_tokens=3),
+            )
+        )
+
+    run_stream = Mock(side_effect=mock_run_stream)
+    mock_pool.session_pool.run_stream = run_stream
 
     # Mock compact_conversation and get_messages_for_session
     with (
@@ -172,7 +174,7 @@ async def test_summarize_routes_through_session_pool(
     assert response.status_code == 200
 
     # Verify session_pool.run_stream was called
-    assert mock_pool.session_pool.run_stream.call_count == 1
+    assert run_stream.call_count == 1
 
     result = response.json()
     assert result is True

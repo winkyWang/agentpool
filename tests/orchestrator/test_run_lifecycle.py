@@ -143,6 +143,50 @@ async def test_cancel_sets_cancelled_flag() -> None:
 
 
 @pytest.mark.anyio
+async def test_shutdown_waits_for_driver_finally_before_completion() -> None:
+    """Session teardown cannot finish while the Run driver is still alive."""
+    handle = RunHandle(run_id="r1", session_id="s1", agent_type="native")
+    started = asyncio.Event()
+    finalized = asyncio.Event()
+
+    async def drive() -> None:
+        handle.run_ctx.current_task = asyncio.current_task()
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            finalized.set()
+            handle.complete_event.set()
+
+    task = asyncio.create_task(drive())
+    handle.bind_driver_task(task)
+    await started.wait()
+
+    await handle.shutdown()
+
+    assert task.cancelled()
+    assert finalized.is_set()
+    assert handle.complete_event.is_set()
+
+
+@pytest.mark.anyio
+async def test_shutdown_settles_driver_cancelled_before_first_step() -> None:
+    """A Run cancelled immediately after launch still reaches completion."""
+    handle = RunHandle(run_id="r1", session_id="s1", agent_type="native")
+
+    async def drive() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(drive())
+    handle.bind_driver_task(task)
+
+    await handle.shutdown()
+
+    assert task.cancelled()
+    assert handle.complete_event.is_set()
+
+
+@pytest.mark.anyio
 async def test_cancel_does_not_call_cleanup_callback() -> None:
     """cancel() must NOT invoke _cleanup_callback synchronously."""
     cleanup_calls: list[str] = []

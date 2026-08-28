@@ -12,7 +12,6 @@ All external dependencies (uvicorn, starlette) are mocked.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -273,13 +272,12 @@ async def test_handle_acp_accepts_with_connection_id_header(
 
     assert captured_handler is not None
 
-    # Call the captured handler with mock websocket
-    handler_task = asyncio.create_task(captured_handler(mock_websocket))
-    # Give it a moment to set up, then simulate client disconnect by cancelling
-    await asyncio.sleep(0.05)
-    handler_task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await handler_task
+    # Exercise the real receive adapter with an explicit client disconnect.
+    # AsyncMock's default nested return value is not a text frame and would
+    # violate the Starlette WebSocket protocol exercised by this integration
+    # test.
+    mock_websocket.receive_text.side_effect = RuntimeError("client disconnected")
+    await captured_handler(mock_websocket)
 
     mock_websocket.accept.assert_awaited_once()
     call_kwargs = mock_websocket.accept.call_args.kwargs
@@ -313,7 +311,12 @@ async def test_handle_acp_creates_stream_adapters(
     with (
         patch("acp.transports._StarletteWebSocketReadStream") as mock_reader,
         patch("acp.transports._StarletteWebSocketWriteStream") as mock_writer,
+        patch("acp.agent.connection.AgentSideConnection") as mock_conn_cls,
     ):
+        mock_conn = AsyncMock()
+        mock_conn_cls.return_value = mock_conn
+        mock_conn._conn._recv_task = asyncio.create_task(asyncio.sleep(0))
+
         task = asyncio.create_task(
             _serve_streamable_http(
                 TestAgent(),
@@ -330,11 +333,7 @@ async def test_handle_acp_creates_stream_adapters(
 
         assert captured_handler is not None
 
-        handler_task = asyncio.create_task(captured_handler(mock_websocket))
-        await asyncio.sleep(0.05)
-        handler_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await handler_task
+        await captured_handler(mock_websocket)
 
         mock_reader.assert_called_once_with(mock_websocket)
         mock_writer.assert_called_once_with(mock_websocket)

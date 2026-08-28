@@ -254,8 +254,10 @@ class SessionPoolRunsMixin:
         Yields:
             Events published to the EventBus for this session.
         """
-        async for event in self._run_stream_run_turn(session_id, *prompts, scope=scope, **kwargs):
-            yield event
+        stream = self._run_stream_run_turn(session_id, *prompts, scope=scope, **kwargs)
+        async with contextlib.aclosing(stream):
+            async for event in stream:
+                yield event
 
     async def _run_stream_run_turn(  # noqa: PLR0915
         self,
@@ -374,40 +376,61 @@ class SessionPoolRunsMixin:
             gen = run_handle.start(content)
         # Lock released — the run is now registered and can be steered
         # by concurrent receive_request() calls.
+
+        # The Run must be driven by its own task. The caller of run_stream is
+        # only an event consumer and may stop consuming at any time; making the
+        # caller itself the driver leaves no independent task for session close
+        # to cancel and await.
+        stream_end = object()
+        output_queue: asyncio.Queue[Any] = asyncio.Queue()
+
+        async def _drive_run() -> None:
+            try:
+                async for evt in gen:
+                    # Drain tool-published events before the corresponding
+                    # RunHandle event, preserving the established ordering.
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        while True:
+                            envelope = bus_queue.get_nowait()
+                            output_queue.put_nowait(envelope.event)
+                    output_queue.put_nowait(evt)
+                    if isinstance(evt, StreamCompleteEvent | RunErrorEvent):
+                        break
+            finally:
+                cancelled: asyncio.CancelledError | None = None
+                try:
+                    await gen.aclose()
+                except asyncio.CancelledError as exc:
+                    cancelled = exc
+                except Exception:
+                    logger.exception("Failed to close run generator")
+                try:
+                    await self.event_bus.unsubscribe(session_id, bus_queue)
+                except asyncio.CancelledError as exc:
+                    if cancelled is None:
+                        cancelled = exc
+                except Exception:
+                    logger.exception("Failed to unsubscribe from EventBus")
+                if session.current_run_id == run_handle.run_id:
+                    session.current_run_id = None
+                self.sessions._runs.pop(run_handle.run_id, None)
+                output_queue.put_nowait(stream_end)
+                if cancelled is not None:
+                    raise cancelled
+
+        driver_task = asyncio.create_task(_drive_run())
+        run_handle.bind_driver_task(driver_task)
         try:
-            async for evt in gen:
-                # Drain any tool-published events from EventBus before
-                # yielding the start() event. This ensures SpawnSessionStart
-                # and similar events appear before the StreamCompleteEvent.
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    while True:
-                        envelope = bus_queue.get_nowait()
-                        yield envelope.event
-                yield evt
-                if isinstance(evt, StreamCompleteEvent | RunErrorEvent):
+            while True:
+                event = await output_queue.get()
+                if event is stream_end:
                     break
+                yield event
+            await driver_task
         finally:
-            # gen.aclose() and subsequent cleanup may raise CancelledError
-            # (a BaseException, not caught by ``except Exception``) or
-            # RuntimeError from pydantic-ai's anyio cancel scope cleanup
-            # during GeneratorExit. Use save-and-re-raise so cleanup steps
-            # always run (run_id cleared, handle removed) and CancelledError
-            # is re-raised.
-            _cancelled: asyncio.CancelledError | None = None
-            try:
-                await gen.aclose()
-            except asyncio.CancelledError as e:
-                _cancelled = e
-            except Exception:
-                logger.exception("Failed to close run generator")
-            try:
-                await self.event_bus.unsubscribe(session_id, bus_queue)
-            except asyncio.CancelledError as e:
-                if _cancelled is None:
-                    _cancelled = e
-            except Exception:
-                logger.exception("Failed to unsubscribe from EventBus")
-            session.current_run_id = None
-            self.sessions._runs.pop(run_handle.run_id, None)
-            if _cancelled is not None:
-                raise _cancelled
+            if not driver_task.done():
+                await run_handle.shutdown()
+            else:
+                # Always retrieve the task exception so task finalization
+                # cannot surface an unobserved exception later.
+                await asyncio.gather(driver_task, return_exceptions=True)

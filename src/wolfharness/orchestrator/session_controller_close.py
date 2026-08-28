@@ -91,13 +91,12 @@ class SessionControllerCloseMixin:
             session.is_closing = True
             session.closed_at = time.monotonic()
 
-        # Step 1: Cancel RunHandle with 10s timeout
+        # Steps 1-2: cancel the Run and wait for its driver and owned tasks.
         run_handle: RunHandle | None = None
         if session.current_run_id is not None:
             run_handle = self._runs.get(session.current_run_id)
         if run_handle is not None:
             try:
-                run_handle.close()
                 if run_handle.run_ctx is not None:
                     run_handle.run_ctx.cancelled = True
                     for ev in list(run_handle.run_ctx.child_done_events.values()):
@@ -110,22 +109,15 @@ class SessionControllerCloseMixin:
                         from wolfharness.orchestrator.session_controller import SessionClosedError
 
                         registry.reject_all(SessionClosedError(session_id))
-                # Step 2: Await RunHandle completion (10s timeout)
-                try:
-                    async with asyncio.timeout(10):
-                        await run_handle.complete_event.wait()
-                except TimeoutError:
-                    logger.warning(
-                        "Timeout waiting for RunHandle completion, cancelling",
-                        session_id=session_id,
-                    )
-                    run_handle.cancel()
-            except Exception:
+                async with asyncio.timeout(10):
+                    await run_handle.shutdown()
+            except (TimeoutError, RuntimeError):
                 logger.exception(
-                    "Failed to cancel RunHandle during close",
+                    "RunHandle did not terminate during session close",
                     session_id=session_id,
                 )
-            finally:
+                raise
+            else:
                 self._runs.pop(run_handle.run_id, None)
                 if session.current_run_id == run_handle.run_id:
                     session.current_run_id = None

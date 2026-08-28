@@ -49,12 +49,19 @@ async def test_steer_from_background_task_acp_converter(
     # Patch agent create_turn to block so we have an active run handle
     release = asyncio.Event()
 
-    async def _blocking_create_turn(*args: Any, **kwargs: Any) -> Any:
-        await release.wait()
-        from wolfharness.agents.events.events import StreamCompleteEvent
-        from wolfharness.messaging.messagenode import ChatMessage
+    class _BlockingTurn:
+        _final_message = None
 
-        return StreamCompleteEvent(message=ChatMessage(role="assistant", content="done"))
+        async def execute(self):
+            await release.wait()
+            from wolfharness.agents.events.events import StreamCompleteEvent
+            from wolfharness.messaging.messagenode import ChatMessage
+
+            self._final_message = ChatMessage(role="assistant", content="done")
+            yield StreamCompleteEvent(message=self._final_message)
+
+    def _blocking_create_turn(*args: Any, **kwargs: Any) -> Any:
+        return _BlockingTurn()
 
     agent = await session_pool.sessions.get_or_create_session_agent(session_id)
     agent.create_turn = _blocking_create_turn  # type: ignore[method-assign]
@@ -86,6 +93,7 @@ async def test_steer_from_background_task_acp_converter(
 
     # Release the blocking turn
     release.set()
+    await session_pool.wait_for_completion(session_id, timeout=3.0)
 
     # Find UserMessageInsertedEvent with source="accepted" and delivery="steer"
     # (filter by delivery to exclude the initial prompt event which also has

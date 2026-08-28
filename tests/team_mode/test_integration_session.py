@@ -124,10 +124,12 @@ def _inject_run_handle(
     session_pool: Any,
     session: SessionState,
 ) -> RunHandle:
-    """Manually create and register a RunHandle for the given session.
+    """Register a RunHandle backed by a cancellable driver task.
 
-    This avoids depending on TestModel timing — the RunHandle is created
-    in IDLE state and can be closed directly to simulate run termination.
+    The real runtime owns a driver coroutine for every active RunHandle.
+    Keeping that invariant in the test fixture ensures session teardown is
+    exercising driver cancellation and settlement instead of fabricating an
+    impossible ``RUNNING`` handle with no owner.
     """
     run_id = str(uuid.uuid4())
     run_handle = RunHandle(
@@ -135,6 +137,15 @@ def _inject_run_handle(
         session_id=session.session_id,
         agent_type="native",
     )
+
+    async def _drive_until_cancelled() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            run_handle.complete_event.set()
+
+    driver_task = asyncio.create_task(_drive_until_cancelled())
+    run_handle.bind_driver_task(driver_task)
     session_pool.sessions._runs[run_id] = run_handle
     session.current_run_id = run_id
     return run_handle
@@ -229,9 +240,9 @@ async def test_member_sessions_closed_when_lead_idle_and_no_active_runs(
         # 2. Set last_active_at far in the past.
         import time
 
+        await run_handle.shutdown()
         lead_session.current_run_id = None
         session_pool.sessions._runs.pop(run_handle.run_id, None)
-        run_handle.complete_event.set()
         lead_session.last_active_at = time.monotonic() - 100.0
 
         # Wait for the polling cleanup to detect idle and close members.
@@ -410,9 +421,9 @@ async def test_cleanup_deferred_when_member_has_active_run(
         # Lead: clear run (lead finished) and set idle.
         import time
 
+        await run_handle.shutdown()
         lead_session.current_run_id = None
         session_pool.sessions._runs.pop(run_handle.run_id, None)
-        run_handle.complete_event.set()
         lead_session.last_active_at = time.monotonic() - 100.0
 
         # Wait long enough for cleanup to have fired if it weren't deferred.

@@ -1,47 +1,21 @@
 """Test script to validate the behavior of breaking from `run_stream()` iteration.
 
-This test validates the behavior when breaking from an async for loop iterating
-over `agent.run_stream()`. The findings document known issues and edge cases.
+This test validates early termination while iterating over
+``agent.run_stream()`` and the ownership contract for closing that stream.
 
 ## Summary of Findings
 
-### Current Behavior (ISSUES IDENTIFIED):
-
-1. **Exception Propagation on Break** (CRITICAL):
-   - Breaking from `run_stream()` causes multiple internal exceptions:
-     - `RuntimeError: Attempted to exit cancel scope in a different task`
-     - `ValueError: Token was created in a different Context`
-     - `RuntimeError: generator didn't stop after athrow()`
-   - These exceptions are printed to stderr but may not propagate to user code
-   - Previously caused by `merge_queue_into_iterator` context manager task switching (now removed)
-
-2. **_cancelled Flag State** (PARTIALLY WORKS):
-   - `_cancelled` flag is set to `True` when break happens during active streaming
-   - However, flag state can be inconsistent depending on where break occurs
-
-3. **Conversation History** (BROKEN):
-   - After break, conversation history often shows 0 messages
-   - History accumulation is unreliable due to exception during cleanup
-
-4. **Subsequent Runs** (BROKEN):
-   - After breaking, subsequent `run_stream()` calls may fail with:
-     - `CancelledError: Cancelled via cancel scope`
-   - The agent enters a corrupted state
-
-### Recommendation:
-
-AVOID breaking from `run_stream()` iteration in production code.
-Use explicit cancellation via `agent.interrupt()` instead,
-or consume all events until `StreamCompleteEvent`.
-
-For simulation use cases (break on tool call), wrap the agent to intercept
-events rather than breaking the iteration.
+An early-exiting caller owns the async iterator and must close it with
+``contextlib.aclosing``. SessionPool drives the RunHandle in an independent
+task, so closing the iterator can cancel and await that task without asking the
+caller's task to cancel itself. Consumers that do not exit early should iterate
+to natural exhaustion, including after ``StreamCompleteEvent``.
 """
 
 from __future__ import annotations
 
 import asyncio
-from contextlib import redirect_stderr, suppress
+from contextlib import aclosing, redirect_stderr, suppress
 from io import StringIO
 from typing import Any
 from unittest.mock import MagicMock
@@ -117,14 +91,8 @@ async def _setup_session_pool(
 async def test_simple_break_after_n_events(break_test_agent: Agent[None], minimal_pool: AgentPool):
     """Test 1: Simple break after receiving N events.
 
-    !!! warning "Known Issue"
-        This test documents current behavior which has issues. Breaking from
-        run_stream causes internal exceptions and may corrupt agent state.
-
-    Current behavior:
-    - Events are collected correctly before break
-    - _cancelled flag may or may not be set depending on timing
-    - Conversation history may be 0 due to cleanup exceptions
+    The caller exits early under ``aclosing`` and the independently owned run
+    must be fully removed before the iterator context exits.
     """
     session_pool, session_id = await _setup_session_pool(break_test_agent, minimal_pool)
     try:
@@ -133,13 +101,18 @@ async def test_simple_break_after_n_events(break_test_agent: Agent[None], minima
 
         with redirect_stderr(stderr_capture):
             events = []
-            async for event in session_pool.run_stream(session_id, "Hello"):
-                events.append(event)
-                if len(events) >= 3:
-                    break
+            async with aclosing(session_pool.run_stream(session_id, "Hello")) as stream:
+                async for event in stream:
+                    events.append(event)
+                    if len(events) >= 3:
+                        break
 
         # We collected some events
         assert len(events) >= 3, f"Expected at least 3 events, got {len(events)}"
+        session = session_pool.sessions.get_session(session_id)
+        assert session is not None
+        assert session.current_run_id is None
+        assert session_pool.sessions._runs == {}
 
         # Check for internal exceptions in stderr
         stderr_output = stderr_capture.getvalue()
@@ -155,17 +128,16 @@ async def test_break_with_exception_handling(
 ):
     """Test 2: Verify exception handling around break.
 
-    !!! warning "Known Issue"
-        While user code may not see exceptions, internal errors occur during
-        generator cleanup that can corrupt agent state.
+    The explicit stream owner must not receive or defer cleanup exceptions.
     """
     session_pool, session_id = await _setup_session_pool(break_test_agent, minimal_pool)
     try:
         user_exception = None
 
         try:
-            async for _event in session_pool.run_stream(session_id, "Test"):
-                break
+            async with aclosing(session_pool.run_stream(session_id, "Test")) as stream:
+                async for _event in stream:
+                    break
         except Exception as e:  # noqa: BLE001
             user_exception = e
 
@@ -181,15 +153,14 @@ async def test_conversation_history_after_break(
 ):
     """Test 3: Conversation history after break.
 
-    !!! warning "Known Issue"
-        Due to cleanup exceptions, conversation history is often not preserved
-        correctly after a break.
+    The stream is closed deterministically before history is inspected.
     """
     session_pool, session_id = await _setup_session_pool(break_test_agent, minimal_pool)
     try:
         # Run and break
-        async for _event in session_pool.run_stream(session_id, "Test message"):
-            break  # Break immediately
+        async with aclosing(session_pool.run_stream(session_id, "Test message")) as stream:
+            async for _event in stream:
+                break  # Break immediately; aclosing owns deterministic teardown.
 
         history = break_test_agent.conversation.get_history()
         # Document behavior rather than assert correctness
@@ -201,15 +172,14 @@ async def test_conversation_history_after_break(
 async def test_subsequent_run_after_break(break_test_agent: Agent[None], minimal_pool: AgentPool):
     """Test 4: Subsequent run_stream after break.
 
-    !!! warning "Known Issue"
-        After breaking, subsequent runs may fail with CancelledError due to
-        leftover cancel scope state.
+    A second run starts after the first iterator has completed teardown.
     """
     session_pool, session_id = await _setup_session_pool(break_test_agent, minimal_pool)
     try:
         # First run with break
-        async for _event in session_pool.run_stream(session_id, "First prompt"):
-            break
+        async with aclosing(session_pool.run_stream(session_id, "First prompt")) as stream:
+            async for _event in stream:
+                break
 
         # Try second run - this may fail
         second_run_succeeded = False
@@ -219,7 +189,6 @@ async def test_subsequent_run_after_break(break_test_agent: Agent[None], minimal
             async for event in session_pool.run_stream(session_id, "Second prompt"):
                 if isinstance(event, StreamCompleteEvent):
                     second_run_succeeded = True
-                    break
         except asyncio.CancelledError as e:
             second_run_error = e
         except Exception as e:  # noqa: BLE001
@@ -292,7 +261,6 @@ async def test_safe_pattern_complete_consumption(
             events.append(event)
             if isinstance(event, StreamCompleteEvent):
                 final_message = event.message
-                break  # OK to break after StreamCompleteEvent
 
         assert final_message is not None, "Should get final message"
         assert len(events) > 0, "Should have events"
@@ -324,9 +292,6 @@ async def test_tool_call_detection_without_break(
                 print(f"[INFO] Tool call detected: {event.tool_name}")
                 # Do not break! Let it continue
 
-            if isinstance(event, StreamCompleteEvent):
-                break
-
         print(f"[INFO] Tool detected: {tool_detected}, Total events: {len(events)}")
     finally:
         await session_pool.shutdown()
@@ -350,7 +315,6 @@ async def test_partial_text_collection(break_test_agent: Agent[None], minimal_po
                     text_chunks.append(delta)
                 case StreamCompleteEvent(message=msg):
                     final_message = msg
-                    break
 
         partial_text = "".join(text_chunks)
         print(f"[INFO] Collected text: {partial_text[:100]}...")

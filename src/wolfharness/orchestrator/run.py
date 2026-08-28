@@ -236,6 +236,8 @@ class RunHandle:
     """Whether the current turn failed. Set by ``_execute_turn()``."""
     _interrupt_task: asyncio.Task[None] | None = None
     """Background task for agent._interrupt(), stored to prevent GC."""
+    _event_task: asyncio.Task[None] | None = None
+    """Background task publishing a terminal run event, when present."""
     _emission_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     """References to fire-and-forget UserMessageInsertedEvent emission tasks.
 
@@ -379,8 +381,12 @@ class RunHandle:
 
         # Set _run_handle on run_ctx so NativeTurn can access active_agent_run
         self.run_ctx._run_handle = self
-        # Set current_task so cancel() can interrupt the running turn.
-        self.run_ctx.current_task = asyncio.current_task()
+        # Bind the driver before executing the turn so cancellation and
+        # completion have one lifecycle owner.
+        current_task = asyncio.current_task()
+        if current_task is None:
+            raise RuntimeError("RunHandle.start() requires an asyncio driver task")
+        self.bind_driver_task(current_task)
         # Wire _cancel_fn so cancel() triggers agent._interrupt() (ACP
         # CancelNotification, native _iteration_task cancel).
         self._cancel_fn = self._create_cancel_fn()
@@ -1032,6 +1038,48 @@ class RunHandle:
         task = self.run_ctx.current_task
         if task is not None and not task.done():
             task.cancel()
+
+    def bind_driver_task(self, task: asyncio.Task[Any]) -> None:
+        """Bind the single task that owns this RunHandle's execution.
+
+        The task is registered before it gets an opportunity to run. Its done
+        callback covers the valid zero-work case where cancellation wins the
+        race before the coroutine body starts; in every other case
+        ``start()`` sets the same completion event from its ``finally`` block.
+        """
+        current_task = self.run_ctx.current_task
+        if current_task is task:
+            return
+        if current_task is not None and not current_task.done():
+            raise RuntimeError("RunHandle already has an active driver task")
+        self.run_ctx.current_task = task
+        task.add_done_callback(lambda _task: self.complete_event.set())
+
+    async def shutdown(self) -> None:
+        """Cancel this Run and wait until every Run-owned task has settled.
+
+        Session teardown must use this method instead of treating
+        ``complete_event`` as a cancellation signal. The event is emitted by
+        the driver task's ``finally`` block and therefore proves that turn
+        cleanup actually ran.
+        """
+        driver_task = self.run_ctx.current_task
+        if driver_task is asyncio.current_task():
+            raise RuntimeError("A Run cannot synchronously shut down its own driver task")
+
+        self.cancel()
+        if driver_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await driver_task
+        await self.complete_event.wait()
+
+        owned_tasks = [
+            task
+            for task in (self._interrupt_task, self._event_task, *self._emission_tasks)
+            if task is not None and task is not asyncio.current_task()
+        ]
+        if owned_tasks:
+            await asyncio.gather(*owned_tasks, return_exceptions=True)
 
     def _create_cancel_fn(self) -> Callable[[], None]:
         """Create a cancel function that schedules ``agent._interrupt()``.

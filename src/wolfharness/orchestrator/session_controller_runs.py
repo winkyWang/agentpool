@@ -460,6 +460,7 @@ class SessionControllerRunsMixin:
         mid = fb.message_id
 
         task = asyncio.create_task(self._consume_run(run_handle, content))
+        run_handle.bind_driver_task(task)
         # Keep a strong reference to prevent GC from destroying the task.
         self._background_tasks.add(task)
 
@@ -752,6 +753,7 @@ class SessionControllerRunsMixin:
         agent._cancelled = False
         new_handle = self._create_per_prompt_handle(session, agent, next_prompt)
         task = asyncio.create_task(self._consume_run(new_handle, next_prompt))
+        new_handle.bind_driver_task(task)
         self._background_tasks.add(task)
 
         def _on_chain_done(

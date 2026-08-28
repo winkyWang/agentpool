@@ -530,15 +530,14 @@ async def test_complete_event_set_when_start_cancelled() -> None:
             session=session,
             run_ctx=run_ctx,
         )
+        agent.create_turn = MagicMock(return_value=_BlockingTurn(run_ctx))  # type: ignore[method-assign]
 
         gen = run_handle.start("hello")
-        task = asyncio.create_task(gen.__anext__())
-        await asyncio.sleep(0.1)
+        task = asyncio.create_task(_consume_gen(gen))
+        await asyncio.sleep(0.05)
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-        with contextlib.suppress(Exception, GeneratorExit):
-            await gen.aclose()
 
         # Even on cancel, complete_event should be set
         assert run_handle.complete_event.is_set(), (
@@ -964,6 +963,9 @@ async def test_no_value_error_when_generator_abandoned_in_different_context() ->
         model=TestModel(custom_output_text="done"),
     )
     async with agent:
+        agent.create_turn = MagicMock(  # type: ignore[method-assign]
+            return_value=_StubTurn(events=[_stream_complete_event()])
+        )
         event_bus = EventBus()
         session = SessionState(
             session_id="test-gc-session",

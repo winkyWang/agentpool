@@ -924,9 +924,9 @@ class SessionPool(
         """Close a session.
 
         Delegates to :meth:`SessionController.close_session()` which
-        implements the standardized 7-step cleanup ordering. If the
-        delegate does not respond within 15 seconds, falls back to
-        direct RunHandle cancellation and retries.
+        implements the standardized cleanup ordering and owns active Run
+        cancellation. A Session is not reported closed until that cleanup
+        has completed.
 
         SessionPool-level cleanup (message cache, EventBus safety net)
         is performed in the ``finally`` block regardless of outcome.
@@ -946,46 +946,10 @@ class SessionPool(
                     session_id=session_id,
                 )
 
-        try:
-            async with asyncio.timeout(15):
-                await self.sessions.close_session(session_id)
-        except TimeoutError:
-            logger.warning(
-                "SessionController.close_session() timed out (15s), "
-                "falling back to direct RunHandle cancellation",
-                session_id=session_id,
-            )
-            # Fallback: directly cancel RunHandle
-            session = self.sessions.get_session(session_id)
-            if session is not None and session.current_run_id is not None:
-                run_handle = self.sessions._runs.get(session.current_run_id)
-                if run_handle is not None:
-                    run_handle.cancel()
-            # Retry close after cancellation
-            try:
-                await self.sessions.close_session(session_id)
-            except Exception:
-                logger.exception(
-                    "Fallback close also failed",
-                    session_id=session_id,
-                )
-        finally:
-            # SessionPool-level cleanup (not handled by SessionController)
-            self._message_cache.pop(session_id, None)
-            # EventBus cleanup as safety net (idempotent if already
-            # done by _close_session_unlocked step 6)
-            try:
-                await self.event_bus.close_session(session_id)
-            except asyncio.CancelledError:
-                logger.warning(
-                    "EventBus close_session interrupted by spurious cancellation",
-                    session_id=session_id,
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to close event bus session",
-                    session_id=session_id,
-                )
+        await self.sessions.close_session(session_id)
+        # SessionPool-level cleanup (idempotent with SessionController step 6).
+        self._message_cache.pop(session_id, None)
+        await self.event_bus.close_session(session_id)
 
     async def _await_inflight_checkpoints(self) -> None:
         """Wait for any in-flight checkpoint operations to complete.

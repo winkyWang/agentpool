@@ -186,13 +186,13 @@ async def test_start_run_handle_protocol_channel_has_journal() -> None:
 
 
 # ---------------------------------------------------------------------------
-# close_session calls RunHandle.close()
+# close_session shuts down the active RunHandle
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-async def test_close_session_calls_run_handle_close() -> None:
-    """close_session() signals RunHandle.close() via the run-turn path."""
+async def test_close_session_shuts_down_active_run_handle() -> None:
+    """close_session() cancels and settles the active Run via the run-turn path."""
     agent = _make_mock_agent()
     pool = _make_mock_pool(agent)
     controller = SessionController(pool)
@@ -214,9 +214,10 @@ async def test_close_session_calls_run_handle_close() -> None:
     # Close the session.
     await controller.close_session("s1")
 
-    # The run handle should have complete_event set (either by close()
-    # or by the turn completing naturally).
+    # Completion is emitted only after the Run driver has terminated.
     assert run_handle.complete_event.is_set() is True
+    driver_task = run_handle.run_ctx.current_task
+    assert driver_task is None or driver_task.done()
 
 
 # ---------------------------------------------------------------------------
