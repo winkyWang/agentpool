@@ -434,15 +434,18 @@ def create_app(*, agent: BaseAgent[Any, Any], working_dir: str | None = None) ->
                 event = FileWatcherUpdatedEvent.create(file=file_path, event=event_type)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
                 await state.broadcast_event(event)
 
-        logger.info("Setting up project FileWatcher", working_dir=state.working_dir)
-        project_file_watcher = FileWatcher(
-            paths=[state.working_dir],
-            callback=on_file_change,
-            debounce=500,  # 500ms debounce to batch rapid changes
-            path_filter=lambda file_path: not should_ignore(file_path),
-        )
-        await project_file_watcher.start()
-        logger.info("Project FileWatcher started")
+        if state.pool.manifest.opencode.watch_project_files:
+            logger.info("Setting up project FileWatcher", working_dir=state.working_dir)
+            project_file_watcher = FileWatcher(
+                paths=[state.working_dir],
+                callback=on_file_change,
+                debounce=500,  # 500ms debounce to batch rapid changes
+                path_filter=lambda file_path: not should_ignore(file_path),
+            )
+            await project_file_watcher.start()
+            logger.info("Project FileWatcher started")
+        else:
+            logger.info("Project FileWatcher disabled by OpenCode configuration")
 
         # --- Version update check (triggered when first client connects) ---
         async def check_for_updates() -> None:

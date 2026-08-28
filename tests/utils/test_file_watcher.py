@@ -5,6 +5,7 @@ from pathlib import Path
 from watchfiles import Change
 
 from wolfharness.utils.file_watcher import FileWatcher
+from wolfharness_config.session_pool import OpenCodeConfig
 from wolfharness_server.opencode_server.models.config import DEFAULT_IGNORE
 from wolfharness_server.opencode_server.server import (
     _should_ignore_watched_path,
@@ -54,3 +55,9 @@ def test_runtime_defaults_exist_before_public_config_is_requested() -> None:
         working_dir="C:\\project",
         ignore_patterns=patterns,
     )
+
+
+def test_project_file_watching_is_an_explicit_opencode_capability() -> None:
+    """Headless services can disable the editor-facing project watcher."""
+    assert OpenCodeConfig().watch_project_files is True
+    assert OpenCodeConfig(watch_project_files=False).watch_project_files is False

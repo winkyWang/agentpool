@@ -70,4 +70,11 @@ class OpenCodeConfig(Schema):
     eventbus_replay_buffer_size: int = Field(default=100, ge=1, title="EventBus replay buffer size")
     """Maximum number of events retained per session for EventBus replay."""
 
+    watch_project_files: bool = Field(default=True, title="Watch project files")
+    """Whether the OpenCode server publishes project file-change events.
+
+    Disable this for headless services that do not consume editor file events,
+    especially when the project is hosted on a polling-only filesystem.
+    """
+
     model_config = ConfigDict(frozen=True)
