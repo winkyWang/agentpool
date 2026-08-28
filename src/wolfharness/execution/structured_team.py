@@ -17,12 +17,14 @@ from wolfharness.agents.events import (
     RunErrorEvent,
     RunFailedEvent,
     StreamCompleteEvent,
+    ToolCallCompleteEvent,
 )
 from wolfharness.capabilities.file_team_state import FileTeamState
 from wolfharness.execution.mission import MissionExecutionContext, with_mission_context
 
 
 _PROGRESS_HEARTBEAT_SECONDS = 30.0
+_MAX_TOOL_ERROR_TEXT_CHARACTERS = 2_000
 
 
 if TYPE_CHECKING:
@@ -348,6 +350,7 @@ class StructuredTeamExecutionService:
         expected_artifact_type: str,
         progress_phase: str,
     ) -> ArtifactCompletionEvent:
+        tool_errors: list[str] = []
         while True:
             remaining = mission.remaining_seconds()
             if mission.cancelled or remaining <= 0:
@@ -365,6 +368,11 @@ class StructuredTeamExecutionService:
                 )
                 continue
             event = envelope.event
+            if isinstance(event, ToolCallCompleteEvent) and event.is_error:
+                tool_errors.append(
+                    f"{event.tool_name}: {self._tool_error_text(event.tool_result)}",
+                )
+                continue
             if isinstance(event, ArtifactCompletionEvent):
                 if event.mission_id != mission.mission_id or event.session_id != session_id:
                     continue
@@ -381,9 +389,19 @@ class StructuredTeamExecutionService:
             # PydanticAI uses the same event for RetryPromptPart feedback and
             # continues the current Run so the model can correct its call.
             if isinstance(event, StreamCompleteEvent):
+                details = ""
+                if tool_errors:
+                    details = "; tool errors: " + " | ".join(tool_errors)
                 raise StructuredTeamExecutionError(
-                    "Member ended without a typed Artifact completion"
+                    "Member ended without a typed Artifact completion" + details
                 )
+
+    @staticmethod
+    def _tool_error_text(tool_result: object) -> str:
+        """Render one failed tool result for the terminal execution report."""
+        text = str(tool_result).strip()
+        limit = _MAX_TOOL_ERROR_TEXT_CHARACTERS
+        return text if len(text) <= limit else f"{text[:limit]}…"
 
     async def _publish_progress(
         self,

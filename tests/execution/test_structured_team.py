@@ -197,6 +197,8 @@ async def test_structured_team_fails_when_run_ends_after_uncorrected_tool_error(
     completion = report.completions[0]
     assert completion.outcome == "technical_failure"
     assert "without a typed Artifact completion" in (completion.error or "")
+    assert "persist_fragment" in (completion.error or "")
+    assert "expected ',' or ']'" in (completion.error or "")
     assert pool.closed_sessions == ["member-session-1"]
 
 
