@@ -16,6 +16,12 @@ from .structured_team import (
     TeamMemberCompletion,
     TeamMemberDispatch,
 )
+from .typed_artifact import (
+    TypedArtifactExecutionError,
+    TypedArtifactExecutionRequest,
+    TypedArtifactExecutionResult,
+    TypedArtifactExecutionService,
+)
 
 __all__ = [
     "MISSION_CONTEXT_KEY",
@@ -27,6 +33,10 @@ __all__ = [
     "TeamExecutionReport",
     "TeamMemberCompletion",
     "TeamMemberDispatch",
+    "TypedArtifactExecutionError",
+    "TypedArtifactExecutionRequest",
+    "TypedArtifactExecutionResult",
+    "TypedArtifactExecutionService",
     "inherited_run_deps",
     "mission_from_deps",
     "with_mission_context",

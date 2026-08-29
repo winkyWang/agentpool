@@ -16,10 +16,12 @@ from wolfharness.execution import (
     StructuredTeamExecutionService,
     TeamExecutionPlan,
     TeamMemberDispatch,
+    TypedArtifactExecutionRequest,
+    TypedArtifactExecutionService,
     mission_from_deps,
 )
 from wolfharness.execution.mission import MissionExecutionContext
-import wolfharness.execution.structured_team as structured_team_module
+import wolfharness.execution.typed_artifact as typed_artifact_module
 from wolfharness.orchestrator.event_bus import EventBus
 
 
@@ -35,6 +37,7 @@ class _SessionPool:
         expected_members: int,
         typed_completion: bool = True,
         tool_error: str | None = None,
+        artifact_type: str = "EvidenceFragment",
     ) -> None:
         self.event_bus = EventBus()
         self.sessions = _Sessions()
@@ -45,6 +48,7 @@ class _SessionPool:
         self._all_started = asyncio.Event()
         self._typed_completion = typed_completion
         self._tool_error = tool_error
+        self._artifact_type = artifact_type
         self._background_tasks: set[asyncio.Task[None]] = set()
 
     async def create_child_session(self, **_kwargs: Any) -> SimpleNamespace:
@@ -80,7 +84,7 @@ class _SessionPool:
                     mission_id=mission.mission_id,
                     session_id=session_id,
                     artifact_uri=f"scratchpad:///welding/{session_id}/fragment.json",
-                    artifact_type="EvidenceFragment",
+                    artifact_type=self._artifact_type,
                 )
             else:
                 event = StreamCompleteEvent(message=None)
@@ -234,7 +238,7 @@ async def test_structured_team_emits_scoped_progress_while_member_runs(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        structured_team_module,
+        typed_artifact_module,
         "_PROGRESS_HEARTBEAT_SECONDS",
         0.01,
     )
@@ -276,3 +280,25 @@ async def test_structured_team_emits_scoped_progress_while_member_runs(
         if isinstance(event, MissionProgressEvent):
             progress_events.append(event)
     assert any(event.phase == "evidence_audit_running" for event in progress_events)
+
+
+async def test_typed_artifact_execution_runs_without_team_state() -> None:
+    pool = _SessionPool(expected_members=1, artifact_type="EvidenceReview")
+    service = TypedArtifactExecutionService(session_pool=pool)  # type: ignore[arg-type]
+
+    result = await service.execute(
+        request=TypedArtifactExecutionRequest(
+            execution_id="audit-1",
+            parent_session_id="coordinator-session",
+            agent_name="evidence-auditor",
+            input_artifact_uri="scratchpad:///bundles/bundle-1.yaml",
+            expected_artifact_type="EvidenceReview",
+            instruction="Audit the immutable evidence bundle.",
+        ),
+        mission=_mission(),
+    )
+
+    assert result.outcome == "completed"
+    assert result.artifact_type == "EvidenceReview"
+    assert result.session_id == "member-session-1"
+    assert pool.closed_sessions == ["member-session-1"]
