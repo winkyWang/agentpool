@@ -23,6 +23,8 @@ from wolfharness.execution.mission import with_mission_context
 
 _PROGRESS_HEARTBEAT_SECONDS = 30.0
 _MAX_TOOL_ERROR_TEXT_CHARACTERS = 2_000
+STRUCTURED_INPUT_ARTIFACT_URI_METADATA_KEY = "structured_input_artifact_uri"
+STRUCTURED_EXPECTED_ARTIFACT_TYPE_METADATA_KEY = "structured_expected_artifact_type"
 
 
 if TYPE_CHECKING:
@@ -142,13 +144,18 @@ class TypedArtifactExecutionService:
         self,
         request: TypedArtifactExecutionRequest,
     ) -> str:
+        runtime_metadata = {
+            **request.child_session_metadata,
+            "structured_execution_id": request.execution_id,
+            STRUCTURED_INPUT_ARTIFACT_URI_METADATA_KEY: request.input_artifact_uri,
+            STRUCTURED_EXPECTED_ARTIFACT_TYPE_METADATA_KEY: request.expected_artifact_type,
+        }
         child = await self._session_pool.create_child_session(
             parent_session_id=request.parent_session_id,
             agent_name=request.agent_name,
             agent_type="native",
             lifecycle_policy="cascade",
-            structured_execution_id=request.execution_id,
-            **request.child_session_metadata,
+            **runtime_metadata,
         )
         child_session_id = child.session_id
         await self._session_pool.sessions.get_or_create_session_agent(
@@ -202,8 +209,7 @@ class TypedArtifactExecutionService:
         blank = [name for name, value in required.items() if not value.strip()]
         if blank:
             raise ValueError(
-                "typed Artifact execution fields must not be blank: "
-                + ", ".join(blank),
+                "typed Artifact execution fields must not be blank: " + ", ".join(blank),
             )
 
     @staticmethod
@@ -289,6 +295,8 @@ class TypedArtifactExecutionService:
 
 
 __all__ = [
+    "STRUCTURED_EXPECTED_ARTIFACT_TYPE_METADATA_KEY",
+    "STRUCTURED_INPUT_ARTIFACT_URI_METADATA_KEY",
     "TypedArtifactExecutionError",
     "TypedArtifactExecutionRequest",
     "TypedArtifactExecutionResult",

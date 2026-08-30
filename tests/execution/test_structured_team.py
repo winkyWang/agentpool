@@ -42,6 +42,7 @@ class _SessionPool:
         self.event_bus = EventBus()
         self.sessions = _Sessions()
         self.closed_sessions: list[str] = []
+        self.created_child_arguments: list[dict[str, Any]] = []
         self._session_index = 0
         self._started = 0
         self._expected_members = expected_members
@@ -51,7 +52,8 @@ class _SessionPool:
         self._artifact_type = artifact_type
         self._background_tasks: set[asyncio.Task[None]] = set()
 
-    async def create_child_session(self, **_kwargs: Any) -> SimpleNamespace:
+    async def create_child_session(self, **kwargs: Any) -> SimpleNamespace:
+        self.created_child_arguments.append(kwargs)
         self._session_index += 1
         return SimpleNamespace(session_id=f"member-session-{self._session_index}")
 
@@ -294,6 +296,12 @@ async def test_typed_artifact_execution_runs_without_team_state() -> None:
             input_artifact_uri="scratchpad:///bundles/bundle-1.yaml",
             expected_artifact_type="EvidenceReview",
             instruction="Audit the immutable evidence bundle.",
+            child_session_metadata={
+                "trace_label": "audit",
+                "structured_execution_id": "caller-spoofed-execution",
+                "structured_input_artifact_uri": "scratchpad:///caller-spoofed.yaml",
+                "structured_expected_artifact_type": "CallerSpoofedArtifact",
+            },
         ),
         mission=_mission(),
     )
@@ -302,3 +310,15 @@ async def test_typed_artifact_execution_runs_without_team_state() -> None:
     assert result.artifact_type == "EvidenceReview"
     assert result.session_id == "member-session-1"
     assert pool.closed_sessions == ["member-session-1"]
+    assert pool.created_child_arguments == [
+        {
+            "parent_session_id": "coordinator-session",
+            "agent_name": "evidence-auditor",
+            "agent_type": "native",
+            "lifecycle_policy": "cascade",
+            "trace_label": "audit",
+            "structured_execution_id": "audit-1",
+            "structured_input_artifact_uri": "scratchpad:///bundles/bundle-1.yaml",
+            "structured_expected_artifact_type": "EvidenceReview",
+        },
+    ]
