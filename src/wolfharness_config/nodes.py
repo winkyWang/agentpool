@@ -373,6 +373,28 @@ class BaseAgentConfig(NodeConfig):
         ```
     """
 
+    skill_tools_enabled: bool = Field(
+        default=True,
+        title="Enable dynamic Skill tools",
+    )
+    """Whether the Agent may discover or dynamically activate Skills.
+
+    When ``False``, the pool does not attach ``load_skill``, ``list_skills``,
+    or Skill-owned dynamic tools to this Agent. Instructions explicitly
+    injected by a parent task remain available because task assignment resolves
+    them server-side before the child Session starts.
+
+    Use this for bounded specialist Agents whose complete method references are
+    supplied by their caller:
+
+    Example:
+        ```yaml
+        agents:
+          bounded_specialist:
+            skill_tools_enabled: false
+        ```
+    """
+
     @field_validator("elicitation_timeout", mode="before")
     @classmethod
     def parse_elicitation_timeout(cls, v: str | timedelta | float | None) -> timedelta | None:

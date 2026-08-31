@@ -225,6 +225,30 @@ async def test_get_agentlet_collects_mcp_capabilities(
             assert cap in capabilities
 
 
+@pytest.mark.anyio
+async def test_get_agentlet_omits_skill_capability_when_dynamic_skill_tools_disabled(
+    mock_agent: Agent[Any],
+) -> None:
+    """A bounded specialist receives preloaded instructions without Skill loaders."""
+    pool = MagicMock()
+    pool.mcp.providers = []
+    pool.mcp.get_capabilities = AsyncMock(return_value=[])
+    pool.skill_capability_for_node = MagicMock()
+    pool.resource_capability = None
+    mock_agent._agent_pool = pool
+    mock_agent.mcp = pool.mcp
+    mock_agent.config = MagicMock()
+    mock_agent.config.capabilities = []
+    mock_agent.config.skill_tools_enabled = False
+    mock_agent.config.resources.enabled = False
+
+    with patch("wolfharness.agents.native_agent.agent.PydanticAgent") as mock_pydantic_agent:
+        mock_pydantic_agent.return_value = MagicMock()
+        await mock_agent.get_agentlet(None, None, None)
+
+    pool.skill_capability_for_node.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Test: History processors are wrapped as ProcessHistory capabilities
 # ---------------------------------------------------------------------------

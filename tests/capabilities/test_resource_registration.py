@@ -112,6 +112,18 @@ def test_base_agent_config_resources_disabled():
     assert config.resources.enabled is False
 
 
+def test_base_agent_config_dynamic_skill_tools_default_to_enabled():
+    """Agents retain dynamic Skill discovery unless explicitly bounded."""
+    config = BaseAgentConfig(name="test")
+    assert config.skill_tools_enabled is True
+
+
+def test_base_agent_config_can_disable_dynamic_skill_tools():
+    """Preloaded specialist instructions do not require model-facing loaders."""
+    config = BaseAgentConfig(name="test", skill_tools_enabled=False)
+    assert config.skill_tools_enabled is False
+
+
 # =============================================================================
 # AgentPool registration tests
 # =============================================================================

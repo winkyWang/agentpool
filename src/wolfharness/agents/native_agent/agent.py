@@ -1155,9 +1155,13 @@ class Agent[TDeps = None, OutputDataT = str](BaseAgent[TDeps, OutputDataT]):
         #    Each SkillManagerCap provides tools and MCP servers.
         skill_capability = None
         if pool is not None:
-            skill_capability = pool.skill_capability_for_node(self.name)
-            if skill_capability is not None:
-                tool_capabilities.append(skill_capability)
+            skill_tools_enabled = (
+                self.config is None or self.config.skill_tools_enabled
+            )
+            if skill_tools_enabled:
+                skill_capability = pool.skill_capability_for_node(self.name)
+                if skill_capability is not None:
+                    tool_capabilities.append(skill_capability)
             # 6. ResourceCapability — unified resource access tools.
             #    Per-agent opt-out via ``resources.enabled: false`` in YAML.
             if self.config is not None and self.config.resources.enabled:
