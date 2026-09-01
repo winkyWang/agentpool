@@ -1,14 +1,13 @@
-"""TDD tests for NotificationBatcher with anyio structured concurrency.
+"""Tests for the notification batcher's owned timers and delivery tasks.
 
 Covers debounce timing, dedup, batch formatting, status ordering,
-shutdown flush, CancelScope cancellation, orphan prevention,
-fail_after timeout protection, and more.
+shutdown flush, owner-task isolation, orphan prevention, delivery timeout
+protection, and more.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from datetime import UTC, datetime
 import inspect
 from unittest.mock import AsyncMock
@@ -385,45 +384,21 @@ async def test_shutdown_cancels_timer_handles():
 
 
 # ---------------------------------------------------------------------------
-# 8. CancelScope cancellation propagation
+# 8. Owner-task isolation
 # ---------------------------------------------------------------------------
 
 
-async def test_cancel_scope_cancellation_stops_timers():
-    """Cancelling the CancelScope stops pending delivery.
-
-    After CancelScope.cancel(), the _schedule_flush callback still fires
-    (it's a raw asyncio TimerHandle), but since the TaskGroup is under
-    a cancelled scope, ``start_soon`` either no-ops or the spawned task
-    is immediately cancelled.  No delivery should reach the callback.
-    """
-    delivered: list[tuple[str, list[BackgroundTask], str]] = []
-
-    async def deliver(sid: str, tasks: list[BackgroundTask], notice: str) -> None:
-        delivered.append((sid, tasks, notice))
-
-    batcher = NotificationBatcher(deliver, debounce_ms=50)
+async def test_shutdown_does_not_cancel_the_owner_task():
+    """The batcher lifecycle never attaches cancellation to its caller."""
+    owner = asyncio.current_task()
+    assert owner is not None
+    cancellation_count = owner.cancelling()
+    batcher = NotificationBatcher(AsyncMock(), debounce_ms=50)
     await batcher.start()
+    await batcher.shutdown()
 
-    batcher.submit(_make_task("t1"))
-
-    # Cancel the scope immediately (before the 50ms debounce fires)
-    batcher._cancel_scope.cancel()
-
-    # After cancel scope, we can't use asyncio.sleep normally because
-    # anyio propagates the cancellation.  Use suppress instead.
-    with contextlib.suppress(asyncio.CancelledError):
-        await asyncio.sleep(0.2)
-
-    # No delivery should have occurred
-    assert len(delivered) == 0
-
-    # Cleanup — manually tear down since shutdown may fail under cancelled scope
-    for handle in batcher._timers.values():
-        handle.cancel()
-    batcher._timers.clear()
-    batcher._pending.clear()
-    batcher._started = False
+    await asyncio.sleep(0)
+    assert owner.cancelling() == cancellation_count
 
 
 # ---------------------------------------------------------------------------

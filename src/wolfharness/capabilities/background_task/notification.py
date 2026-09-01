@@ -1,8 +1,8 @@
 """Notification batcher with debounce and timeout protection.
 
 Debounces and batches background-task completion notifications before
-delivering them to the lead agent.  Uses ``anyio.CancelScope`` and
-``anyio.fail_after`` for delivery timeout protection.
+delivering them to the lead agent. Uses explicit timer and task ownership for
+lifecycle cleanup, and ``anyio.fail_after`` for delivery timeout protection.
 """
 
 from __future__ import annotations
@@ -86,8 +86,6 @@ class NotificationBatcher:
         self._pending_count_callback = pending_count_callback or (lambda: 0)
         self._deliver_timeout = deliver_timeout
 
-        self._cancel_scope: anyio.CancelScope | None = None
-
         self._pending: dict[str, list[BackgroundTask]] = {}
         self._timers: dict[str, asyncio.TimerHandle] = {}
         self._flush_tasks: set[asyncio.Task[None]] = set()
@@ -100,15 +98,13 @@ class NotificationBatcher:
 
     @logfire.instrument("background_task.notification.start")
     async def start(self) -> None:
-        """Enter the CancelScope for timeout protection.
+        """Mark the batcher ready to accept completion notifications.
 
         Safe to call multiple times — only enters once.
         """
         if self._started:
             return
         self._started = True
-        self._cancel_scope = anyio.CancelScope()
-        self._cancel_scope.__enter__()
 
     # ------------------------------------------------------------------
     # Submission (SYNC)
@@ -356,9 +352,6 @@ class NotificationBatcher:
         # Clear _delivered
         if self._pending_count_callback() == 0:
             self._delivered.clear()
-
-        if self._cancel_scope is not None:
-            self._cancel_scope.cancel()
 
         for ft in list(self._flush_tasks):
             ft.cancel()
